@@ -1,0 +1,37 @@
+[project]
+name = "riskprobe-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "lightgbm==4.6.0",
+  "numpy==2.3.2",
+  "polars==1.33.1",
+  "pyarrow==21.0.0",
+  "pydantic==2.11.7",
+  "PyYAML==6.0.2",
+  "rich==14.1.0",
+  "scikit-learn==1.7.1",
+  "scipy==1.16.1",
+  "statsmodels==0.14.5",
+  "typer==0.16.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.4.1", "pytest-cov==6.2.1", "ruff==0.12.8"]
+
+[project.scripts]
+riskprobe = "riskprobe.cli:app"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/riskprobe"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

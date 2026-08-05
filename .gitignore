@@ -1,0 +1,61 @@
+# Company, private, and raw data
+/data/
+/private/
+/company/
+*.parquet
+*.csv
+*.xlsx
+*.xls
+*.feather
+*.arrow
+
+# Real company configuration and secrets
+/configs/company*.yaml
+/configs/company*.yml
+/configs/private/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Internal outputs and reports
+/runs/
+/outputs/
+/reports/internal/
+/logs/
+
+# Models and large artifacts
+*.pkl
+*.pickle
+*.joblib
+*.bin
+*.onnx
+*.pt
+*.pth
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Development worktrees and agent scratch
+.worktrees/
+.superpowers/
+
+# IDE and operating system
+.DS_Store
+.vscode/
+.idea/

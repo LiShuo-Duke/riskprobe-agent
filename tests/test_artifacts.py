@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -6,6 +7,46 @@ from pathlib import Path
 import pytest
 
 from riskprobe.artifacts import RunStore
+
+_ARTIFACTS = (
+    "manifest.json",
+    "metadata_report.json",
+    "data_profile.json",
+    "candidate_rules.parquet",
+    "evidence_cards.json",
+    "risk_report.md",
+)
+
+
+def _canonical_json(payload: object) -> str:
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) + "\n"
+
+
+def _write_complete_run(context: object) -> None:
+    for name in _ARTIFACTS[1:]:
+        context.write_text(name, f"content for {name}\n")
+    integrity = {}
+    for name in _ARTIFACTS[1:]:
+        content = (context.run_dir / name).read_bytes()
+        integrity[name] = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+    context.write_text(
+        "manifest.json",
+        _canonical_json(
+            {
+                "artifact_integrity": integrity,
+                "artifacts": list(_ARTIFACTS),
+            }
+        ),
+    )
 
 
 def test_same_inputs_produce_same_run_id(tmp_path) -> None:
@@ -32,18 +73,13 @@ def test_run_id_is_canonical_and_cannot_traverse_runs_directory(tmp_path: Path) 
 def test_complete_duplicate_run_is_returned_without_overwrite(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "runs")
     first = store.create("cfg", "data", "0.1.0")
-    first.write_json("manifest.json", {"artifacts": ["manifest.json"]})
+    _write_complete_run(first)
     first.finalize()
-    sentinel = first.run_dir / "sentinel.txt"
-    sentinel.write_text("keep", encoding="utf-8")
 
     second = store.create("cfg", "data", "0.1.0")
 
     assert second.is_existing is True
-    assert json.loads((second.run_dir / "manifest.json").read_text()) == {
-        "artifacts": ["manifest.json"]
-    }
-    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert {path.name for path in second.run_dir.iterdir()} == set(_ARTIFACTS)
 
 
 def test_incomplete_run_is_cleaned_before_rebuild(tmp_path: Path) -> None:
@@ -91,7 +127,7 @@ def test_json_writer_rejects_non_finite_numbers(tmp_path: Path, value: float) ->
 
 def test_finalized_context_rejects_further_writes(tmp_path: Path) -> None:
     context = RunStore(tmp_path / "runs").create("cfg", "data", "0.1.0")
-    context.write_json("manifest.json", {"artifacts": ["manifest.json"]})
+    _write_complete_run(context)
     original = (context.run_dir / "manifest.json").read_bytes()
     context.finalize()
 
@@ -122,6 +158,75 @@ def test_unmarked_incomplete_directory_is_not_treated_as_complete(tmp_path: Path
     (run_dir / "manifest.json").write_text(
         '{"artifacts":["manifest.json","missing.json"]}\n', encoding="utf-8"
     )
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        store.create("cfg", "data", "0.1.0")
+
+
+def test_finalize_rejects_manifest_that_claims_only_itself(tmp_path: Path) -> None:
+    context = RunStore(tmp_path / "runs").create("cfg", "data", "0.1.0")
+    context.write_text(
+        "manifest.json",
+        _canonical_json({"artifacts": ["manifest.json"], "artifact_integrity": {}}),
+    )
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        context.finalize()
+
+
+def test_reuse_rejects_tampered_artifact(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    context = store.create("cfg", "data", "0.1.0")
+    _write_complete_run(context)
+    context.finalize()
+    report = context.run_dir / "risk_report.md"
+    original = report.read_bytes()
+    replacement = bytes([original[0] ^ 1]) + original[1:]
+    assert len(replacement) == len(original)
+    report.write_bytes(replacement)
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        store.create("cfg", "data", "0.1.0")
+
+
+def test_reuse_rejects_manifest_missing_required_artifact(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    context = store.create("cfg", "data", "0.1.0")
+    _write_complete_run(context)
+    context.finalize()
+    (context.run_dir / "risk_report.md").unlink()
+    manifest = json.loads((context.run_dir / "manifest.json").read_text())
+    manifest["artifacts"].remove("risk_report.md")
+    manifest["artifact_integrity"].pop("risk_report.md")
+    (context.run_dir / "manifest.json").write_text(
+        _canonical_json(manifest), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        store.create("cfg", "data", "0.1.0")
+
+
+def test_reuse_rejects_extra_file(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    context = store.create("cfg", "data", "0.1.0")
+    _write_complete_run(context)
+    context.finalize()
+    (context.run_dir / "extra.txt").write_text("unexpected", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        store.create("cfg", "data", "0.1.0")
+
+
+def test_reuse_rejects_symlinked_artifact(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    context = store.create("cfg", "data", "0.1.0")
+    _write_complete_run(context)
+    context.finalize()
+    report = context.run_dir / "risk_report.md"
+    external = tmp_path / "external.md"
+    external.write_bytes(report.read_bytes())
+    report.unlink()
+    report.symlink_to(external)
 
     with pytest.raises(RuntimeError, match="not complete"):
         store.create("cfg", "data", "0.1.0")

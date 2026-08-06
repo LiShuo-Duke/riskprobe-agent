@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -5,6 +6,8 @@ from typing import Any
 
 import polars as pl
 import pytest
+
+import riskprobe.service as service_module
 
 from riskprobe.config import ProjectConfig
 from riskprobe.features.catalog import QualityIssue
@@ -123,14 +126,30 @@ def test_service_run_writes_required_artifacts(tmp_path, synthetic_config) -> No
     service = RiskProbeService(config=synthetic_config, runs_dir=tmp_path / "runs")
     result = service.run()
     names = {path.name for path in result.run_dir.iterdir()}
-    assert {
+    assert names == {
         "manifest.json",
         "metadata_report.json",
         "data_profile.json",
         "candidate_rules.parquet",
         "evidence_cards.json",
         "risk_report.md",
-    } <= names
+    }
+    manifest_path = result.run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert set(manifest["artifact_integrity"]) == names - {"manifest.json"}
+    for name, integrity in manifest["artifact_integrity"].items():
+        content = (result.run_dir / name).read_bytes()
+        assert integrity == {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+    assert manifest_path.read_text() == json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) + "\n"
 
 
 def test_inspect_and_discover_return_existing_domain_models(tmp_path: Path) -> None:
@@ -156,17 +175,17 @@ def test_same_input_produces_byte_for_byte_identical_artifacts(tmp_path: Path) -
     assert first_bytes == second_bytes
 
 
-def test_service_does_not_overwrite_complete_duplicate_run(tmp_path: Path) -> None:
+def test_service_rejects_tampered_complete_run(tmp_path: Path) -> None:
     config = _small_config(tmp_path)
     service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
     first = service.run()
     report = first.run_dir / "risk_report.md"
-    report.write_text("immutable", encoding="utf-8")
+    report.write_text("tampered", encoding="utf-8")
 
-    second = service.run()
+    with pytest.raises(RuntimeError, match="not complete"):
+        service.run()
 
-    assert second.is_existing is True
-    assert report.read_text(encoding="utf-8") == "immutable"
+    assert report.read_text(encoding="utf-8") == "tampered"
 
 
 def test_service_failure_removes_incomplete_run(
@@ -183,6 +202,7 @@ def test_service_failure_removes_incomplete_run(
         service.run()
 
     assert [path for path in (tmp_path / "runs").iterdir() if path.is_dir()] == []
+    assert list((tmp_path / "runs").glob("*.parquet")) == []
 
 
 def test_disabled_time_split_is_stratified_projected_and_read_only(
@@ -370,7 +390,16 @@ def test_outputs_redact_segment_values_and_absolute_input_path(
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
-    combined = b"\n".join(path.read_bytes() for path in result.run_dir.iterdir())
+    text_artifacts = b"\n".join(
+        path.read_bytes()
+        for path in result.run_dir.iterdir()
+        if path.suffix != ".parquet"
+    )
+    candidate_rows = pl.read_parquet(
+        result.run_dir / "candidate_rules.parquet"
+    ).rows(named=True)
+    logical_parquet = json.dumps(candidate_rows, sort_keys=True).encode()
+    combined = text_artifacts + b"\n" + logical_parquet
     assert b"private-" not in combined
     assert b"SECRET_CLIENT_ALPHA" not in combined
     assert b"SECRET_CLIENT_BETA" not in combined
@@ -482,3 +511,296 @@ def test_path_like_dataset_id_is_not_written_to_outputs(
     combined = b"\n".join(path.read_bytes() for path in result.run_dir.iterdir())
     assert private_id.encode() not in combined
     assert b"dataset-" in combined
+
+
+def test_run_analyzes_same_snapshot_used_for_fingerprint_after_atomic_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=200)
+    original_fingerprint = service_module._parquet_metadata_fingerprint(
+        config.dataset.path
+    )
+    replacement = tmp_path / "replacement.parquet"
+    pl.read_parquet(config.dataset.path).head(80).write_parquet(replacement)
+    real_fingerprint = service_module._parquet_metadata_fingerprint
+    replaced = False
+
+    def replace_source_after_fingerprint(path: Path) -> str:
+        nonlocal replaced
+        fingerprint = real_fingerprint(path)
+        if not replaced:
+            replacement.replace(config.dataset.path)
+            replaced = True
+        return fingerprint
+
+    monkeypatch.setattr(
+        service_module,
+        "_parquet_metadata_fingerprint",
+        replace_source_after_fingerprint,
+    )
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    manifest = json.loads((result.run_dir / "manifest.json").read_text())
+    profile = json.loads((result.run_dir / "data_profile.json").read_text())
+    assert manifest["data_fingerprint"] == original_fingerprint
+    assert profile["row_count"] == 200
+    assert pl.read_parquet(config.dataset.path).height == 80
+    assert list((tmp_path / "runs").glob("*.parquet")) == []
+
+
+def test_empty_holdout_downgrades_each_card_and_reports_limitation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_enabled=True,
+        metadata_grade="A",
+    )
+    frame = pl.read_parquet(config.dataset.path).with_columns(
+        pl.Series(
+            "snapshot_date",
+            [date(2024, 1, 1)] * 70 + [date(2024, 2, 1)] * 30,
+        )
+    )
+    frame.write_parquet(config.dataset.path)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        "riskprobe.service.validate_rules", lambda *args, **kwargs: [_card()]
+    )
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    evidence = json.loads((result.run_dir / "evidence_cards.json").read_text())
+    report = (result.run_dir / "risk_report.md").read_text()
+    limitation = "Holdout partition is empty; validation unavailable"
+    assert evidence[0]["grade"] == "Suspicious"
+    assert limitation in evidence[0]["limitations"]
+    assert limitation in report
+
+
+def test_single_class_holdout_downgrades_each_card_and_reports_limitation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_enabled=True,
+        metadata_grade="A",
+    )
+    frame = pl.read_parquet(config.dataset.path).with_columns(
+        pl.Series(
+            "snapshot_date",
+            [date(2024, 1, 1)] * 60
+            + [date(2024, 2, 1)] * 20
+            + [date(2024, 3, 1)] * 20,
+        ),
+        pl.Series("target", [index % 2 for index in range(80)] + [0] * 20),
+    )
+    frame.write_parquet(config.dataset.path)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        "riskprobe.service.validate_rules", lambda *args, **kwargs: [_card()]
+    )
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    evidence = json.loads((result.run_dir / "evidence_cards.json").read_text())
+    metadata = json.loads((result.run_dir / "metadata_report.json").read_text())
+    limitation = "Holdout partition has a single target class; validation unavailable"
+    assert evidence[0]["grade"] == "Suspicious"
+    assert limitation in evidence[0]["limitations"]
+    assert limitation in metadata["limitations"]
+
+
+def test_holdout_validation_error_downgrades_each_card_instead_of_failing_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_enabled=True,
+        metadata_grade="A",
+    )
+    responses = iter([[_card()], ValueError("unstable implementation detail")])
+
+    def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    evidence = json.loads((result.run_dir / "evidence_cards.json").read_text())
+    limitation = "Holdout validation could not be computed"
+    assert evidence[0]["grade"] == "Suspicious"
+    assert limitation in evidence[0]["limitations"]
+    assert "unstable implementation detail" not in json.dumps(evidence)
+
+
+def test_missing_holdout_rule_downgrades_only_missing_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_enabled=True,
+        metadata_grade="A",
+    )
+    responses = [[_card()], []]
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        "riskprobe.service.validate_rules", lambda *args, **kwargs: responses.pop(0)
+    )
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    evidence = json.loads((result.run_dir / "evidence_cards.json").read_text())
+    limitation = "Holdout evidence is missing for this rule"
+    assert evidence[0]["grade"] == "Suspicious"
+    assert limitation in evidence[0]["limitations"]
+
+
+def test_null_snapshots_are_excluded_and_audited_not_treated_as_holdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_enabled=True,
+        metadata_grade="A",
+    )
+    frame = pl.read_parquet(config.dataset.path).with_columns(
+        pl.Series(
+            "snapshot_date",
+            [date(2024, 1, 1)] * 48
+            + [date(2024, 2, 1)] * 16
+            + [date(2024, 3, 1)] * 16
+            + [None] * 20,
+            dtype=pl.Date,
+        )
+    )
+    frame.write_parquet(config.dataset.path)
+    calls: list[tuple[pl.DataFrame, pl.DataFrame]] = []
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+
+    def fake_validate(
+        train: pl.DataFrame, test: pl.DataFrame, rules: object, **kwargs: object
+    ) -> list[EvidenceCard]:
+        calls.append((train, test))
+        return [_card()]
+
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    profile = json.loads((result.run_dir / "data_profile.json").read_text())
+    evidence = json.loads((result.run_dir / "evidence_cards.json").read_text())
+    metadata = json.loads((result.run_dir / "metadata_report.json").read_text())
+    report = (result.run_dir / "risk_report.md").read_text()
+    limitation = "Time validation excluded 20 rows with null snapshot values"
+    assert all(
+        partition.get_column("snapshot_date").null_count() == 0
+        for call in calls
+        for partition in call
+    )
+    assert profile["excluded_null_snapshot_rows"] == 20
+    assert sum(metadata["split_rows"].values()) == 80
+    assert limitation in evidence[0]["limitations"]
+    assert limitation in report
+
+
+@pytest.mark.parametrize(
+    "private_id",
+    [
+        "file:///Users/alice/private/input.parquet",
+        "file:///Users/alice/private%20folder/input.parquet",
+        "file%3A%2F%2F%2FUsers%2Falice%2Fprivate%2Finput.parquet",
+        "file:///C:/Users/Alice/private/input.parquet",
+        "source=/Users/alice/private/input.parquet",
+        r"source=C:\Users\Alice\private\input.parquet",
+    ],
+)
+def test_file_uri_and_prefixed_path_dataset_ids_are_redacted_everywhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    private_id: str,
+) -> None:
+    config = _small_config(tmp_path)
+    config = config.model_copy(
+        update={"dataset": config.dataset.model_copy(update={"id": private_id})}
+    )
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    text = b"\n".join(
+        path.read_bytes()
+        for path in result.run_dir.iterdir()
+        if path.suffix != ".parquet"
+    ).decode()
+    assert private_id not in text
+    assert "dataset-" in text
+
+
+def test_renderer_redacts_path_dataset_id_without_service_boundary() -> None:
+    profile = DatasetProfile(
+        dataset_id="file:///Users/alice/private/input.parquet",
+        row_count=1,
+        feature_count=0,
+        positive_rate=0.0,
+        segment_counts={},
+        snapshot_min=None,
+        snapshot_max=None,
+        metadata_grade="A",
+        issues=(),
+    )
+
+    report = render_risk_report(profile, [])
+
+    assert "file:///Users/alice" not in report
+    assert "dataset-" in report
+
+
+@pytest.mark.parametrize(
+    "business_id",
+    ["portfolio/retail-2024", "customer:premium", "file-processing-2024"],
+)
+def test_renderer_preserves_ordinary_business_dataset_ids(business_id: str) -> None:
+    profile = DatasetProfile(
+        dataset_id=business_id,
+        row_count=1,
+        feature_count=0,
+        positive_rate=0.0,
+        segment_counts={},
+        snapshot_min=None,
+        snapshot_max=None,
+        metadata_grade="A",
+        issues=(),
+    )
+
+    report = render_risk_report(profile, [])
+
+    assert f"`{business_id}`" in report
+
+
+def test_snapshot_copy_failure_removes_temporary_raw_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path)
+
+    def fail_copy(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated snapshot copy failure")
+
+    monkeypatch.setattr(service_module.shutil, "copyfileobj", fail_copy)
+
+    with pytest.raises(OSError, match="simulated snapshot copy failure"):
+        RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    assert list((tmp_path / "runs").glob("*.parquet")) == []

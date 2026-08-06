@@ -1,9 +1,12 @@
 import hashlib
 import json
+import shutil
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path, PureWindowsPath
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 import numpy as np
 import polars as pl
@@ -20,6 +23,7 @@ from riskprobe.reporting import (
     redact_limitation,
     redact_segment_value,
     render_risk_report,
+    safe_dataset_id,
 )
 from riskprobe.rules.discovery import discover_rules
 from riskprobe.rules.validation import validate_rules
@@ -45,10 +49,31 @@ def _package_version() -> str:
 
 
 def _safe_dataset_id(dataset_id: str) -> str:
-    if Path(dataset_id).is_absolute() or PureWindowsPath(dataset_id).is_absolute():
-        digest = hashlib.sha256(dataset_id.encode("utf-8")).hexdigest()[:8]
-        return f"dataset-{digest}"
-    return dataset_id
+    return safe_dataset_id(dataset_id)
+
+
+@contextmanager
+def _stable_dataset_snapshot(source: Path, snapshot_dir: Path) -> Iterator[Path]:
+    snapshot_path: Path | None = None
+    try:
+        with source.open("rb") as source_handle, tempfile.NamedTemporaryFile(
+            dir=snapshot_dir,
+            prefix=".riskprobe-input-",
+            suffix=".parquet",
+            delete=False,
+        ) as snapshot_handle:
+            snapshot_path = Path(snapshot_handle.name)
+            shutil.copyfileobj(source_handle, snapshot_handle)
+            snapshot_handle.flush()
+        snapshot_path.chmod(0o400)
+        yield snapshot_path
+    finally:
+        if snapshot_path is not None:
+            try:
+                snapshot_path.chmod(0o600)
+            except FileNotFoundError:
+                pass
+            snapshot_path.unlink(missing_ok=True)
 
 
 def _parquet_metadata_fingerprint(path: Path) -> str:
@@ -66,11 +91,15 @@ def _parquet_metadata_fingerprint(path: Path) -> str:
     return hashlib.sha256(metadata).hexdigest()
 
 
-def _time_split(frame: pl.DataFrame, snapshot_col: str) -> tuple[pl.DataFrame, ...]:
+def _time_split(
+    frame: pl.DataFrame, snapshot_col: str
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, int]:
     order_column = "__riskprobe_snapshot_order"
     parsed = normalize_date_series(frame.get_column(snapshot_col))
-    ordered = frame.with_columns(parsed.alias(order_column)).sort(
-        order_column, nulls_last=True, maintain_order=True
+    with_order = frame.with_columns(parsed.alias(order_column))
+    excluded_null_snapshot_rows = with_order.get_column(order_column).null_count()
+    ordered = with_order.filter(pl.col(order_column).is_not_null()).sort(
+        order_column, maintain_order=True
     )
     groups = ordered.partition_by(order_column, maintain_order=True)
     group_count = len(groups)
@@ -106,6 +135,7 @@ def _time_split(frame: pl.DataFrame, snapshot_col: str) -> tuple[pl.DataFrame, .
         combine(0, train_group_end),
         combine(train_group_end, test_group_end),
         combine(test_group_end, group_count),
+        excluded_null_snapshot_rows,
     )
 
 
@@ -202,7 +232,9 @@ def _issue_payload(issue: Any) -> dict[str, Any]:
     return payload
 
 
-def _profile_payload(profile: DatasetProfile) -> dict[str, Any]:
+def _profile_payload(
+    profile: DatasetProfile, *, excluded_null_snapshot_rows: int
+) -> dict[str, Any]:
     segment_sizes = list(profile.segment_counts.values())
     return {
         "dataset_id": profile.dataset_id,
@@ -214,6 +246,7 @@ def _profile_payload(profile: DatasetProfile) -> dict[str, Any]:
         "segment_size_max": max(segment_sizes, default=0),
         "snapshot_min": profile.snapshot_min,
         "snapshot_max": profile.snapshot_max,
+        "excluded_null_snapshot_rows": excluded_null_snapshot_rows,
         "metadata_grade": profile.metadata_grade,
         "issues": [
             _issue_payload(issue)
@@ -239,6 +272,20 @@ def _render_service_report(
     return report
 
 
+def _with_limitation(
+    cards: list[EvidenceCard], limitation: str, *, downgrade: bool
+) -> list[EvidenceCard]:
+    return [
+        card.model_copy(
+            update={
+                "grade": "Suspicious" if downgrade else card.grade,
+                "limitations": tuple(sorted({*card.limitations, limitation})),
+            }
+        )
+        for card in cards
+    ]
+
+
 def _attach_holdout(
     primary: list[EvidenceCard], holdout: list[EvidenceCard]
 ) -> list[EvidenceCard]:
@@ -247,7 +294,13 @@ def _attach_holdout(
     for card in primary:
         holdout_card = holdout_by_id.get(card.rule.rule_id)
         if holdout_card is None:
-            combined.append(card)
+            combined.extend(
+                _with_limitation(
+                    [card],
+                    "Holdout evidence is missing for this rule",
+                    downgrade=True,
+                )
+            )
             continue
         holdout_slice = SliceMetrics(
             slice_type="dataset",
@@ -280,6 +333,17 @@ def _attach_holdout(
     return combined
 
 
+def _artifact_integrity(run_dir: Path) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for name in _ARTIFACT_NAMES[1:]:
+        content = (run_dir / name).read_bytes()
+        records[name] = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+    return records
+
+
 class RiskProbeService:
     def __init__(self, *, config: ProjectConfig | Path, runs_dir: Path) -> None:
         self.config = (
@@ -301,7 +365,7 @@ class RiskProbeService:
 
     def _partitions(
         self, dataset: ParquetDataset, feature_names: list[str]
-    ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame | None]:
+    ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame | None, int]:
         columns = [
             self.config.columns.snapshot,
             self.config.columns.segment,
@@ -311,7 +375,8 @@ class RiskProbeService:
         frame = dataset.collect(columns)
         if self.config.time_validation_enabled:
             return _time_split(frame, self.config.columns.snapshot)
-        return _stratified_split(frame, self.config.columns.target)
+        train, test, holdout = _stratified_split(frame, self.config.columns.target)
+        return train, test, holdout, 0
 
     def _discover_from_train(
         self, train: pl.DataFrame, feature_names: list[str]
@@ -364,36 +429,64 @@ class RiskProbeService:
             "metadata_grade": self.config.metadata_grade,
         }
         validation_limitations: list[str] = []
+        holdout_limitation: str | None = None
+        if self.config.time_validation_enabled:
+            if holdout is None or holdout.is_empty():
+                holdout_limitation = (
+                    "Holdout partition is empty; validation unavailable"
+                )
+            elif (
+                holdout.get_column(self.config.columns.target).n_unique() < 2
+            ):
+                holdout_limitation = (
+                    "Holdout partition has a single target class; "
+                    "validation unavailable"
+                )
+            if holdout_limitation is not None:
+                validation_limitations.append(holdout_limitation)
+
         if train_projection.is_empty() or not (
             train_projection.get_column(self.config.columns.target) == 1
         ).any():
-            return [], ("Train partition has no positive target; validation unavailable",)
+            validation_limitations.append(
+                "Train partition has no positive target; validation unavailable"
+            )
+            return [], tuple(validation_limitations)
         if test_projection.is_empty() or not (
             test_projection.get_column(self.config.columns.target) == 1
         ).any():
-            return [], ("Test partition has no positive target; validation unavailable",)
+            validation_limitations.append(
+                "Test partition has no positive target; validation unavailable"
+            )
+            return [], tuple(validation_limitations)
 
         cards = validate_rules(train_projection, test_projection, rules, **kwargs)
-        if holdout is not None and not holdout.is_empty() and rules:
-            holdout_projection = holdout.select(validation_columns)
-            if (holdout_projection.get_column(self.config.columns.target) == 1).any():
-                holdout_cards = validate_rules(
-                    train_projection,
-                    holdout_projection,
-                    rules,
-                    **kwargs,
-                )
-                cards = _attach_holdout(cards, holdout_cards)
-            else:
-                limitation = "Holdout partition has no positive target; validation unavailable"
-                validation_limitations.append(limitation)
-                cards = [
-                    card.model_copy(
-                        update={"limitations": card.limitations + (limitation,)}
-                    )
-                    for card in cards
-                ]
-        return cards, tuple(validation_limitations)
+        if not self.config.time_validation_enabled:
+            return cards, tuple(validation_limitations)
+        if holdout_limitation is not None:
+            return (
+                _with_limitation(cards, holdout_limitation, downgrade=True),
+                tuple(validation_limitations),
+            )
+        if not rules or holdout is None:
+            return cards, tuple(validation_limitations)
+
+        holdout_projection = holdout.select(validation_columns)
+        try:
+            holdout_cards = validate_rules(
+                train_projection,
+                holdout_projection,
+                rules,
+                **kwargs,
+            )
+        except (ArithmeticError, ValueError):
+            limitation = "Holdout validation could not be computed"
+            validation_limitations.append(limitation)
+            return (
+                _with_limitation(cards, limitation, downgrade=True),
+                tuple(validation_limitations),
+            )
+        return _attach_holdout(cards, holdout_cards), tuple(validation_limitations)
 
     def inspect(self) -> DatasetProfile:
         return profile_dataset(self._dataset(), self.config)
@@ -401,87 +494,123 @@ class RiskProbeService:
     def discover(self) -> list[RiskRule]:
         dataset = self._dataset()
         feature_names = self._feature_names(dataset)
-        train, _, _ = self._partitions(dataset, feature_names)
+        train, _, _, _ = self._partitions(dataset, feature_names)
         return self._discover_from_train(train, feature_names)
 
     def run(self) -> RunContext:
-        dataset = self._dataset()
-        data_fingerprint = _parquet_metadata_fingerprint(self.config.dataset.path)
-        code_version = _package_version()
-        context = self.store.create(
-            self.config,
-            data_fingerprint,
-            code_version,
-        )
-        if context.is_existing:
-            return context
+        with _stable_dataset_snapshot(
+            self.config.dataset.path, self.store.runs_dir
+        ) as snapshot_path:
+            dataset = ParquetDataset(snapshot_path)
+            data_fingerprint = _parquet_metadata_fingerprint(snapshot_path)
+            code_version = _package_version()
+            context = self.store.create(
+                self.config,
+                data_fingerprint,
+                code_version,
+            )
+            if context.is_existing:
+                return context
 
-        try:
-            profile = profile_dataset(dataset, self.config)
-            artifact_profile = replace(
-                profile,
-                dataset_id=_safe_dataset_id(profile.dataset_id),
-            )
-            feature_names = self._feature_names(dataset)
-            train, test, holdout = self._partitions(dataset, feature_names)
-            rules = self._discover_from_train(train, feature_names)
-            cards, validation_limitations = self._validate(train, test, holdout, rules)
-            split_rows = {
-                "train": train.height,
-                "test": test.height,
-                "holdout": holdout.height if holdout is not None else 0,
-            }
-            limitations = sorted(
-                {
-                    *validation_limitations,
-                    *(
-                        redact_limitation(limitation)
-                        for card in cards
-                        for limitation in card.limitations
-                    ),
+            try:
+                profile = profile_dataset(dataset, self.config)
+                artifact_profile = replace(
+                    profile,
+                    dataset_id=_safe_dataset_id(profile.dataset_id),
+                )
+                feature_names = self._feature_names(dataset)
+                train, test, holdout, excluded_null_snapshot_rows = self._partitions(
+                    dataset, feature_names
+                )
+                rules = self._discover_from_train(train, feature_names)
+                cards, validation_limitations = self._validate(
+                    train, test, holdout, rules
+                )
+                if excluded_null_snapshot_rows:
+                    null_snapshot_limitation = (
+                        "Time validation excluded "
+                        f"{excluded_null_snapshot_rows} rows with null snapshot values"
+                    )
+                    cards = _with_limitation(
+                        cards,
+                        null_snapshot_limitation,
+                        downgrade=False,
+                    )
+                    validation_limitations = tuple(
+                        sorted(
+                            {
+                                *validation_limitations,
+                                null_snapshot_limitation,
+                            }
+                        )
+                    )
+                split_rows = {
+                    "train": train.height,
+                    "test": test.height,
+                    "holdout": holdout.height if holdout is not None else 0,
                 }
-            )
-            if profile.metadata_grade == "B":
-                limitations = sorted({"label performance window unknown", *limitations})
-            context.write_json(
-                "manifest.json",
-                {
-                    "artifacts": list(_ARTIFACT_NAMES),
-                    "code_version": code_version,
-                    "data_fingerprint": data_fingerprint,
-                    "dataset_id": artifact_profile.dataset_id,
-                    "run_id": context.run_id,
-                    "time_validation_enabled": self.config.time_validation_enabled,
-                },
-            )
-            context.write_json(
-                "metadata_report.json",
-                {
-                    "metadata_grade": profile.metadata_grade,
-                    "limitations": limitations,
-                    "split_rows": split_rows,
-                    "time_validation_enabled": self.config.time_validation_enabled,
-                },
-            )
-            context.write_json("data_profile.json", _profile_payload(artifact_profile))
-            context.write_parquet("candidate_rules.parquet", _candidate_frame(rules))
-            context.write_json(
-                "evidence_cards.json",
-                _evidence_payload(
-                    cards,
-                    time_validation_enabled=self.config.time_validation_enabled,
-                ),
-            )
-            context.write_text(
-                "risk_report.md",
-                _render_service_report(
-                    artifact_profile,
-                    cards,
-                    validation_limitations,
-                ),
-            )
-            context.finalize()
-            return context
-        except BaseException:
-            context.cleanup()
-            raise
+                limitations = sorted(
+                    {
+                        *validation_limitations,
+                        *(
+                            redact_limitation(limitation)
+                            for card in cards
+                            for limitation in card.limitations
+                        ),
+                    }
+                )
+                if profile.metadata_grade == "B":
+                    limitations = sorted(
+                        {"label performance window unknown", *limitations}
+                    )
+                context.write_json(
+                    "metadata_report.json",
+                    {
+                        "metadata_grade": profile.metadata_grade,
+                        "limitations": limitations,
+                        "split_rows": split_rows,
+                        "time_validation_enabled": self.config.time_validation_enabled,
+                    },
+                )
+                context.write_json(
+                    "data_profile.json",
+                    _profile_payload(
+                        artifact_profile,
+                        excluded_null_snapshot_rows=excluded_null_snapshot_rows,
+                    ),
+                )
+                context.write_parquet(
+                    "candidate_rules.parquet", _candidate_frame(rules)
+                )
+                context.write_json(
+                    "evidence_cards.json",
+                    _evidence_payload(
+                        cards,
+                        time_validation_enabled=self.config.time_validation_enabled,
+                    ),
+                )
+                context.write_text(
+                    "risk_report.md",
+                    _render_service_report(
+                        artifact_profile,
+                        cards,
+                        validation_limitations,
+                    ),
+                )
+                context.write_canonical_json(
+                    "manifest.json",
+                    {
+                        "artifact_integrity": _artifact_integrity(context.run_dir),
+                        "artifacts": list(_ARTIFACT_NAMES),
+                        "code_version": code_version,
+                        "data_fingerprint": data_fingerprint,
+                        "dataset_id": artifact_profile.dataset_id,
+                        "run_id": context.run_id,
+                        "time_validation_enabled": self.config.time_validation_enabled,
+                    },
+                )
+                context.finalize()
+                return context
+            except BaseException:
+                context.cleanup()
+                raise

@@ -47,26 +47,74 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+_REQUIRED_ARTIFACTS = (
+    "manifest.json",
+    "metadata_report.json",
+    "data_profile.json",
+    "candidate_rules.parquet",
+    "evidence_cards.json",
+    "risk_report.md",
+)
+_INTEGRITY_ARTIFACTS = _REQUIRED_ARTIFACTS[1:]
+
+
+def _file_integrity(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return {"sha256": digest.hexdigest(), "size": size}
+
+
 def _is_complete_run(run_dir: Path) -> bool:
     manifest_path = run_dir / "manifest.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            return False
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
     except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
         return False
-    artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
-    if not isinstance(artifacts, list) or not artifacts:
+    if not isinstance(manifest, dict):
         return False
-    if any(
-        not isinstance(name, str)
-        or not name
-        or Path(name).name != name
-        or name in {".", "..", ".incomplete"}
-        for name in artifacts
-    ):
+    if manifest_bytes != f"{_canonical_json(manifest)}\n".encode("utf-8"):
         return False
-    return "manifest.json" in artifacts and all(
-        (run_dir / name).is_file() for name in artifacts
-    )
+    if manifest.get("artifacts") != list(_REQUIRED_ARTIFACTS):
+        return False
+    integrity = manifest.get("artifact_integrity")
+    if not isinstance(integrity, dict) or set(integrity) != set(_INTEGRITY_ARTIFACTS):
+        return False
+    try:
+        directory_entries = {entry.name for entry in run_dir.iterdir()}
+    except OSError:
+        return False
+    allowed_entries = set(_REQUIRED_ARTIFACTS)
+    if (run_dir / ".incomplete").is_file():
+        allowed_entries.add(".incomplete")
+    if directory_entries != allowed_entries:
+        return False
+    for name in _INTEGRITY_ARTIFACTS:
+        path = run_dir / name
+        record = integrity.get(name)
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not isinstance(record, dict)
+            or set(record) != {"sha256", "size"}
+            or not isinstance(record.get("sha256"), str)
+            or not isinstance(record.get("size"), int)
+            or isinstance(record.get("size"), bool)
+            or record["size"] < 0
+        ):
+            return False
+        try:
+            if _file_integrity(path) != record:
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def _release_lock(handle: BinaryIO | None) -> None:
@@ -127,6 +175,9 @@ class RunContext:
             sort_keys=True,
         )
         self._atomic_bytes(name, f"{rendered}\n".encode("utf-8"))
+
+    def write_canonical_json(self, name: str, payload: Any) -> None:
+        self._atomic_bytes(name, f"{_canonical_json(payload)}\n".encode("utf-8"))
 
     def write_text(self, name: str, content: str) -> None:
         self._atomic_bytes(name, content.encode("utf-8"))

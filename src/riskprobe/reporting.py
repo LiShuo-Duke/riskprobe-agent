@@ -1,11 +1,37 @@
 from collections import Counter
 from collections.abc import Sequence
 import hashlib
+from pathlib import Path, PureWindowsPath
+import re
+from urllib.parse import unquote, urlsplit
 
 from riskprobe.models import EvidenceCard
 from riskprobe.profiling import DatasetProfile
 
 _GRADE_ORDER = {"Stable": 0, "Local": 1, "Unstable": 2, "Suspicious": 3}
+_EMBEDDED_POSIX_PATH = re.compile(
+    r"(?:^|[=:\s|;,])/(?:[^/\s]+/)+[^/\s]+"
+)
+_EMBEDDED_WINDOWS_PATH = re.compile(
+    r"(?:^|[=:\s|;,])(?:[A-Za-z]:[\\/](?:[^\\/\s]+[\\/])+[^\\/\s]+|\\\\[^\\/\s]+[\\/][^\s]+)"
+)
+
+
+def safe_dataset_id(dataset_id: str) -> str:
+    decoded = unquote(dataset_id)
+    parsed = urlsplit(decoded)
+    is_file_uri = parsed.scheme.lower() == "file"
+    is_path = (
+        is_file_uri
+        or Path(decoded).is_absolute()
+        or PureWindowsPath(decoded).is_absolute()
+        or _EMBEDDED_POSIX_PATH.search(decoded) is not None
+        or _EMBEDDED_WINDOWS_PATH.search(decoded) is not None
+    )
+    if not is_path:
+        return dataset_id
+    digest = hashlib.sha256(dataset_id.encode("utf-8")).hexdigest()[:8]
+    return f"dataset-{digest}"
 
 
 def redact_segment_value(value: str) -> str:
@@ -63,7 +89,7 @@ def render_risk_report(
             "",
             "## Sample Overview",
             "",
-            f"- Dataset: `{profile.dataset_id}`",
+            f"- Dataset: `{safe_dataset_id(profile.dataset_id)}`",
             f"- Rows: {profile.row_count}",
             f"- Features: {profile.feature_count}",
             f"- Positive rate: {_number(profile.positive_rate)}",

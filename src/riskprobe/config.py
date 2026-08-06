@@ -25,7 +25,16 @@ class DatasetConfig(StrictModel):
     @field_validator("path")
     @classmethod
     def require_local_parquet(cls, path: Path) -> Path:
-        if urlparse(str(path)).scheme:
+        path_text = str(path)
+        if path_text.startswith(("//", "\\\\")):
+            raise ValueError("dataset path must be local")
+        is_windows_drive_path = (
+            len(path_text) >= 3
+            and path_text[0].isalpha()
+            and path_text[1] == ":"
+            and path_text[2] in ("/", "\\")
+        )
+        if urlparse(path_text).scheme and not is_windows_drive_path:
             raise ValueError("dataset path must be local")
         if path.suffix.lower() != ".parquet":
             raise ValueError("dataset path must have a .parquet extension")
@@ -55,6 +64,11 @@ class SnapshotConfig(StrictModel):
 class FeatureFamilyConfig(StrictModel):
     families: Mapping[str, tuple[str, ...]]
     explicit_catalog: Path | None = None
+
+    @field_validator("explicit_catalog", mode="before")
+    @classmethod
+    def parse_explicit_catalog_path(cls, path: object) -> object:
+        return Path(path) if isinstance(path, str) else path
 
     @field_validator("families", mode="before")
     @classmethod

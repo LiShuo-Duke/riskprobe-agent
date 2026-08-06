@@ -53,27 +53,30 @@ def _safe_dataset_id(dataset_id: str) -> str:
 
 
 @contextmanager
-def _stable_dataset_snapshot(source: Path, snapshot_dir: Path) -> Iterator[Path]:
-    snapshot_path: Path | None = None
-    try:
-        with source.open("rb") as source_handle, tempfile.NamedTemporaryFile(
-            dir=snapshot_dir,
-            prefix=".riskprobe-input-",
-            suffix=".parquet",
-            delete=False,
-        ) as snapshot_handle:
-            snapshot_path = Path(snapshot_handle.name)
-            shutil.copyfileobj(source_handle, snapshot_handle)
-            snapshot_handle.flush()
-        snapshot_path.chmod(0o400)
-        yield snapshot_path
-    finally:
-        if snapshot_path is not None:
-            try:
-                snapshot_path.chmod(0o600)
-            except FileNotFoundError:
-                pass
-            snapshot_path.unlink(missing_ok=True)
+def _stable_dataset_snapshot(
+    source: Path, _legacy_runs_dir: Path | None = None
+) -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="riskprobe-input-") as temporary_dir:
+        snapshot_path: Path | None = None
+        try:
+            with source.open("rb") as source_handle, tempfile.NamedTemporaryFile(
+                dir=temporary_dir,
+                prefix="input-",
+                suffix=".parquet",
+                delete=False,
+            ) as snapshot_handle:
+                snapshot_path = Path(snapshot_handle.name)
+                shutil.copyfileobj(source_handle, snapshot_handle)
+                snapshot_handle.flush()
+            snapshot_path.chmod(0o400)
+            yield snapshot_path
+        finally:
+            if snapshot_path is not None:
+                try:
+                    snapshot_path.chmod(0o600)
+                except FileNotFoundError:
+                    pass
+                snapshot_path.unlink(missing_ok=True)
 
 
 def _parquet_metadata_fingerprint(path: Path) -> str:
@@ -479,7 +482,7 @@ class RiskProbeService:
                 rules,
                 **kwargs,
             )
-        except (ArithmeticError, ValueError):
+        except Exception:
             limitation = "Holdout validation could not be computed"
             validation_limitations.append(limitation)
             return (
@@ -498,16 +501,17 @@ class RiskProbeService:
         return self._discover_from_train(train, feature_names)
 
     def run(self) -> RunContext:
-        with _stable_dataset_snapshot(
-            self.config.dataset.path, self.store.runs_dir
-        ) as snapshot_path:
+        with _stable_dataset_snapshot(self.config.dataset.path) as snapshot_path:
             dataset = ParquetDataset(snapshot_path)
             data_fingerprint = _parquet_metadata_fingerprint(snapshot_path)
             code_version = _package_version()
+            expected_dataset_id = _safe_dataset_id(self.config.dataset.id)
             context = self.store.create(
                 self.config,
                 data_fingerprint,
                 code_version,
+                dataset_id=expected_dataset_id,
+                time_validation_enabled=self.config.time_validation_enabled,
             )
             if context.is_existing:
                 return context
@@ -516,7 +520,7 @@ class RiskProbeService:
                 profile = profile_dataset(dataset, self.config)
                 artifact_profile = replace(
                     profile,
-                    dataset_id=_safe_dataset_id(profile.dataset_id),
+                    dataset_id=expected_dataset_id,
                 )
                 feature_names = self._feature_names(dataset)
                 train, test, holdout, excluded_null_snapshot_rows = self._partitions(
@@ -603,8 +607,9 @@ class RiskProbeService:
                         "artifact_integrity": _artifact_integrity(context.run_dir),
                         "artifacts": list(_ARTIFACT_NAMES),
                         "code_version": code_version,
+                        "config_fingerprint": self.store.config_fingerprint(self.config),
                         "data_fingerprint": data_fingerprint,
-                        "dataset_id": artifact_profile.dataset_id,
+                        "dataset_id": expected_dataset_id,
                         "run_id": context.run_id,
                         "time_validation_enabled": self.config.time_validation_enabled,
                     },

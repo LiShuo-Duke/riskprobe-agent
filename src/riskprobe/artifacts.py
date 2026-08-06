@@ -56,6 +56,19 @@ _REQUIRED_ARTIFACTS = (
     "risk_report.md",
 )
 _INTEGRITY_ARTIFACTS = _REQUIRED_ARTIFACTS[1:]
+_MANIFEST_IDENTITY_FIELDS = (
+    "run_id",
+    "config_fingerprint",
+    "data_fingerprint",
+    "code_version",
+    "dataset_id",
+    "time_validation_enabled",
+)
+_MANIFEST_FIELDS = {
+    "artifacts",
+    "artifact_integrity",
+    *_MANIFEST_IDENTITY_FIELDS,
+}
 
 
 def _file_integrity(path: Path) -> dict[str, Any]:
@@ -68,7 +81,30 @@ def _file_integrity(path: Path) -> dict[str, Any]:
     return {"sha256": digest.hexdigest(), "size": size}
 
 
-def _is_complete_run(run_dir: Path) -> bool:
+def _write_canonical_json(path: Path, payload: Any) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(f"{_canonical_json(payload)}\n".encode("utf-8"))
+            handle.flush()
+            temporary = Path(handle.name)
+        temporary.replace(path)
+        path.chmod(0o400)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _is_complete_run(
+    run_dir: Path,
+    expected_identity: Mapping[str, Any],
+    integrity_anchor: Path | None = None,
+) -> bool:
     manifest_path = run_dir / "manifest.json"
     try:
         if manifest_path.is_symlink() or not manifest_path.is_file():
@@ -81,7 +117,12 @@ def _is_complete_run(run_dir: Path) -> bool:
         return False
     if manifest_bytes != f"{_canonical_json(manifest)}\n".encode("utf-8"):
         return False
+    if set(manifest) != _MANIFEST_FIELDS:
+        return False
     if manifest.get("artifacts") != list(_REQUIRED_ARTIFACTS):
+        return False
+    identity = {name: manifest.get(name) for name in _MANIFEST_IDENTITY_FIELDS}
+    if identity != dict(expected_identity):
         return False
     integrity = manifest.get("artifact_integrity")
     if not isinstance(integrity, dict) or set(integrity) != set(_INTEGRITY_ARTIFACTS):
@@ -114,7 +155,21 @@ def _is_complete_run(run_dir: Path) -> bool:
                 return False
         except OSError:
             return False
-    return True
+    if integrity_anchor is None:
+        return True
+    try:
+        if integrity_anchor.is_symlink() or not integrity_anchor.is_file():
+            return False
+        anchor_bytes = integrity_anchor.read_bytes()
+        anchor = json.loads(anchor_bytes)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return False
+    expected_anchor = {"artifact_integrity": integrity, "identity": identity}
+    return (
+        isinstance(anchor, dict)
+        and anchor_bytes == f"{_canonical_json(anchor)}\n".encode("utf-8")
+        and anchor == expected_anchor
+    )
 
 
 def _release_lock(handle: BinaryIO | None) -> None:
@@ -130,11 +185,15 @@ class RunContext:
         run_dir: Path,
         *,
         is_existing: bool,
+        expected_identity: Mapping[str, Any],
+        integrity_anchor: Path,
         lock_handle: BinaryIO | None = None,
     ) -> None:
         self.run_id = run_id
         self.run_dir = run_dir
         self.is_existing = is_existing
+        self._expected_identity = dict(expected_identity)
+        self._integrity_anchor = integrity_anchor
         self._lock_handle = lock_handle
         self._writable = not is_existing
 
@@ -202,7 +261,20 @@ class RunContext:
 
     def finalize(self) -> None:
         self._ensure_writable()
-        if not _is_complete_run(self.run_dir):
+        if not _is_complete_run(self.run_dir, self._expected_identity):
+            raise RuntimeError(f"run {self.run_id} is not complete")
+        manifest = json.loads((self.run_dir / "manifest.json").read_text())
+        _write_canonical_json(
+            self._integrity_anchor,
+            {
+                "artifact_integrity": manifest["artifact_integrity"],
+                "identity": self._expected_identity,
+            },
+        )
+        if not _is_complete_run(
+            self.run_dir, self._expected_identity, self._integrity_anchor
+        ):
+            self._integrity_anchor.unlink(missing_ok=True)
             raise RuntimeError(f"run {self.run_id} is not complete")
         (self.run_dir / ".incomplete").unlink()
         self._writable = False
@@ -210,8 +282,10 @@ class RunContext:
         self._lock_handle = None
 
     def cleanup(self) -> None:
-        if self._writable and (self.run_dir / ".incomplete").exists():
-            shutil.rmtree(self.run_dir)
+        if self._writable:
+            self._integrity_anchor.unlink(missing_ok=True)
+            if (self.run_dir / ".incomplete").exists():
+                shutil.rmtree(self.run_dir)
         self._writable = False
         _release_lock(self._lock_handle)
         self._lock_handle = None
@@ -221,6 +295,10 @@ class RunStore:
     def __init__(self, runs_dir: Path) -> None:
         self.runs_dir = Path(runs_dir).resolve()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def config_fingerprint(config: Any) -> str:
+        return hashlib.sha256(f"{_canonical_json(config)}\n".encode("utf-8")).hexdigest()
 
     def compute_run_id(
         self,
@@ -236,10 +314,22 @@ class RunStore:
         config: Any,
         data_fingerprint: str,
         code_version: str,
+        *,
+        dataset_id: str | None = None,
+        time_validation_enabled: bool | None = None,
     ) -> RunContext:
         run_id = self.compute_run_id(config, data_fingerprint, code_version)
+        expected_identity = {
+            "run_id": run_id,
+            "config_fingerprint": self.config_fingerprint(config),
+            "data_fingerprint": data_fingerprint,
+            "code_version": code_version,
+            "dataset_id": dataset_id,
+            "time_validation_enabled": time_validation_enabled,
+        }
         run_dir = self.runs_dir / run_id
         incomplete = run_dir / ".incomplete"
+        integrity_anchor = self.runs_dir / f".{run_id}.integrity.json"
         lock_handle = (self.runs_dir / f".{run_id}.lock").open("a+b")
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -251,19 +341,32 @@ class RunStore:
             if run_dir.exists():
                 if incomplete.is_file():
                     shutil.rmtree(run_dir)
-                elif run_dir.is_dir() and _is_complete_run(run_dir):
+                    integrity_anchor.unlink(missing_ok=True)
+                elif run_dir.is_dir() and _is_complete_run(
+                    run_dir, expected_identity, integrity_anchor
+                ):
                     _release_lock(lock_handle)
-                    return RunContext(run_id, run_dir, is_existing=True)
+                    return RunContext(
+                        run_id,
+                        run_dir,
+                        is_existing=True,
+                        expected_identity=expected_identity,
+                        integrity_anchor=integrity_anchor,
+                    )
                 elif run_dir.is_dir():
                     raise RuntimeError(f"run {run_id} is not complete")
                 else:
                     raise FileExistsError(run_dir)
+            else:
+                integrity_anchor.unlink(missing_ok=True)
             run_dir.mkdir()
             incomplete.write_bytes(b"")
             return RunContext(
                 run_id,
                 run_dir,
                 is_existing=False,
+                expected_identity=expected_identity,
+                integrity_anchor=integrity_anchor,
                 lock_handle=lock_handle,
             )
         except BaseException:

@@ -615,8 +615,12 @@ def test_single_class_holdout_downgrades_each_card_and_reports_limitation(
     assert limitation in metadata["limitations"]
 
 
-def test_holdout_validation_error_downgrades_each_card_instead_of_failing_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("unstable implementation detail"), RuntimeError("backend failure")],
+)
+def test_holdout_validation_exception_downgrades_each_card_instead_of_failing_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
     config = _small_config(
         tmp_path,
@@ -624,7 +628,7 @@ def test_holdout_validation_error_downgrades_each_card_instead_of_failing_run(
         time_validation_enabled=True,
         metadata_grade="A",
     )
-    responses = iter([[_card()], ValueError("unstable implementation detail")])
+    responses = iter([[_card()], error])
 
     def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
         response = next(responses)
@@ -641,7 +645,7 @@ def test_holdout_validation_error_downgrades_each_card_instead_of_failing_run(
     limitation = "Holdout validation could not be computed"
     assert evidence[0]["grade"] == "Suspicious"
     assert limitation in evidence[0]["limitations"]
-    assert "unstable implementation detail" not in json.dumps(evidence)
+    assert str(error) not in json.dumps(evidence)
 
 
 def test_missing_holdout_rule_downgrades_only_missing_card(
@@ -790,6 +794,26 @@ def test_renderer_preserves_ordinary_business_dataset_ids(business_id: str) -> N
     assert f"`{business_id}`" in report
 
 
+def test_stable_snapshot_is_private_to_os_temp_and_removed_after_use(
+    tmp_path: Path,
+) -> None:
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+
+    with service_module._stable_dataset_snapshot(
+        config.dataset.path, runs_dir
+    ) as snapshot_path:
+        snapshot_dir = snapshot_path.parent
+        assert snapshot_dir != runs_dir
+        assert snapshot_path.read_bytes() == config.dataset.path.read_bytes()
+        assert snapshot_path.stat().st_mode & 0o777 == 0o400
+        assert snapshot_dir.stat().st_mode & 0o777 == 0o700
+        assert not list(runs_dir.glob(".riskprobe-input-*.parquet"))
+
+    assert not snapshot_dir.exists()
+
+
 def test_snapshot_copy_failure_removes_temporary_raw_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -803,4 +827,43 @@ def test_snapshot_copy_failure_removes_temporary_raw_data(
     with pytest.raises(OSError, match="simulated snapshot copy failure"):
         RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
-    assert list((tmp_path / "runs").glob("*.parquet")) == []
+    assert not list((tmp_path / "runs").glob(".riskprobe-input-*.parquet"))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("run_id", "other-run"),
+        ("config_fingerprint", "0" * 64),
+        ("data_fingerprint", "0" * 64),
+        ("code_version", "other-version"),
+        ("dataset_id", "other-dataset"),
+        ("time_validation_enabled", True),
+    ],
+)
+def test_reuse_rejects_canonical_manifest_identity_mutation(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    config = _small_config(tmp_path)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+    first = service.run()
+
+    first.run_dir.chmod(0o755)
+    manifest_path = first.run_dir / "manifest.json"
+    manifest_path.chmod(0o644)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = replacement
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        service.run()

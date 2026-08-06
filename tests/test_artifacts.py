@@ -28,7 +28,13 @@ def _canonical_json(payload: object) -> str:
     ) + "\n"
 
 
-def _write_complete_run(context: object) -> None:
+def _write_complete_run(
+    context: object,
+    *,
+    config: object = "cfg",
+    data_fingerprint: str = "data",
+    code_version: str = "0.1.0",
+) -> None:
     for name in _ARTIFACTS[1:]:
         context.write_text(name, f"content for {name}\n")
     integrity = {}
@@ -44,6 +50,14 @@ def _write_complete_run(context: object) -> None:
             {
                 "artifact_integrity": integrity,
                 "artifacts": list(_ARTIFACTS),
+                "code_version": code_version,
+                "config_fingerprint": hashlib.sha256(
+                    _canonical_json(config).encode("utf-8")
+                ).hexdigest(),
+                "data_fingerprint": data_fingerprint,
+                "dataset_id": None,
+                "run_id": context.run_id,
+                "time_validation_enabled": None,
             }
         ),
     )
@@ -227,6 +241,32 @@ def test_reuse_rejects_symlinked_artifact(tmp_path: Path) -> None:
     external.write_bytes(report.read_bytes())
     report.unlink()
     report.symlink_to(external)
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        store.create("cfg", "data", "0.1.0")
+
+
+def test_reuse_rejects_rehashed_artifact_and_canonical_manifest_rewrite(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "runs")
+    context = store.create("cfg", "data", "0.1.0")
+    _write_complete_run(context)
+    context.finalize()
+
+    context.run_dir.chmod(0o755)
+    report = context.run_dir / "risk_report.md"
+    manifest_path = context.run_dir / "manifest.json"
+    report.chmod(0o644)
+    manifest_path.chmod(0o644)
+    report.write_text("substituted report\n", encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    content = report.read_bytes()
+    manifest["artifact_integrity"]["risk_report.md"] = {
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size": len(content),
+    }
+    manifest_path.write_text(_canonical_json(manifest), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="not complete"):
         store.create("cfg", "data", "0.1.0")

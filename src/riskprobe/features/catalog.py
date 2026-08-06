@@ -92,22 +92,30 @@ def check_window_invariants(
     frame: pl.DataFrame,
     catalog: FeatureCatalog,
 ) -> tuple[QualityIssue, ...]:
-    groups: defaultdict[tuple[str, str], list[FeatureSpec]] = defaultdict(list)
+    window_groups: defaultdict[tuple[str, str, int], list[FeatureSpec]] = defaultdict(list)
     for spec in catalog.features:
         if spec.window_days is not None and _is_comparable_cumulative(spec):
-            groups[(spec.family, spec.aggregation)].append(spec)
+            window_groups[(spec.family, spec.aggregation, spec.window_days)].append(spec)
+
+    groups: defaultdict[tuple[str, str], dict[int, list[FeatureSpec]]] = defaultdict(dict)
+    for (family, aggregation, window_days), specs in window_groups.items():
+        groups[(family, aggregation)][window_days] = specs
 
     issues: list[QualityIssue] = []
-    for (family, aggregation), specs in groups.items():
-        ordered = sorted(specs, key=lambda spec: spec.window_days or 0)
-        if len(ordered) < 2:
+    for (family, aggregation), windows in groups.items():
+        ordered_windows = sorted(windows.items())
+        if len(ordered_windows) < 2:
             continue
         inversion = pl.lit(False)
-        for shorter, longer in zip(ordered, ordered[1:]):
-            inversion = inversion | (pl.col(shorter.name) > pl.col(longer.name)).fill_null(False)
+        for (_, shorter_specs), (_, longer_specs) in zip(ordered_windows, ordered_windows[1:]):
+            for shorter in shorter_specs:
+                for longer in longer_specs:
+                    inversion = inversion | (pl.col(shorter.name) > pl.col(longer.name)).fill_null(
+                        False
+                    )
         affected_rows = frame.select(inversion.sum()).item()
         if affected_rows:
-            features = tuple(spec.name for spec in ordered)
+            features = tuple(spec.name for _, specs in ordered_windows for spec in specs)
             issues.append(
                 QualityIssue(
                     code="WINDOW_INVERSION",

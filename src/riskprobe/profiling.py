@@ -49,6 +49,7 @@ def profile_dataset(dataset: ParquetDataset, config: ProjectConfig) -> DatasetPr
     frame = dataset.collect(selected_columns)
     row_count = frame.height
 
+    _validate_target(frame, config.columns.target)
     snapshot_min, snapshot_max, parsed_snapshots = _snapshot_range(frame, config)
     positive_rate = _positive_rate(frame, config)
     segment_counts = _segment_counts(frame, config.columns.segment)
@@ -97,6 +98,14 @@ def profile_dataset(dataset: ParquetDataset, config: ProjectConfig) -> DatasetPr
     )
 
 
+def _validate_target(frame: pl.DataFrame, target_column: str) -> None:
+    targets = frame.get_column(target_column)
+    if targets.null_count():
+        raise DataContractError(f"target column {target_column} contains null values")
+    if any(value not in (0, 1) for value in targets.unique().to_list()):
+        raise DataContractError(f"target column {target_column} must contain only 0 and 1")
+
+
 def _snapshot_range(
     frame: pl.DataFrame,
     config: ProjectConfig,
@@ -123,7 +132,7 @@ def _positive_rate(frame: pl.DataFrame, config: ProjectConfig) -> float | None:
     if frame.height == 0:
         return None
     positives = frame.get_column(config.columns.target) == config.target.positive_value
-    return float(positives.fill_null(False).sum() / frame.height)
+    return float(positives.sum() / frame.height)
 
 
 def _segment_counts(frame: pl.DataFrame, segment_column: str) -> dict[str, int]:
@@ -146,7 +155,7 @@ def _single_class_issues(
     )
     issues = []
     for group_value, class_count, group_rows in grouped.iter_rows():
-        if class_count <= 1:
+        if class_count == 1:
             issues.append(
                 QualityIssue(
                     code="SINGLE_CLASS_SLICE",

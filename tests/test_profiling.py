@@ -161,6 +161,77 @@ def test_disabled_time_validation_rejects_all_null_snapshots(
         profile_dataset(dataset, config)
 
 
+@pytest.mark.parametrize("target_values", [[0, None], [None, None]])
+def test_null_target_values_raise_data_contract_error(
+    tmp_path: Path,
+    synthetic_config: ProjectConfig,
+    target_values: list[int | None],
+) -> None:
+    dataset = _write_dataset(
+        tmp_path,
+        {
+            "entity_id": ["a", "b"],
+            "snapshot_date": ["2026-01-01", "2026-01-02"],
+            "institution": ["A", "A"],
+            "target": target_values,
+            "order_cnt_7d": [0, 1],
+        },
+    )
+
+    with pytest.raises(DataContractError, match=r"target.*null"):
+        profile_dataset(dataset, synthetic_config)
+
+
+def test_non_binary_target_values_raise_data_contract_error(
+    tmp_path: Path, synthetic_config: ProjectConfig
+) -> None:
+    dataset = _write_dataset(
+        tmp_path,
+        {
+            "entity_id": ["a", "b", "c"],
+            "snapshot_date": ["2026-01-01"] * 3,
+            "institution": ["A"] * 3,
+            "target": [0, 1, 2],
+            "order_cnt_7d": [0, 1, 2],
+        },
+    )
+
+    with pytest.raises(DataContractError, match=r"target.*0 and 1"):
+        profile_dataset(dataset, synthetic_config)
+
+
+@pytest.mark.parametrize("target_value", [0, 1])
+def test_single_class_zero_or_one_segment_is_warned_without_blocking(
+    tmp_path: Path,
+    synthetic_config: ProjectConfig,
+    target_value: int,
+) -> None:
+    dataset = _write_dataset(
+        tmp_path,
+        {
+            "entity_id": ["a", "b"],
+            "snapshot_date": ["2026-01-01", "2026-01-02"],
+            "institution": ["A", "A"],
+            "target": [target_value, target_value],
+            "order_cnt_7d": [0, 1],
+        },
+    )
+
+    profile = profile_dataset(
+        dataset,
+        _config_with(synthetic_config, performance_window_days=30),
+    )
+
+    segment_issues = [
+        issue
+        for issue in profile.issues
+        if issue.code == "SINGLE_CLASS_SLICE" and issue.family == "institution"
+    ]
+    assert len(segment_issues) == 1
+    assert segment_issues[0].affected_rows == 2
+    assert profile.positive_rate == float(target_value)
+
+
 def test_profile_contains_aggregates_not_entity_values(
     tmp_path: Path, synthetic_config: ProjectConfig
 ) -> None:

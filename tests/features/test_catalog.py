@@ -92,3 +92,34 @@ def test_window_before_aggregation_is_compared() -> None:
 
     assert len(issues) == 1
     assert issues[0].affected_rows == 1
+
+
+def test_same_window_aliases_are_never_compared() -> None:
+    frame = pl.DataFrame(
+        {
+            "order_cnt_7d": [5],
+            "order_7d_cnt": [1],
+        }
+    )
+    catalog = FeatureCatalog.from_columns(frame.columns, {"order": ("order_",)})
+
+    issues = check_window_invariants(frame, catalog)
+
+    assert issues == ()
+
+
+def test_every_alias_is_compared_with_aliases_in_the_next_unique_window() -> None:
+    frame = pl.DataFrame(
+        {
+            "order_cnt_7d": [5],
+            "order_7d_cnt": [None],
+            "order_cnt_30d": [None],
+            "order_30d_cnt": [3],
+        }
+    )
+    catalog = FeatureCatalog.from_columns(frame.columns, {"order": ("order_",)})
+
+    issues = check_window_invariants(frame, catalog)
+
+    assert len(issues) == 1
+    assert issues[0].affected_rows == 1

@@ -1,18 +1,35 @@
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
+from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
 class DatasetConfig(StrictModel):
     id: str
     path: Path
-    read_only: bool = True
+    read_only: Literal[True] = True
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def parse_dataset_path(cls, path: object) -> object:
+        return Path(path) if isinstance(path, str) else path
+
+    @field_validator("path")
+    @classmethod
+    def require_local_parquet(cls, path: Path) -> Path:
+        if urlparse(str(path)).scheme:
+            raise ValueError("dataset path must be local")
+        if path.suffix.lower() != ".parquet":
+            raise ValueError("dataset path must have a .parquet extension")
+        return path
 
 
 class ColumnRoles(StrictModel):
@@ -23,7 +40,7 @@ class ColumnRoles(StrictModel):
 
 
 class TargetConfig(StrictModel):
-    positive_value: int = 1
+    positive_value: Literal[1] = 1
     positive_meaning: Literal["bad_debt"]
     performance_window_days: int | None = Field(default=None, gt=0)
 
@@ -36,8 +53,25 @@ class SnapshotConfig(StrictModel):
 
 
 class FeatureFamilyConfig(StrictModel):
-    families: dict[str, list[str]]
+    families: Mapping[str, tuple[str, ...]]
     explicit_catalog: Path | None = None
+
+    @field_validator("families", mode="before")
+    @classmethod
+    def convert_family_lists_to_tuples(cls, families: object) -> object:
+        if not isinstance(families, Mapping):
+            return families
+        return {
+            name: tuple(prefixes) if isinstance(prefixes, list) else prefixes
+            for name, prefixes in families.items()
+        }
+
+    @field_validator("families")
+    @classmethod
+    def freeze_families(
+        cls, families: Mapping[str, tuple[str, ...]]
+    ) -> Mapping[str, tuple[str, ...]]:
+        return MappingProxyType(dict(families))
 
 
 class DiscoveryConfig(StrictModel):
@@ -45,7 +79,7 @@ class DiscoveryConfig(StrictModel):
     max_single_rules: int = Field(default=100, ge=1)
     beam_width: int = Field(default=20, ge=1)
     max_pair_rules: int = Field(default=50, ge=0)
-    random_seed: int = 42
+    random_seed: Literal[42] = 42
 
 
 class ValidationConfig(StrictModel):

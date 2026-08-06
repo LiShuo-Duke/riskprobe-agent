@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from riskprobe.config import ProjectConfig
+from riskprobe.config import (
+    DatasetConfig,
+    DiscoveryConfig,
+    FeatureFamilyConfig,
+    ProjectConfig,
+    TargetConfig,
+)
 
 
 def test_company_metadata_without_performance_window_is_grade_b(tmp_path: Path) -> None:
@@ -53,3 +59,40 @@ features: {families: {order: [order_]}}
 
     with pytest.raises(ValidationError):
         ProjectConfig.from_yaml(config_path)
+
+
+def test_strict_models_reject_coercible_values() -> None:
+    with pytest.raises(ValidationError):
+        DiscoveryConfig(max_single_rules="100")
+
+
+@pytest.mark.parametrize(
+    ("path", "read_only"),
+    [
+        (Path("/tmp/demo.csv"), True),
+        (Path("s3://bucket/demo.parquet"), True),
+        (Path("/tmp/demo.parquet"), False),
+    ],
+)
+def test_dataset_requires_local_read_only_parquet(path: Path, read_only: bool) -> None:
+    with pytest.raises(ValidationError):
+        DatasetConfig(id="demo", path=path, read_only=read_only)
+
+
+def test_positive_value_must_be_one() -> None:
+    with pytest.raises(ValidationError):
+        TargetConfig(positive_value=0, positive_meaning="bad_debt")
+
+
+def test_random_seed_must_be_42() -> None:
+    with pytest.raises(ValidationError):
+        DiscoveryConfig(random_seed=7)
+
+
+def test_feature_families_are_deeply_immutable() -> None:
+    config = FeatureFamilyConfig(families={"order": ["order_"]})
+
+    with pytest.raises(TypeError):
+        config.families["browse"] = ["browse_"]
+    with pytest.raises(AttributeError):
+        config.families["order"].append("late_")

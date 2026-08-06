@@ -40,7 +40,7 @@ class RuleMetrics(FrozenModel):
 
 
 class SliceMetrics(FrozenModel):
-    slice_type: Literal["dataset", "institution", "time"]
+    slice_type: Literal["dataset", "segment", "time"]
     slice_value: str
     metrics: RuleMetrics
 

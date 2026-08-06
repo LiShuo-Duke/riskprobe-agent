@@ -5,7 +5,34 @@ import pytest
 from pydantic import ValidationError
 
 from riskprobe.metrics import adjust_pvalues, bootstrap_lift_ci, compute_rule_metrics
-from riskprobe.models import RuleMetrics
+from riskprobe.models import RuleMetrics, SliceMetrics
+
+
+def _sample_rule_metrics() -> RuleMetrics:
+    return compute_rule_metrics(
+        np.array([True, False]),
+        np.array([1, 0]),
+        positive_value=1,
+    )
+
+
+def test_slice_metrics_accepts_segment() -> None:
+    slice_metrics = SliceMetrics(
+        slice_type="segment",
+        slice_value="small_business",
+        metrics=_sample_rule_metrics(),
+    )
+
+    assert slice_metrics.slice_type == "segment"
+
+
+def test_slice_metrics_rejects_institution() -> None:
+    with pytest.raises(ValidationError):
+        SliceMetrics(
+            slice_type="institution",
+            slice_value="bank_a",
+            metrics=_sample_rule_metrics(),
+        )
 
 
 def test_rule_metrics_match_hand_calculation() -> None:
@@ -108,6 +135,55 @@ def test_bootstrap_lift_ci_is_seeded_and_finite() -> None:
     assert first == second
     assert first[0] <= first[1]
     assert all(math.isfinite(bound) for bound in first)
+
+
+def test_bootstrap_lift_ci_matches_manual_stratified_low_positive_rate() -> None:
+    target = np.array([1] + [0] * 19)
+    mask = np.array([True, True, True, True, True] + [False] * 15)
+    rounds = 40
+
+    actual = bootstrap_lift_ci(
+        mask,
+        target,
+        positive_value=1,
+        rounds=rounds,
+        random_seed=42,
+    )
+
+    rng = np.random.default_rng(42)
+    positive_indices = np.flatnonzero(target == 1)
+    negative_indices = np.flatnonzero(target != 1)
+    manual_lifts = []
+    for _ in range(rounds):
+        sampled_indices = np.concatenate(
+            (
+                rng.choice(positive_indices, size=len(positive_indices), replace=True),
+                rng.choice(negative_indices, size=len(negative_indices), replace=True),
+            )
+        )
+        manual_lifts.append(
+            compute_rule_metrics(
+                mask[sampled_indices],
+                target[sampled_indices],
+                positive_value=1,
+            ).lift
+        )
+    expected = np.quantile(manual_lifts, [0.025, 0.975])
+
+    assert actual == pytest.approx(expected)
+
+
+def test_bootstrap_lift_ci_positive_only_returns_finite_interval() -> None:
+    interval = bootstrap_lift_ci(
+        np.array([True, True, True]),
+        np.array([1, 1, 1]),
+        positive_value=1,
+        rounds=20,
+        random_seed=42,
+    )
+
+    assert interval == (1.0, 1.0)
+    assert all(math.isfinite(bound) for bound in interval)
 
 
 def test_adjust_pvalues_uses_benjamini_hochberg() -> None:

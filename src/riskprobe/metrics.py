@@ -83,21 +83,33 @@ def bootstrap_lift_ci(
         raise ValueError("confidence_level must be between 0 and 1")
 
     rng = np.random.default_rng(random_seed)
+    positive_indices = np.flatnonzero(target_array == positive_value)
+    negative_indices = np.flatnonzero(target_array != positive_value)
     lifts: list[float] = []
     for _ in range(rounds):
-        indices = rng.integers(0, len(target_array), size=len(target_array))
-        sampled_target = target_array[indices]
-        if not np.any(sampled_target == positive_value):
-            continue
+        sampled_positive_indices = rng.choice(
+            positive_indices,
+            size=len(positive_indices),
+            replace=True,
+        )
+        if len(negative_indices):
+            sampled_negative_indices = rng.choice(
+                negative_indices,
+                size=len(negative_indices),
+                replace=True,
+            )
+            sampled_indices = np.concatenate(
+                (sampled_positive_indices, sampled_negative_indices)
+            )
+        else:
+            sampled_indices = sampled_positive_indices
         sampled_metrics = compute_rule_metrics(
-            mask_array[indices],
-            sampled_target,
+            mask_array[sampled_indices],
+            target_array[sampled_indices],
             positive_value,
         )
         lifts.append(sampled_metrics.lift)
 
-    if not lifts:
-        raise ValueError("bootstrap samples contain no positive samples")
     tail_probability = (1.0 - confidence_level) / 2.0
     lower, upper = np.quantile(lifts, [tail_probability, 1.0 - tail_probability])
     return float(lower), float(upper)

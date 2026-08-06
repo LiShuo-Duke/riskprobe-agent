@@ -6,6 +6,7 @@ from types import MappingProxyType
 import polars as pl
 
 from riskprobe.config import ProjectConfig
+from riskprobe.dates import normalize_date_series
 from riskprobe.features.catalog import FeatureCatalog, QualityIssue, check_window_invariants
 from riskprobe.io.parquet import ParquetDataset
 
@@ -117,14 +118,12 @@ def _snapshot_range(
     if not config.time_validation_enabled:
         return None, None, None
 
-    if snapshots.dtype == pl.Date:
-        parsed = snapshots
-    elif isinstance(snapshots.dtype, pl.Datetime):
-        parsed = snapshots.cast(pl.Date)
-    else:
-        parsed = snapshots.cast(pl.String).str.to_date(strict=False)
-    if parsed.null_count() != snapshots.null_count():
-        raise DataContractError(f"snapshot column {snapshot_column} contains invalid dates")
+    try:
+        parsed = normalize_date_series(snapshots)
+    except ValueError as error:
+        raise DataContractError(
+            f"snapshot column {snapshot_column} contains invalid dates"
+        ) from error
     return parsed.min(), parsed.max(), parsed
 
 

@@ -5,6 +5,7 @@ from typing import Literal
 import polars as pl
 
 from riskprobe.config import ValidationConfig
+from riskprobe.dates import normalize_date_series
 from riskprobe.metrics import adjust_pvalues, bootstrap_lift_ci, compute_rule_metrics
 from riskprobe.models import EvidenceCard, RiskRule, RuleMetrics, SliceMetrics
 from riskprobe.rules.expression import evaluate_rule
@@ -20,6 +21,7 @@ class _RuleValidation:
     segment_consistency: float
     max_time_decay: float
     insufficient_samples: bool
+    limitations: tuple[str, ...]
 
 
 def _metrics(frame: pl.DataFrame, rule: RiskRule, target_col: str) -> RuleMetrics:
@@ -37,47 +39,39 @@ def _group_slices(
     target_col: str,
     group_col: str,
     slice_type: Literal["segment", "time"],
+    display_name: str,
     min_group_size: int,
-) -> tuple[tuple[SliceMetrics, ...], bool]:
+) -> tuple[tuple[SliceMetrics, ...], tuple[str, ...]]:
     slices: list[SliceMetrics] = []
-    has_uncomputable_group = False
+    limitations: list[str] = []
     for group in frame.partition_by(group_col, maintain_order=True):
         if group.height < min_group_size:
             continue
-        try:
-            metrics = _metrics(group, rule, target_col)
-        except ValueError as error:
-            if str(error) == "target has no positive samples":
-                has_uncomputable_group = True
-                continue
-            raise
+        group_value = str(group.get_column(group_col)[0])
+        if group.get_column(target_col).drop_nulls().n_unique() == 1:
+            limitations.append(f"single-class {display_name}: {group_value}")
+            continue
         slices.append(
             SliceMetrics(
                 slice_type=slice_type,
-                slice_value=str(group.get_column(group_col)[0]),
-                metrics=metrics,
+                slice_value=group_value,
+                metrics=_metrics(group, rule, target_col),
             )
         )
-    return tuple(slices), has_uncomputable_group
+    return tuple(slices), tuple(limitations)
 
 
-def _with_time_bucket(frame: pl.DataFrame, snapshot_col: str) -> pl.DataFrame:
-    dtype = frame.schema[snapshot_col]
-    if dtype == pl.String:
-        parsed = pl.col(snapshot_col).str.to_date(
-            format="%Y-%m-%d", strict=False
-        )
-    elif dtype == pl.Date:
-        parsed = pl.col(snapshot_col)
-    elif isinstance(dtype, pl.Datetime):
-        parsed = pl.col(snapshot_col).dt.date()
-    else:
-        raise ValueError("snapshot column contains invalid dates")
+def _with_time_bucket(
+    frame: pl.DataFrame, snapshot_col: str
+) -> tuple[pl.DataFrame, int]:
+    try:
+        parsed = normalize_date_series(frame.get_column(snapshot_col))
+    except ValueError as error:
+        raise ValueError("snapshot column contains invalid dates") from error
 
     bucketed = frame.with_columns(parsed.dt.strftime("%Y-%m").alias("__time_bucket"))
-    if bucketed.get_column("__time_bucket").null_count():
-        raise ValueError("snapshot column contains invalid dates")
-    return bucketed
+    missing_count = bucketed.get_column("__time_bucket").null_count()
+    return bucketed.filter(pl.col("__time_bucket").is_not_null()), missing_count
 
 
 def _validate_rule(
@@ -87,6 +81,7 @@ def _validate_rule(
     *,
     target_col: str,
     segment_col: str,
+    segment_display_name: str,
     snapshot_col: str,
     time_validation_enabled: bool,
     config: ValidationConfig,
@@ -103,12 +98,13 @@ def _validate_rule(
         random_seed=42,
     )
 
-    segment_slices, has_uncomputable_segment = _group_slices(
+    segment_slices, segment_limitations = _group_slices(
         test,
         rule,
         target_col=target_col,
         group_col=segment_col,
         slice_type="segment",
+        display_name=segment_display_name,
         min_group_size=config.min_group_size,
     )
     stable_segment_count = sum(
@@ -119,16 +115,22 @@ def _validate_rule(
     )
 
     time_slices: tuple[SliceMetrics, ...] = ()
-    has_uncomputable_time = False
+    time_limitations: tuple[str, ...] = ()
+    date_limitations: tuple[str, ...] = ()
     max_time_decay = 0.0
     if time_validation_enabled:
-        time_frame = _with_time_bucket(test, snapshot_col)
-        time_slices, has_uncomputable_time = _group_slices(
+        time_frame, missing_date_count = _with_time_bucket(test, snapshot_col)
+        if missing_date_count:
+            date_limitations = (
+                f"missing time values: {missing_date_count} rows excluded",
+            )
+        time_slices, time_limitations = _group_slices(
             time_frame,
             rule,
             target_col=target_col,
             group_col="__time_bucket",
             slice_type="time",
+            display_name="time",
             min_group_size=config.min_group_size,
         )
         if time_slices and train_metrics.lift > 0.0:
@@ -142,10 +144,10 @@ def _validate_rule(
         train.height < config.min_group_size
         or test.height < config.min_group_size
         or not segment_slices
-        or has_uncomputable_segment
+        or bool(segment_limitations)
         or (
             time_validation_enabled
-            and (not time_slices or has_uncomputable_time)
+            and (not time_slices or bool(time_limitations))
         )
     )
     return _RuleValidation(
@@ -157,6 +159,7 @@ def _validate_rule(
         segment_consistency=segment_consistency,
         max_time_decay=max_time_decay,
         insufficient_samples=insufficient_samples,
+        limitations=segment_limitations + time_limitations + date_limitations,
     )
 
 
@@ -208,6 +211,7 @@ def validate_rules(
             rule,
             target_col=target_col,
             segment_col=segment_col,
+            segment_display_name=segment_display_name,
             snapshot_col=snapshot_col,
             time_validation_enabled=time_validation_enabled,
             config=config,
@@ -217,7 +221,7 @@ def validate_rules(
     adjusted_p_values = adjust_pvalues(
         [validation.train.p_value for validation in validations]
     )
-    limitations = (
+    metadata_limitations = (
         ("label performance window unknown",) if metadata_grade == "B" else ()
     )
 
@@ -232,7 +236,7 @@ def validate_rules(
             segment_consistency=validation.segment_consistency,
             max_time_decay=validation.max_time_decay,
             grade=_grade(validation, adjusted_p_value, config),
-            limitations=limitations,
+            limitations=metadata_limitations + validation.limitations,
         )
         for validation, adjusted_p_value in zip(
             validations, adjusted_p_values, strict=True

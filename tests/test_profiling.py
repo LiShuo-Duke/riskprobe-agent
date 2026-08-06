@@ -73,6 +73,27 @@ def test_enabled_time_validation_rejects_invalid_snapshot(
         profile_dataset(dataset, synthetic_config)
 
 
+def test_profile_accepts_categorical_snapshots_with_original_nulls(
+    tmp_path: Path, synthetic_config: ProjectConfig
+) -> None:
+    path = tmp_path / "categorical-snapshots.parquet"
+    pl.DataFrame(
+        {
+            "entity_id": ["a", "b", "c"],
+            "snapshot_date": ["2026-01-01", None, "2026-02-01"],
+            "institution": ["A", "A", "B"],
+            "target": [0, 1, 0],
+            "order_cnt_7d": [0, 1, 2],
+        }
+    ).with_columns(pl.col("snapshot_date").cast(pl.Categorical)).write_parquet(path)
+    dataset = ParquetDataset(path)
+
+    profile = profile_dataset(dataset, synthetic_config)
+
+    assert profile.snapshot_min == date(2026, 1, 1)
+    assert profile.snapshot_max == date(2026, 2, 1)
+
+
 @pytest.mark.parametrize("missing_role", ["entity_id", "snapshot_date", "institution", "target"])
 def test_missing_role_column_raises_data_contract_error(
     tmp_path: Path,

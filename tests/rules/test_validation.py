@@ -50,6 +50,7 @@ def _validate(
     test: pl.DataFrame,
     rules: list[RiskRule] | None = None,
     *,
+    segment_display_name: str = "institution",
     time_validation_enabled: bool = True,
     metadata_grade: str = "A",
     config: ValidationConfig = _CONFIG,
@@ -61,7 +62,7 @@ def _validate(
         target_col="target",
         segment_col="institution",
         snapshot_col="snapshot_date",
-        segment_display_name="institution",
+        segment_display_name=segment_display_name,
         time_validation_enabled=time_validation_enabled,
         config=config,
         metadata_grade=metadata_grade,
@@ -118,22 +119,56 @@ def test_global_dataset_below_minimum_size_is_suspicious() -> None:
     assert all(math.isfinite(value) for value in card.lift_ci)
 
 
-def test_segment_slices_apply_size_threshold_and_skip_no_positive_group() -> None:
+@pytest.mark.parametrize("single_class_target", [0, 1])
+def test_segment_slices_skip_single_class_symmetrically_with_auditable_limitation(
+    single_class_target: int,
+) -> None:
+    single_class_counts = (
+        (0, 10, 0, 10) if single_class_target == 0 else (10, 0, 10, 0)
+    )
     frame = _frame(
         [
             ("exactly_twenty", "2026-01-01", 8, 2, 2, 8),
             ("nineteen", "2026-01-01", 8, 2, 2, 7),
-            ("no_positives", "2026-01-01", 0, 10, 0, 10),
+            ("single_class", "2026-01-01", *single_class_counts),
         ]
     )
 
-    card = _validate(frame, frame)[0]
+    card = _validate(
+        frame,
+        frame,
+        segment_display_name="customer_segment",
+        time_validation_enabled=False,
+    )[0]
     segment_slices = [item for item in card.slices if item.slice_type == "segment"]
 
     assert [item.slice_value for item in segment_slices] == ["exactly_twenty"]
     assert card.segment_consistency == 1.0
     assert card.grade == "Suspicious"
+    assert "single-class customer_segment: single_class" in card.limitations
     assert all(math.isfinite(item.metrics.lift) for item in card.slices)
+
+
+@pytest.mark.parametrize("single_class_target", [0, 1])
+def test_time_slices_skip_single_class_symmetrically_with_stable_limitation_name(
+    single_class_target: int,
+) -> None:
+    single_class_counts = (
+        (0, 10, 0, 10) if single_class_target == 0 else (10, 0, 10, 0)
+    )
+    frame = _frame(
+        [
+            ("A", "2026-01-01", 40, 10, 10, 40),
+            ("A", "2026-02-01", *single_class_counts),
+        ]
+    )
+
+    card = _validate(frame, frame)[0]
+    time_slices = [item for item in card.slices if item.slice_type == "time"]
+
+    assert [item.slice_value for item in time_slices] == ["2026-01"]
+    assert card.grade == "Suspicious"
+    assert "single-class time: 2026-02" in card.limitations
 
 
 @pytest.mark.parametrize(
@@ -164,11 +199,38 @@ def test_time_slices_parse_supported_dates_to_year_month(
     ] == expected
 
 
+def test_validation_accepts_categorical_snapshots_and_ignores_original_nulls() -> None:
+    frame = _frame(
+        [
+            ("A", "2026-01-01", 40, 10, 10, 40),
+            ("A", None, 8, 2, 2, 8),
+        ]
+    ).with_columns(pl.col("snapshot_date").cast(pl.Categorical))
+
+    card = _validate(frame, frame)[0]
+
+    assert [
+        item.slice_value for item in card.slices if item.slice_type == "time"
+    ] == ["2026-01"]
+    assert "missing time values: 20 rows excluded" in card.limitations
+
+
 def test_invalid_snapshot_date_is_rejected_when_time_validation_is_enabled() -> None:
     frame = _frame([("A", "not-a-date", 80, 20, 20, 80)])
 
     with pytest.raises(ValueError, match="^snapshot column contains invalid dates$"):
         _validate(frame, frame)
+
+
+@pytest.mark.parametrize("empty_dataset", ["train", "test"])
+def test_zero_row_dataset_is_rejected_with_stable_error(empty_dataset: str) -> None:
+    valid = _frame([("A", "2026-01-01", 80, 20, 20, 80)])
+    empty = valid.clear()
+    train = empty if empty_dataset == "train" else valid
+    test = empty if empty_dataset == "test" else valid
+
+    with pytest.raises(ValueError, match="^mask and target must not be empty$"):
+        _validate(train, test)
 
 
 def test_adjusted_pvalues_are_assigned_to_corresponding_input_rules() -> None:

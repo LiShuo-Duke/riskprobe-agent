@@ -257,6 +257,6 @@ def discover_rules(
 
     singles = _single_candidates(train, feature_names, target, config)
     selected_singles = singles[: config.max_single_rules]
-    pairs = _pair_candidates(train, target, selected_singles, config)
+    pairs = _pair_candidates(train, target, singles, config)
     selected_pairs = pairs[: config.max_pair_rules]
     return [candidate.rule for candidate in selected_singles + selected_pairs]

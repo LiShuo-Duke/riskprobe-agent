@@ -60,6 +60,47 @@ def test_discovery_generates_pair_rules_from_different_features() -> None:
     )
 
 
+def test_pair_beam_is_independent_of_single_rule_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x = [-1.0] + [1.0] * 4
+    train = pl.DataFrame(
+        {
+            "x": x * 3,
+            "y": [-1.0] * 5 + [1.0] * 5 + [2.0] * 5,
+            "target": [0] * 10 + [0, 1, 1, 1, 1],
+        }
+    )
+
+    def fixed_thresholds(
+        _train: pl.DataFrame,
+        feature_name: str,
+        _target: object,
+        _config: DiscoveryConfig,
+    ) -> list[float]:
+        return {"x": [0.0], "y": [0.0, 1.0]}[feature_name]
+
+    monkeypatch.setattr(
+        "riskprobe.rules.discovery._feature_thresholds", fixed_thresholds
+    )
+    config = DiscoveryConfig(
+        min_support=0.1,
+        max_single_rules=2,
+        beam_width=3,
+        max_pair_rules=10,
+    )
+
+    rules = discover_rules(train, ["x", "y"], "target", config)
+    singles = [rule for rule in rules if len(rule.conditions) == 1]
+    pairs = [rule for rule in rules if len(rule.conditions) == 2]
+
+    assert {rule.conditions[0].feature for rule in singles} == {"y"}
+    assert any(
+        {condition.feature for condition in rule.conditions} == {"x", "y"}
+        for rule in pairs
+    )
+
+
 def test_discovery_skips_all_null_constant_nan_and_infinite_features() -> None:
     train = pl.DataFrame(
         {

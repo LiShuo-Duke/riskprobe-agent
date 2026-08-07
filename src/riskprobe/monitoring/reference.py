@@ -147,7 +147,12 @@ def _stable_deidentified_dataset_id(dataset_id: str) -> str:
 
 
 def _stable_deidentified_code(identifier: str) -> str:
-    decoded = unquote(identifier)
+    decoded = identifier
+    while True:
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
     if (
         urlsplit(decoded).scheme.lower() == "file"
         or "/" in decoded
@@ -162,13 +167,14 @@ def _deidentified_segment_counts(
     segment_counts: Iterable[tuple[str, int]],
     min_group_size: int,
 ) -> dict[str, int]:
-    retained_counts = tuple(
-        (str(segment), int(count))
+    deidentified_counts = tuple(
+        (_stable_deidentified_code(str(segment)), int(count))
         for segment, count in sorted(segment_counts, key=lambda item: str(item[0]))
-        if count >= min_group_size
     )
     return {
-        _stable_deidentified_code(segment): count for segment, count in retained_counts
+        segment: count
+        for segment, count in deidentified_counts
+        if count >= min_group_size
     }
 
 

@@ -24,6 +24,14 @@ _PATH_LIKE_IDENTIFIER_IDS = (
     "relative-windows-path",
     "drive-relative-windows-path",
 )
+_REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIERS = (
+    "%252Fprivate%252Fcustomer-data.parquet",
+    "file%253A%252F%252Fprivate%252Fcustomer-data.parquet",
+)
+_REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIER_IDS = (
+    "twice-encoded-posix-path",
+    "twice-encoded-file-uri",
+)
 
 
 def test_reference_snapshot_contains_aggregates_not_entities(reference_fixture) -> None:
@@ -86,6 +94,74 @@ def test_reference_snapshot_rejects_path_like_rule_ids(
 
     with pytest.raises(ValueError, match="path-like identifier"):
         build_reference_snapshot(**dict(reference_fixture, evidence_cards=(path_like_card,)))
+
+
+@pytest.mark.parametrize(
+    "dataset_id",
+    _REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIERS,
+    ids=_REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIER_IDS,
+)
+def test_reference_snapshot_rejects_repeatedly_encoded_path_like_dataset_ids(
+    reference_fixture,
+    dataset_id: str,
+) -> None:
+    profile = replace(reference_fixture["profile"], dataset_id=dataset_id)
+
+    with pytest.raises(ValueError, match="path-like identifier"):
+        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+
+
+@pytest.mark.parametrize(
+    "segment_code",
+    _REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIERS,
+    ids=_REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIER_IDS,
+)
+def test_reference_snapshot_rejects_repeatedly_encoded_path_like_segment_codes(
+    reference_fixture,
+    segment_code: str,
+) -> None:
+    minimum = reference_fixture["config"].validation.min_group_size
+    profile = replace(reference_fixture["profile"], segment_counts={segment_code: minimum})
+
+    with pytest.raises(ValueError, match="path-like identifier"):
+        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+
+
+@pytest.mark.parametrize(
+    "rule_id",
+    _REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIERS,
+    ids=_REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIER_IDS,
+)
+def test_reference_snapshot_rejects_repeatedly_encoded_path_like_rule_ids(
+    reference_fixture,
+    rule_id: str,
+) -> None:
+    card = reference_fixture["evidence_cards"][0]
+    path_like_card = card.model_copy(
+        update={"rule": card.rule.model_copy(update={"rule_id": rule_id})}
+    )
+
+    with pytest.raises(ValueError, match="path-like identifier"):
+        build_reference_snapshot(**dict(reference_fixture, evidence_cards=(path_like_card,)))
+
+
+@pytest.mark.parametrize(
+    "segment_code",
+    _PATH_LIKE_IDENTIFIERS + _REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIERS,
+    ids=_PATH_LIKE_IDENTIFIER_IDS + _REPEATEDLY_ENCODED_PATH_LIKE_IDENTIFIER_IDS,
+)
+def test_reference_snapshot_rejects_path_like_codes_below_group_threshold(
+    reference_fixture,
+    segment_code: str,
+) -> None:
+    minimum = reference_fixture["config"].validation.min_group_size
+    profile = replace(
+        reference_fixture["profile"],
+        segment_counts={"ordinary-small-group": minimum - 1, segment_code: minimum - 1},
+    )
+
+    with pytest.raises(ValueError, match="path-like identifier"):
+        build_reference_snapshot(**dict(reference_fixture, profile=profile))
 
 
 @pytest.mark.parametrize("stable_code", ["d1", "1ab", "A12"])

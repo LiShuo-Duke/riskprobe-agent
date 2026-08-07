@@ -79,3 +79,27 @@ Result: installation succeeded and `.venv/bin/python -c 'import mcp; print("mcp-
 - `.venv/bin/python -m pytest -v`: **225 passed**
 - `.venv/bin/ruff check .`: passed
 - `git diff --check`: passed
+
+## Deidentified-input contract migration and final review
+
+The user confirmed that every input is already deidentified. The implementation and design therefore removed the previous HMAC/key/namespace contract and now preserve stable deidentified dataset, segment, and rule codes for aggregate comparison.
+
+### Review/fix evidence
+
+- Independent review found and the following TDD fixes closed: direct path-like dataset IDs, unsuppressed small segment groups, rule-ID path leakage, overly restrictive code formatting, repeatedly percent-encoded paths, and validation skipped for suppressed groups.
+- The final implementation rejects path-like or file-URI identifiers at all dataset/segment/rule boundaries after repeated percent decoding, returns normal stable codes verbatim, validates every segment before applying the configured `min_group_size` suppression, and preserves deterministic ordering.
+- The final independent scoped review reported all prior findings **ADDRESSED**, no new Critical/Important finding, and **PASS**.
+
+### Final verification
+
+- `.venv/bin/python -m pytest -q`: **250 passed**
+- `.venv/bin/ruff check src tests`: passed
+- `git diff --check f41a5f6..HEAD`: passed
+
+### Additional commits
+
+- `f08a1c4 fix: use stable deidentified monitoring codes`
+- `e902472 docs: clarify deidentified monitoring contract`
+- `7d70388 fix: guard reference snapshot identifiers`
+- `0f5ae6b fix: validate reference snapshot rule identifiers`
+- `7ebe2d3 fix: reject encoded path-like reference identifiers`

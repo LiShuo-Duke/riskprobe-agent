@@ -237,8 +237,8 @@ def test_disabled_time_split_is_stratified_projected_and_read_only(
     discovery = captured["discovery"]
     train, test, kwargs = captured["validation"]  # type: ignore[misc]
     assert isinstance(discovery, pl.DataFrame)
-    assert discovery.columns == ["feature_a", "unused_feature", "target"]
-    assert captured["feature_names"] == ["feature_a", "unused_feature"]
+    assert discovery.columns == ["feature_a", "target"]
+    assert captured["feature_names"] == ["feature_a"]
     assert train.columns == ["feature_a", "target", "institution"]
     assert test.columns == ["feature_a", "target", "institution"]
     assert (train.height, test.height) == (70, 30)
@@ -998,3 +998,35 @@ def test_reuse_rejects_canonical_manifest_identity_mutation(
 
     with pytest.raises(RuntimeError, match="not complete"):
         service.run()
+
+
+def test_distinct_same_footer_inputs_do_not_reuse_a_completed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def footer_fingerprint(path: Path) -> str:
+        with path.open("rb") as handle:
+            handle.seek(-8, 2)
+            footer_size = int.from_bytes(handle.read(4), byteorder="little")
+            assert handle.read(4) == b"PAR1"
+            handle.seek(-(footer_size + 8), 2)
+            return hashlib.sha256(handle.read(footer_size)).hexdigest()
+
+    first_config = _small_config(tmp_path, rows=200)
+    second_path = tmp_path / "same-footer-different-values.parquet"
+    first_frame = pl.read_parquet(first_config.dataset.path)
+    first_frame.with_columns(
+        first_frame.get_column("feature_a").reverse().alias("feature_a")
+    ).write_parquet(second_path)
+    second_config = first_config.model_copy(
+        update={
+            "dataset": first_config.dataset.model_copy(update={"path": second_path})
+        }
+    )
+    assert footer_fingerprint(first_config.dataset.path) == footer_fingerprint(second_path)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+
+    first = RiskProbeService(config=first_config, runs_dir=tmp_path / "runs").run()
+    second = RiskProbeService(config=second_config, runs_dir=tmp_path / "runs").run()
+
+    assert first.run_id != second.run_id
+    assert second.is_existing is False

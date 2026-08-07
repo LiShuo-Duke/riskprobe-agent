@@ -61,9 +61,17 @@ def test_synthetic_then_run(tmp_path: Path) -> None:
 
     assert synthetic.exit_code == 0
     assert data_path.exists()
-    assert "rows=5000" in synthetic.stdout
-    assert "columns=16" in synthetic.stdout
-    assert "hidden_order_cancellation" in synthetic.stdout
+    synthetic_payload = json.loads(synthetic.stdout)
+    assert synthetic_payload == {
+        "columns": 16,
+        "command": "synthetic",
+        "rows": 5000,
+        "truth_rule_ids": [
+            "hidden_order_cancellation",
+            "hidden_night_browsing",
+            "hidden_multi_platform_low_order",
+        ],
+    }
     assert "bank_north" not in synthetic.stdout
     assert "entity_id" not in synthetic.stdout
 
@@ -75,7 +83,10 @@ def test_synthetic_then_run(tmp_path: Path) -> None:
     )
 
     assert run.exit_code == 0, run.stdout
-    assert "run_id=" in run.stdout
+    run_payload = json.loads(run.stdout)
+    assert run_payload["command"] == "run"
+    assert run_payload["metadata_grade"] == "B"
+    assert run_payload["artifact_count"] == 6
     run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
     assert (run_dirs[0] / "metadata_report.json").exists()

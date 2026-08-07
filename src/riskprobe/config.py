@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
@@ -85,7 +85,43 @@ class FeatureFamilyConfig(StrictModel):
     def freeze_families(
         cls, families: Mapping[str, tuple[str, ...]]
     ) -> Mapping[str, tuple[str, ...]]:
+        if any(not prefix for prefixes in families.values() for prefix in prefixes):
+            raise ValueError("feature family prefixes must be non-empty")
         return MappingProxyType(dict(families))
+
+    def select_columns(
+        self,
+        columns: Iterable[str],
+        role_columns: Iterable[str],
+    ) -> list[str]:
+        candidates = sorted(set(columns).difference(role_columns))
+        if self.explicit_catalog is not None:
+            return [
+                column
+                for column in candidates
+                if column in _catalog_feature_names(self.explicit_catalog)
+            ]
+        prefixes = tuple(
+            dict.fromkeys(prefix for family in self.families.values() for prefix in family)
+        )
+        return [
+            column
+            for column in candidates
+            if any(column.startswith(prefix) for prefix in prefixes)
+        ]
+
+
+def _catalog_feature_names(path: Path) -> frozenset[str]:
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError("explicit feature catalog must be a readable YAML file") from error
+    names = payload
+    if isinstance(payload, Mapping):
+        names = payload.get("features", payload.get("columns"))
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise ValueError("explicit feature catalog must list feature names")
+    return frozenset(names)
 
 
 class DiscoveryConfig(StrictModel):
@@ -122,4 +158,14 @@ class ProjectConfig(StrictModel):
     @classmethod
     def from_yaml(cls, path: Path) -> "ProjectConfig":
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-        return cls.model_validate(payload)
+        config = cls.model_validate(payload)
+        catalog = config.features.explicit_catalog
+        if catalog is None or catalog.is_absolute():
+            return config
+        return config.model_copy(
+            update={
+                "features": config.features.model_copy(
+                    update={"explicit_catalog": path.resolve().parent / catalog}
+                )
+            }
+        )

@@ -242,18 +242,11 @@ def _stable_dataset_snapshot(
 
 
 def _parquet_metadata_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        handle.seek(0, 2)
-        size = handle.tell()
-        if size < 12:
-            raise ValueError("invalid Parquet file")
-        handle.seek(-8, 2)
-        footer_size = int.from_bytes(handle.read(4), byteorder="little")
-        if handle.read(4) != b"PAR1" or footer_size > size - 12:
-            raise ValueError("invalid Parquet footer")
-        handle.seek(-(footer_size + 8), 2)
-        metadata = handle.read(footer_size)
-    return hashlib.sha256(metadata).hexdigest()
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _time_split(
@@ -520,13 +513,13 @@ class RiskProbeService:
         return ParquetDataset(self.config.dataset.path)
 
     def _feature_names(self, dataset: ParquetDataset) -> list[str]:
-        roles = {
+        roles = (
             self.config.columns.entity,
             self.config.columns.snapshot,
             self.config.columns.segment,
             self.config.columns.target,
-        }
-        return sorted(name for name in dataset.schema().names() if name not in roles)
+        )
+        return self.config.features.select_columns(dataset.schema().names(), roles)
 
     def _partitions(
         self, dataset: ParquetDataset, feature_names: list[str]

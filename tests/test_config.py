@@ -166,3 +166,8 @@ discovery:
     error_locations = {tuple(error["loc"]) for error in exc_info.value.errors()}
     assert ("discovery", "max_single_rules") in error_locations
     assert ("features", "explicit_catalog") not in error_locations
+
+
+def test_feature_families_reject_empty_prefixes() -> None:
+    with pytest.raises(ValidationError, match="non-empty"):
+        FeatureFamilyConfig(families={"mistake": [""]})

@@ -297,8 +297,32 @@ class RunStore:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def config_fingerprint(config: Any) -> str:
-        return hashlib.sha256(f"{_canonical_json(config)}\n".encode("utf-8")).hexdigest()
+    def _identity_config(config: Any) -> Any:
+        payload = _jsonable(config)
+        if not isinstance(payload, dict):
+            return payload
+        identity = dict(payload)
+        dataset = identity.get("dataset")
+        if isinstance(dataset, dict) and "path" in dataset:
+            identity["dataset"] = {**dataset, "path": "local-parquet-input"}
+        features = identity.get("features")
+        if isinstance(features, dict) and features.get("explicit_catalog") is not None:
+            catalog = Path(str(features["explicit_catalog"]))
+            try:
+                catalog_digest = hashlib.sha256(catalog.read_bytes()).hexdigest()
+            except OSError:
+                catalog_digest = "unreadable"
+            identity["features"] = {
+                **features,
+                "explicit_catalog": {"content_sha256": catalog_digest},
+            }
+        return identity
+
+    @classmethod
+    def config_fingerprint(cls, config: Any) -> str:
+        return hashlib.sha256(
+            f"{_canonical_json(cls._identity_config(config))}\n".encode("utf-8")
+        ).hexdigest()
 
     def compute_run_id(
         self,
@@ -306,7 +330,7 @@ class RunStore:
         data_fingerprint: str,
         code_version: str,
     ) -> str:
-        payload = f"{_canonical_json(config)}{data_fingerprint}{code_version}"
+        payload = f"{_canonical_json(self._identity_config(config))}{data_fingerprint}{code_version}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def create(

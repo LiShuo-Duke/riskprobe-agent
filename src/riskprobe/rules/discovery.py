@@ -206,13 +206,35 @@ def _single_candidates(
     return sorted(candidates.values(), key=_ranking_key, reverse=True)
 
 
+def _pair_beam(singles: list[_Candidate], width: int) -> list[_Candidate]:
+    grouped: dict[str, list[_Candidate]] = {}
+    for candidate in singles:
+        grouped.setdefault(candidate.rule.conditions[0].feature, []).append(candidate)
+    selected: list[_Candidate] = []
+    position = 0
+    while len(selected) < width:
+        added = False
+        for feature in sorted(grouped):
+            candidates = grouped[feature]
+            if position >= len(candidates):
+                continue
+            selected.append(candidates[position])
+            added = True
+            if len(selected) == width:
+                return selected
+        if not added:
+            return selected
+        position += 1
+    return selected
+
+
 def _pair_candidates(
     train: pl.DataFrame,
     target: np.ndarray[Any, np.dtype[Any]],
     singles: list[_Candidate],
     config: DiscoveryConfig,
 ) -> list[_Candidate]:
-    beam = singles[: config.beam_width]
+    beam = _pair_beam(singles, config.beam_width)
     candidates: dict[str, _Candidate] = {}
     for left_index, left in enumerate(beam):
         for right in beam[left_index + 1 :]:
@@ -234,6 +256,31 @@ def _pair_candidates(
                 continue
             candidates[candidate.expression] = candidate
     return sorted(candidates.values(), key=_ranking_key, reverse=True)
+
+
+def _diverse_pair_selection(
+    pairs: list[_Candidate],
+    maximum: int,
+) -> list[_Candidate]:
+    if maximum == 0:
+        return []
+    selected: list[_Candidate] = []
+    selected_expressions: set[str] = set()
+    represented_feature_pairs: set[tuple[str, str]] = set()
+    for candidate in pairs:
+        feature_pair = tuple(sorted(condition.feature for condition in candidate.rule.conditions))
+        if feature_pair not in represented_feature_pairs:
+            selected.append(candidate)
+            selected_expressions.add(candidate.expression)
+            represented_feature_pairs.add(feature_pair)
+            if len(selected) == maximum:
+                return sorted(selected, key=_ranking_key, reverse=True)
+    for candidate in pairs:
+        if candidate.expression not in selected_expressions:
+            selected.append(candidate)
+            if len(selected) == maximum:
+                break
+    return sorted(selected, key=_ranking_key, reverse=True)
 
 
 def discover_rules(
@@ -258,5 +305,5 @@ def discover_rules(
     singles = _single_candidates(train, feature_names, target, config)
     selected_singles = singles[: config.max_single_rules]
     pairs = _pair_candidates(train, target, singles, config)
-    selected_pairs = pairs[: config.max_pair_rules]
+    selected_pairs = _diverse_pair_selection(pairs, config.max_pair_rules)
     return [candidate.rule for candidate in selected_singles + selected_pairs]

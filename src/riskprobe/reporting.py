@@ -66,7 +66,11 @@ def render_risk_report(
 ) -> str:
     cards = sorted(evidence_cards, key=evidence_sort_key)
     counts = Counter(card.grade for card in cards)
-    time_validation_enabled = profile.snapshot_min is not None and profile.snapshot_max is not None
+    time_validation_enabled = (
+        profile.snapshot_min is not None
+        and profile.snapshot_max is not None
+        and profile.snapshot_min != profile.snapshot_max
+    )
     has_holdout = any(
         item.slice_type == "dataset" and item.slice_value == "Holdout"
         for card in cards
@@ -78,12 +82,17 @@ def render_risk_report(
         f"**Metadata Grade: {profile.metadata_grade}**",
     ]
     if profile.metadata_grade == "B":
-        lines.extend(
-            [
-                "",
-                "> Limitation: label performance window unknown; conclusions require additional validation.",
-            ]
+        limitation = (
+            "label performance window unknown; evidence reflects stability across "
+            "time slices, not a known performance window; conclusions require "
+            "additional validation."
         )
+        if not time_validation_enabled:
+            limitation = (
+                "label performance window unknown; time-slice stability was not "
+                "evaluated; conclusions require additional validation."
+            )
+        lines.extend(["", f"> Limitation: {limitation}"])
     lines.extend(
         [
             "",

@@ -92,10 +92,16 @@ def synthetic(
         frame.write_parquet(output)
     except OSError:
         _fail("output_error", "Choose a writable local --output Parquet path.")
-    rule_ids = ",".join(rule.rule_id for rule in truth.hidden_rules)
     typer.echo(
-        f"Synthetic dataset written: rows={frame.height} columns={frame.width} "
-        f"truth_rule_ids={rule_ids}"
+        json.dumps(
+            {
+                "columns": frame.width,
+                "command": "synthetic",
+                "rows": frame.height,
+                "truth_rule_ids": [rule.rule_id for rule in truth.hidden_rules],
+            },
+            sort_keys=True,
+        )
     )
 
 
@@ -168,7 +174,14 @@ def run(
             "Check the configured local dataset and runs directory, then rerun locally.",
         )
     typer.echo(
-        "Run completed: "
-        f"run_id={context.run_id} metadata_grade={service.config.metadata_grade} "
-        f"reused={context.is_existing}"
+        json.dumps(
+            {
+                "artifact_count": 6,
+                "command": "run",
+                "metadata_grade": service.config.metadata_grade,
+                "reused": context.is_existing,
+                "run_id": context.run_id,
+            },
+            sort_keys=True,
+        )
     )

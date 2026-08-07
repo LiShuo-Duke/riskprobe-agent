@@ -40,7 +40,9 @@ def profile_dataset(dataset: ParquetDataset, config: ProjectConfig) -> DatasetPr
     if missing_roles:
         raise DataContractError(f"missing required role columns: {', '.join(missing_roles)}")
 
-    feature_columns = tuple(column for column in schema.names() if column not in role_columns)
+    feature_columns = tuple(
+        config.features.select_columns(schema.names(), role_columns)
+    )
     selected_columns = (
         config.columns.snapshot,
         config.columns.segment,

@@ -1,5 +1,7 @@
+import fcntl
 import hashlib
 import json
+import uuid
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -792,6 +794,135 @@ def test_renderer_preserves_ordinary_business_dataset_ids(business_id: str) -> N
     report = render_risk_report(profile, [])
 
     assert f"`{business_id}`" in report
+
+
+_SNAPSHOT_MARKER = b"riskprobe raw snapshot v1\n"
+
+
+def _write_recoverable_snapshot(root: Path, source: Path) -> Path:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    snapshot_dir = root / f"snapshot-{uuid.uuid4().hex}"
+    snapshot_dir.mkdir(mode=0o700)
+    marker = snapshot_dir / ".riskprobe-snapshot"
+    marker.write_bytes(_SNAPSHOT_MARKER)
+    marker.chmod(0o400)
+    lock = snapshot_dir / ".lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    snapshot = snapshot_dir / "input.parquet"
+    snapshot.write_bytes(source.read_bytes())
+    snapshot.chmod(0o400)
+    return snapshot_dir
+
+
+def test_stable_snapshot_uses_private_service_root_and_never_runs_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    snapshot_root = tmp_path / "riskprobe-private-snapshots"
+    snapshot_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        service_module, "_snapshot_root", lambda: snapshot_root, raising=False
+    )
+
+    with service_module._stable_dataset_snapshot(
+        config.dataset.path, runs_dir
+    ) as snapshot_path:
+        snapshot_dir = snapshot_path.parent
+        assert snapshot_dir.parent == snapshot_root
+        assert snapshot_path.read_bytes() == config.dataset.path.read_bytes()
+        assert snapshot_path.stat().st_mode & 0o777 == 0o400
+        assert snapshot_dir.stat().st_mode & 0o777 == 0o700
+        assert snapshot_root.stat().st_mode & 0o777 == 0o700
+        assert list(runs_dir.iterdir()) == []
+
+    assert not snapshot_dir.exists()
+    assert list(snapshot_root.iterdir()) == []
+
+
+def test_service_recovers_only_unlocked_safe_snapshots_before_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path)
+    snapshot_root = tmp_path / "riskprobe-private-snapshots"
+    stale = _write_recoverable_snapshot(snapshot_root, config.dataset.path)
+    active = _write_recoverable_snapshot(snapshot_root, config.dataset.path)
+    insecure = _write_recoverable_snapshot(snapshot_root, config.dataset.path)
+    insecure.chmod(0o755)
+    unknown = snapshot_root / "unknown-entry"
+    unknown.write_text("leave me alone", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = snapshot_root / f"snapshot-{uuid.uuid4().hex}"
+    linked.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(
+        service_module, "_snapshot_root", lambda: snapshot_root, raising=False
+    )
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+
+    with (active / ".lock").open("r+b") as active_lock:
+        fcntl.flock(active_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+        assert not stale.exists()
+        assert active.is_dir()
+        assert insecure.is_dir()
+        assert unknown.read_text(encoding="utf-8") == "leave me alone"
+        assert linked.is_symlink()
+        assert outside.is_dir()
+
+
+def test_snapshot_copy_failure_cleans_recovered_and_new_private_raw_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path)
+    snapshot_root = tmp_path / "riskprobe-private-snapshots"
+    _write_recoverable_snapshot(snapshot_root, config.dataset.path)
+    monkeypatch.setattr(
+        service_module, "_snapshot_root", lambda: snapshot_root, raising=False
+    )
+
+    def fail_copy(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated snapshot copy failure")
+
+    monkeypatch.setattr(service_module.shutil, "copyfileobj", fail_copy)
+
+    with pytest.raises(OSError, match="simulated snapshot copy failure"):
+        RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    assert list(snapshot_root.iterdir()) == []
+    assert list((tmp_path / "runs").iterdir()) == []
+
+
+def test_snapshot_cleanup_failure_is_reported_and_recovered_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path)
+    snapshot_root = tmp_path / "riskprobe-private-snapshots"
+    snapshot_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        service_module, "_snapshot_root", lambda: snapshot_root, raising=False
+    )
+    real_rmtree = service_module.shutil.rmtree
+
+    def fail_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        if Path(path).parent == snapshot_root:
+            raise OSError("simulated snapshot cleanup failure")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(service_module.shutil, "rmtree", fail_cleanup)
+    with pytest.raises(OSError, match="simulated snapshot cleanup failure"):
+        with service_module._stable_dataset_snapshot(config.dataset.path) as snapshot:
+            stale_snapshot_dir = snapshot.parent
+
+    monkeypatch.setattr(service_module.shutil, "rmtree", real_rmtree)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    assert not stale_snapshot_dir.exists()
 
 
 def test_stable_snapshot_is_private_to_os_temp_and_removed_after_use(

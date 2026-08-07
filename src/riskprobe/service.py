@@ -1,12 +1,16 @@
+import fcntl
 import hashlib
 import json
+import os
+import secrets
 import shutil
+import stat
 import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Iterator
 
 import numpy as np
 import polars as pl
@@ -39,6 +43,12 @@ _ARTIFACT_NAMES = (
 )
 _SLICE_ORDER = {"dataset": 0, "segment": 1, "time": 2}
 _GRADE_ORDER = {"Stable": 0, "Local": 1, "Unstable": 2, "Suspicious": 3}
+_SNAPSHOT_ROOT_PREFIX = "riskprobe-input-snapshots-"
+_SNAPSHOT_DIR_PREFIX = "snapshot-"
+_SNAPSHOT_MARKER_NAME = ".riskprobe-snapshot"
+_SNAPSHOT_LOCK_NAME = ".lock"
+_SNAPSHOT_FILE_NAME = "input.parquet"
+_SNAPSHOT_MARKER = b"riskprobe raw snapshot v1\n"
 
 
 def _package_version() -> str:
@@ -52,31 +62,183 @@ def _safe_dataset_id(dataset_id: str) -> str:
     return safe_dataset_id(dataset_id)
 
 
+def _is_owned_private_directory(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(details.st_mode)
+        and details.st_uid == os.geteuid()
+        and stat.S_IMODE(details.st_mode) == 0o700
+    )
+
+
+def _is_owned_regular_file(path: Path, modes: set[int]) -> bool:
+    try:
+        details = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(details.st_mode)
+        and details.st_uid == os.geteuid()
+        and stat.S_IMODE(details.st_mode) in modes
+    )
+
+
+def _snapshot_root() -> Path:
+    root = Path(tempfile.gettempdir()) / f"{_SNAPSHOT_ROOT_PREFIX}{os.geteuid()}"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    if not _is_owned_private_directory(root):
+        raise RuntimeError("riskprobe snapshot root is not private")
+    return root
+
+
+def _snapshot_name_is_safe(name: str) -> bool:
+    token = name.removeprefix(_SNAPSHOT_DIR_PREFIX)
+    return (
+        name.startswith(_SNAPSHOT_DIR_PREFIX)
+        and len(token) == 32
+        and all(character in "0123456789abcdef" for character in token)
+    )
+
+
+def _write_private_marker(snapshot_dir: Path) -> None:
+    marker = snapshot_dir / _SNAPSHOT_MARKER_NAME
+    with marker.open("xb") as handle:
+        handle.write(_SNAPSHOT_MARKER)
+    marker.chmod(0o400)
+
+
+def _create_snapshot_lock(snapshot_dir: Path) -> BinaryIO:
+    lock_path = snapshot_dir / _SNAPSHOT_LOCK_NAME
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "r+b")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def _release_snapshot_lock(handle: BinaryIO | None) -> None:
+    if handle is not None and not handle.closed:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _recovery_lock(snapshot_dir: Path) -> BinaryIO | None:
+    lock_path = snapshot_dir / _SNAPSHOT_LOCK_NAME
+    if not _is_owned_private_directory(snapshot_dir) or not _is_owned_regular_file(
+        lock_path, {0o600}
+    ):
+        return None
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        handle = os.fdopen(descriptor, "r+b")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        lock_details = lock_path.lstat()
+        descriptor_details = os.fstat(handle.fileno())
+        if (
+            not _is_owned_regular_file(lock_path, {0o600})
+            or (lock_details.st_dev, lock_details.st_ino)
+            != (descriptor_details.st_dev, descriptor_details.st_ino)
+        ):
+            _release_snapshot_lock(handle)
+            return None
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        _release_snapshot_lock(handle)
+        return None
+    return handle
+
+
+def _is_recoverable_snapshot(snapshot_dir: Path) -> bool:
+    try:
+        entries = {entry.name for entry in snapshot_dir.iterdir()}
+    except OSError:
+        return False
+    expected = {
+        _SNAPSHOT_MARKER_NAME,
+        _SNAPSHOT_LOCK_NAME,
+        _SNAPSHOT_FILE_NAME,
+    }
+    if entries != expected:
+        return False
+    marker = snapshot_dir / _SNAPSHOT_MARKER_NAME
+    snapshot = snapshot_dir / _SNAPSHOT_FILE_NAME
+    return (
+        _is_owned_regular_file(marker, {0o400})
+        and marker.read_bytes() == _SNAPSHOT_MARKER
+        and _is_owned_regular_file(snapshot, {0o400, 0o600})
+    )
+
+
+def _recover_stale_dataset_snapshots(root: Path) -> None:
+    if not _is_owned_private_directory(root):
+        return
+    try:
+        candidates = list(root.iterdir())
+    except OSError:
+        return
+    for candidate in candidates:
+        if not _snapshot_name_is_safe(candidate.name):
+            continue
+        lock_handle = _recovery_lock(candidate)
+        if lock_handle is None:
+            continue
+        try:
+            if _is_recoverable_snapshot(candidate):
+                shutil.rmtree(candidate)
+        finally:
+            _release_snapshot_lock(lock_handle)
+
+
 @contextmanager
 def _stable_dataset_snapshot(
     source: Path, _legacy_runs_dir: Path | None = None
 ) -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="riskprobe-input-") as temporary_dir:
-        snapshot_path: Path | None = None
+    root = _snapshot_root()
+    _recover_stale_dataset_snapshots(root)
+    while True:
+        snapshot_dir = root / f"{_SNAPSHOT_DIR_PREFIX}{secrets.token_hex(16)}"
         try:
-            with source.open("rb") as source_handle, tempfile.NamedTemporaryFile(
-                dir=temporary_dir,
-                prefix="input-",
-                suffix=".parquet",
-                delete=False,
-            ) as snapshot_handle:
-                snapshot_path = Path(snapshot_handle.name)
+            snapshot_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        break
+    lock_handle: BinaryIO | None = None
+    try:
+        _write_private_marker(snapshot_dir)
+        lock_handle = _create_snapshot_lock(snapshot_dir)
+        snapshot_path = snapshot_dir / _SNAPSHOT_FILE_NAME
+        with source.open("rb") as source_handle:
+            descriptor = os.open(
+                snapshot_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as snapshot_handle:
+                os.fchmod(snapshot_handle.fileno(), 0o600)
                 shutil.copyfileobj(source_handle, snapshot_handle)
                 snapshot_handle.flush()
-            snapshot_path.chmod(0o400)
-            yield snapshot_path
-        finally:
-            if snapshot_path is not None:
-                try:
-                    snapshot_path.chmod(0o600)
-                except FileNotFoundError:
-                    pass
-                snapshot_path.unlink(missing_ok=True)
+        snapshot_path.chmod(0o400)
+        yield snapshot_path
+    finally:
+        _release_snapshot_lock(lock_handle)
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
 
 
 def _parquet_metadata_fingerprint(path: Path) -> str:

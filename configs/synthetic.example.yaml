@@ -1,0 +1,35 @@
+dataset:
+  id: public-synthetic-behavior
+  path: data/synthetic/behavior.parquet
+  read_only: true
+columns:
+  entity: entity_id
+  snapshot: snapshot_date
+  segment: institution
+  target: target
+target:
+  positive_value: 1
+  positive_meaning: bad_debt
+  performance_window_days: null
+snapshot:
+  meaning: public_relative_reference
+features:
+  families:
+    order: [order_]
+    browse: [browse_]
+    platform: [multi_platform_]
+    embedding: [emb_]
+segment_display_name: institution
+time_validation_enabled: true
+discovery:
+  min_support: 0.05
+  max_single_rules: 8
+  beam_width: 4
+  max_pair_rules: 4
+  random_seed: 42
+validation:
+  alpha: 0.05
+  min_segment_consistency: 0.6
+  max_lift_decay: 0.3
+  bootstrap_rounds: 100
+  min_group_size: 20

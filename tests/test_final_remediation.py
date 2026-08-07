@@ -24,7 +24,13 @@ runner = CliRunner()
 
 
 def _config(data_path: Path, *, explicit_catalog: Path | None = None) -> ProjectConfig:
-    features: dict[str, object] = {"families": {"order": ["order_"], "browse": ["browse_"]}}
+    features: dict[str, object] = {
+        "families": {
+            "order": ["order_"],
+            "browse": ["browse_"],
+            "platform": ["multi_platform_"],
+        }
+    }
     if explicit_catalog is not None:
         features["explicit_catalog"] = explicit_catalog
     return ProjectConfig.model_validate(
@@ -162,38 +168,52 @@ def test_empty_or_overlapping_prefix_selection_never_expands_to_wide_columns(
     ) == []
 
 
-def test_fixed_train_split_discovers_each_synthetic_truth_rule() -> None:
+def test_fixed_service_train_split_discovers_each_synthetic_truth_rule(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "synthetic.parquet"
     frame, truth = generate_behavior_dataset(rows=20_000, seed=42)
-    train = frame.sort("snapshot_date").head(int(frame.height * 0.6))
-    feature_names = sorted(
-        {
-            condition.feature
-            for rule in truth.hidden_rules
-            for condition in rule.conditions
+    frame.write_parquet(data_path)
+    config = _config(data_path)
+    config = config.model_copy(
+        update={
+            "time_validation_enabled": True,
+            "discovery": config.discovery.model_copy(
+                update={"min_support": 0.03, "beam_width": 120}
+            ),
         }
     )
-    discovery = _config(Path("synthetic.parquet")).discovery.model_copy(
-        update={"min_support": 0.03, "beam_width": 60}
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+    dataset = service._dataset()
+    feature_names = service._feature_names(dataset)
+    train, test, holdout, excluded_null_snapshot_rows = service._partitions(
+        dataset, feature_names
     )
-    rules = discover_rules(
-        train,
-        feature_names,
-        "target",
-        discovery,
-    )
+    rules = service._discover_from_train(train, feature_names)
 
     def same_direction(left: str, right: str) -> bool:
         return ({left, right} <= {">", ">="}) or ({left, right} <= {"<", "<="})
 
+    assert excluded_null_snapshot_rows == 0
+    assert holdout is not None
+    assert set(train["snapshot_date"]).isdisjoint(test["snapshot_date"])
+    assert set(test["snapshot_date"]).isdisjoint(holdout["snapshot_date"])
+    assert all(
+        condition.feature in feature_names
+        for rule in rules
+        for condition in rule.conditions
+    )
     for truth_rule in truth.hidden_rules:
+        expected_conditions = {condition.feature: condition for condition in truth_rule.conditions}
         assert any(
-            all(
-                any(
-                    candidate.feature == expected.feature
-                    and same_direction(candidate.operator, expected.operator)
-                    for candidate in discovered.conditions
+            len(discovered.conditions) == len(expected_conditions)
+            and {condition.feature for condition in discovered.conditions}
+            == set(expected_conditions)
+            and all(
+                same_direction(
+                    condition.operator, expected_conditions[condition.feature].operator
                 )
-                for expected in truth_rule.conditions
+                for condition in discovered.conditions
             )
             for discovered in rules
         ), truth_rule.rule_id

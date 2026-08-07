@@ -222,9 +222,9 @@ riskprobe evaluate-drift --config PATH --runs-dir PATH --seed INTEGER
 
 `evaluate-drift` 会逐一执行六种注入、检测与诊断，输出四项总体评分（precision、recall、false positive rate、Top-3 hit rate），并写入 `anomaly_alerts.json`、`diagnoses.json`、`drift_evaluation.json`。这些命令、根因模块、注册表、MCP 和 Agent 配置目前均不能作为已实现接口使用。
 
-## 9.1 Plan 3：数据适配、公开/公司运行与简历证据闭环（全部计划，尚未实现）
+## 9.1 Plan 3：数据适配、公开/公司运行与简历证据闭环（代码已实现；真实公司运行未执行）
 
-Plan 3 的目标是把公开多表信用数据与公司本地脱敏 Parquet 宽表都收敛到 Plan 1 的统一数据契约，再由 Plan 2 的安全监控、根因与受限 Agent 编排形成可复核闭环。**本节所有接口、CLI、配置和运行手册均为计划，当前尚未实现。**Plan 1 完成是数据适配前提；若需展示 MCP/Kiro Agent 或以白名单工具辅助公司任务，还必须先完成并审查通过 Plan 2。全流程只使用本地 Polars/Python/Parquet，明确不使用 SQL、Spark SQL、数据仓库连接、外部模型 API、数据拉取或文件覆盖。
+Plan 3 已实现公开多表信用数据和公司本地脱敏 Parquet 宽表到 Plan 1 统一契约的代码、CLI、虚构示例配置及运行手册；新增模块的基础测试已通过。真实公司 Parquet、真实本地配置、人工基线、运行产物与量化简历证据均**未执行且不得视为已交付结果**。Plan 1 完成是数据适配前提；若需展示 MCP/Kiro Agent 或以白名单工具辅助公司任务，还必须先完成并审查通过 Plan 2。全流程只使用本地 Polars/Python/Parquet，明确不使用 SQL、Spark SQL、数据仓库连接、外部模型 API、数据拉取或文件覆盖。
 
 ### 9.1.1 公开 Home Credit：本地多表聚合为统一行为宽表
 
@@ -340,7 +340,7 @@ riskprobe resume-evidence --records-dir PATH --output reports/internal/resume_ev
 2. **公司闭环：** 在仓库外保留脱敏 Parquet 和 `company.local.yaml`；只读预检后按 64 列分批运行确定性分析；人工复核并记录真实基线与阶段耗时；完成至少三次任务后才生成内部量化证据。
 3. **Agent 闭环：** 仅在 Plan 2 的注册表、输出门控、MCP、Kiro 最小权限均完成并审查通过后，`@riskprobe` 才可编排 `inspect → discover → validate` 或 `detect → diagnose → report`。其只接收脱敏聚合结果，失败最多重试 **1** 次，不能读取明细、任意路径、Shell、网络或写入数据。
 
-Plan 3 的完成门槛是：公开适配不伪造时间验证；公司预检不改写源文件；977 维为 16 个批次；公开/公司显示分别为 `customer_segment`/`institution`；三次任务前拒绝量化简历；私有数据、配置、结果和内部证据均不在 Git 中。当前全部尚未达到，不能称为 Plan 3 已完成。
+Plan 3 的完整端到端门槛是：公开适配不伪造时间验证；公司预检不改写源文件；977 维为 16 个批次；公开/公司显示分别为 `customer_segment`/`institution`；三次真实任务前拒绝量化简历；私有数据、配置、结果和内部证据均不在 Git 中。当前通用实现、虚构示例、运行手册和基础测试均已具备；但真实公司 Parquet、人工基线、三至五次真实任务、运行产物及量化简历证据均不存在。故真实公司闭环与任何公司效果结论尚未完成。
 
 ## 10. 运行方式、产物、失败处理与可复现性
 
@@ -356,8 +356,24 @@ riskprobe inspect --config ./project.yaml --runs-dir ./runs
 # 在 Train 上发现候选规则
 riskprobe discover --config ./project.yaml --runs-dir ./runs
 
-# 完整运行并创建或复用不可变运行目录
+# 在本地创建或复用完整的不可变分析运行
 riskprobe run --config ./project.yaml --runs-dir ./runs
+```
+
+Plan 3 的以下通用命令也已实现，但它们不代表任何真实公司运行已经发生：
+
+```bash
+# 将用户自行取得的公开 CSV 在本地聚合为 Parquet
+riskprobe prepare-home-credit --input-dir /local/home-credit --output /local/home-credit-riskprobe.parquet
+
+# 对本地只读公司 Parquet 做聚合预检
+riskprobe preflight-company --config configs/company.local.yaml
+
+# 以本地人工基线测量工作流；运行产物必须保持在 Git 忽略目录
+riskprobe benchmark --config configs/company.local.yaml --runs-dir runs --baseline-record /local/baseline.json
+
+# 仅在至少三项完整真实测量后生成 Git 忽略的内部草稿
+riskprobe resume-evidence --records-dir runs --output reports/internal/resume_evidence.md
 ```
 
 当前完整运行有六项产物：
@@ -395,7 +411,7 @@ CLI 对参数错误输出结构化 JSON（`argument_error`）；配置读取失�
 | Plan 2 Task 1：监控模型与参考快照 | **完成且审查通过** | 已具备不含实体明细、可确定性复现、包含特征/分层/规则聚合指标的参考快照 |
 | Plan 2 Task 2：检测器 | **有实现，但有两项 Important 待修复** | 已有 Schema/缺失率/PSI/标签率/分层占比/规则衰减检测；新增分层未告警、自定义 target 识别不可靠，尚未审查闭环 |
 | Plan 2 Task 3–8 | **仅计划** | 漂移注入评分、根因、注册表/门控、MCP、Kiro 权限与监控 CLI 均不得称为完成 |
-| Plan 3：公开/公司数据适配与证据 | **仅计划** | Home Credit 多表适配、公司只读预检/64 列分批、基准计时和实测简历生成均未实现；不得称为已交付 |
+| Plan 3：公开/公司数据适配与证据 | **通用代码、CLI、虚构示例与运行手册已实现；真实公司执行待完成** | 已可在本地准备用户自行下载的 Home Credit CSV、预检只读公司 Parquet、规划 64 列批次、记录本地基准并仅从完整记录生成内部草稿；尚无真实公司 Parquet、人工基线、三次真实任务或量化提效，故不得称为公司闭环或业务结果已交付 |
 | Kiro/MCP Agent | **仅计划** | 当前只有受限 Agent 架构与最小权限 SOP，尚无可用 MCP 服务或 `@riskprobe` Agent |
 | 公开 UCI 基准 | **已运行** | 仅按第 11 节的已核验事实介绍：Top 规则为 Stable、数据为 B 级，且不是严格 OOT 或线上收益 |
 

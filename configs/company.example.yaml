@@ -1,0 +1,23 @@
+dataset:
+  id: company_local_example
+  path: /private/company.local.parquet
+  read_only: true
+columns:
+  entity: anonymous_id
+  snapshot: cutoff_date
+  segment: org_code
+  target: bad_label
+target:
+  positive_value: 1
+  positive_meaning: bad_debt
+  performance_window_days: null
+snapshot:
+  meaning: customer_specified_feature_cutoff
+features:
+  families:
+    order: [ord_x_]
+    browse: [brw_x_]
+    multi: [multi_x_]
+    embedding: [emb_x_]
+segment_display_name: institution
+time_validation_enabled: true

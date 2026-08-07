@@ -12,6 +12,7 @@
 # Real company configuration and secrets
 /configs/company*.yaml
 /configs/company*.yml
+!/configs/company.example.yaml
 /configs/private/
 .env
 .env.*

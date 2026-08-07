@@ -1,10 +1,18 @@
+import hashlib
 import json
+import time
+from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import NoReturn, Sequence
 
 import click
+import polars as pl
 import typer
 
+from riskprobe.adapters.company import preflight_company_dataset
+from riskprobe.adapters.home_credit import HomeCreditPaths, prepare_home_credit
+from riskprobe.benchmarking import BenchmarkRecord, StageTiming, total_agent_minutes
 from riskprobe.features.catalog import FeatureCatalog
 from riskprobe.io.parquet import ParquetDataset
 from riskprobe.models import EvidenceCard, RiskRule, RuleMetrics
@@ -15,6 +23,7 @@ from riskprobe.monitoring.reference import build_reference_snapshot
 from typer.core import TyperGroup
 
 from riskprobe.config import ProjectConfig
+from riskprobe.resume_evidence import aggregate_benchmarks, render_markdown
 from riskprobe.service import RiskProbeService
 from riskprobe.synthetic import generate_behavior_dataset
 
@@ -321,3 +330,168 @@ def evaluate_drift(
     except Exception:
         _fail("evaluation_error", "Check the local configuration, synthetic-compatible features, and --seed.")
     typer.echo(json.dumps({"command": "evaluate-drift", **score.model_dump(mode="json")}, sort_keys=True))
+
+
+def _code_version() -> str:
+    try:
+        return version("riskprobe-agent")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _file_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@app.command("prepare-home-credit")
+def prepare_home_credit_command(
+    input_dir: Path = typer.Option(..., help="Directory containing user-downloaded Home Credit CSVs."),
+    output: Path = typer.Option(..., help="Local output Parquet path."),
+) -> None:
+    """Prepare public Home Credit behavior features without reading prediction files."""
+    try:
+        result = prepare_home_credit(HomeCreditPaths.from_directory(input_dir), output)
+    except ValueError as error:
+        _fail("home_credit_input_error", str(error))
+    except (OSError, pl.exceptions.PolarsError):
+        _fail("home_credit_preparation_error", "Check public CSV inputs and writable output path.")
+    typer.echo(
+        json.dumps(
+            {
+                "columns": result.columns,
+                "command": "prepare-home-credit",
+                "feature_families": result.feature_families,
+                "rows": result.rows,
+                "source_table_count": len(result.source_tables),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("preflight-company")
+def preflight_company(
+    config: Path = typer.Option(..., help="Local company YAML configuration."),
+) -> None:
+    """Print aggregate-only, read-only Parquet readiness information."""
+    try:
+        result = preflight_company_dataset(ProjectConfig.from_yaml(config))
+    except Exception:
+        _fail(
+            "company_preflight_error",
+            "Check the local configuration, role columns, and read-only Parquet schema.",
+        )
+    typer.echo(
+        json.dumps(
+            {
+                "batch_count": result.batch_count,
+                "command": "preflight-company",
+                "feature_count": result.feature_count,
+                "feature_family_counts": result.feature_family_counts,
+                "label_rate": result.label_rate,
+                "limitations": result.limitations,
+                "metadata_grade": result.metadata_grade,
+                "row_count": result.row_count,
+                "segment_count": result.segment_count,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command()
+def benchmark(
+    config: Path = typer.Option(..., help="Local company YAML configuration."),
+    runs_dir: Path = typer.Option(..., help="Ignored local run directory."),
+    baseline_record: Path = typer.Option(..., help="Human-authored local baseline JSON record."),
+) -> None:
+    """Measure local workflow stages without changing the manual baseline record."""
+    try:
+        project_config = ProjectConfig.from_yaml(config)
+        baseline = BenchmarkRecord.model_validate_json(
+            baseline_record.read_text(encoding="utf-8")
+        )
+        service = RiskProbeService(config=project_config, runs_dir=runs_dir)
+        timings: list[StageTiming] = []
+
+        started = time.perf_counter()
+        service.inspect()
+        timings.append(StageTiming(stage="inspect", seconds=time.perf_counter() - started))
+
+        started = time.perf_counter()
+        service.discover()
+        timings.append(StageTiming(stage="discover", seconds=time.perf_counter() - started))
+
+        started = time.perf_counter()
+        context = service.run()
+        timings.append(StageTiming(stage="validate", seconds=time.perf_counter() - started))
+
+        started = time.perf_counter()
+        service.monitoring_snapshot()
+        timings.append(StageTiming(stage="monitor", seconds=time.perf_counter() - started))
+
+        started = time.perf_counter()
+        (context.run_dir / "risk_report.md").read_bytes()
+        timings.append(StageTiming(stage="report", seconds=time.perf_counter() - started))
+
+        record = baseline.model_copy(
+            update={
+                "agent_minutes": total_agent_minutes(timings),
+                "code_version": _code_version(),
+                "config_hash": service.store.config_fingerprint(project_config),
+                "data_fingerprint": _file_fingerprint(project_config.dataset.path),
+                "dataset_id": project_config.dataset.id,
+                "run_id": context.run_id,
+                "measured_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "stage_timings": tuple(timings),
+            }
+        ).validate_consistency()
+        output = context.run_dir / "benchmark_record.json"
+        output.write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        _fail(
+            "benchmark_error",
+            "Check the local configuration, human baseline record, and ignored runs directory.",
+        )
+    typer.echo(
+        json.dumps(
+            {
+                "command": "benchmark",
+                "run_id": record.run_id,
+                "stage_count": len(record.stage_timings),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("resume-evidence")
+def resume_evidence(
+    records_dir: Path = typer.Option(..., help="Ignored local directory containing benchmark records."),
+    output: Path = typer.Option(..., help="Ignored internal Markdown output path."),
+) -> None:
+    """Create internal resume text only from complete measured benchmark records."""
+    try:
+        records = [
+            BenchmarkRecord.model_validate_json(path.read_text(encoding="utf-8"))
+            for path in sorted(records_dir.rglob("benchmark_record.json"))
+        ]
+        evidence = aggregate_benchmarks(records)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(render_markdown(evidence), encoding="utf-8")
+    except Exception as error:
+        _fail("resume_evidence_error", str(error))
+    typer.echo(
+        json.dumps(
+            {
+                "command": "resume-evidence",
+                "source_run_count": len(evidence.source_run_ids),
+                "task_count": evidence.task_count,
+            },
+            sort_keys=True,
+        )
+    )

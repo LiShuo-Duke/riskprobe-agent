@@ -263,7 +263,9 @@ snapshot:
   meaning: public_relative_reference
 segment_display_name: customer_segment
 time_validation_enabled: false
-```计划 CLI 是：
+```
+
+计划 CLI 是：
 
 ```bash
 riskprobe prepare-home-credit --input-dir PATH --output PATH

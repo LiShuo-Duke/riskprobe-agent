@@ -154,11 +154,12 @@ def _family_missingness_alerts(
 
 
 def _label_alerts(reference: ReferenceSnapshot, current_frame: pl.DataFrame) -> list[Alert]:
-    target_column = _target_column(current_frame, {feature.feature for feature in reference.features})
-    if target_column is None or current_frame.height == 0:
+    if reference.target_column not in current_frame.columns or current_frame.height == 0:
         return []
 
-    current_rate = sum(value == 1 for value in current_frame.get_column(target_column).to_list())
+    current_rate = sum(
+        value == 1 for value in current_frame.get_column(reference.target_column).to_list()
+    )
     current_rate /= current_frame.height
     delta = current_rate - reference.positive_rate
     severity = _absolute_severity(delta, _POSITIVE_RATE_WARNING, _POSITIVE_RATE_CRITICAL)
@@ -184,15 +185,31 @@ def _population_alerts(
     current_frame: pl.DataFrame,
     catalog: FeatureCatalog,
 ) -> list[Alert]:
-    segment_column = _segment_column(reference, current_frame, catalog)
-    if segment_column is None or current_frame.height == 0 or reference.row_count == 0:
+    del catalog
+    if (
+        reference.segment_column not in current_frame.columns
+        or current_frame.height == 0
+        or reference.row_count == 0
+    ):
         return []
 
-    current_values = current_frame.get_column(segment_column).to_list()
+    current_values = current_frame.get_column(reference.segment_column).to_list()
+    current_counts: dict[str, int] = {}
+    for value in current_values:
+        segment = str(value)
+        current_counts[segment] = current_counts.get(segment, 0) + 1
+
     alerts: list[Alert] = []
-    for segment, reference_count in sorted(reference.segment_counts.items()):
+    for segment in sorted(set(reference.segment_counts).union(current_counts)):
+        reference_count = reference.segment_counts.get(segment, 0)
+        current_count = current_counts.get(segment, 0)
+        if (
+            reference_count < reference.min_group_size
+            or current_count < reference.min_group_size
+        ):
+            continue
         reference_share = reference_count / reference.row_count
-        current_share = sum(str(value) == segment for value in current_values) / current_frame.height
+        current_share = current_count / current_frame.height
         delta = current_share - reference_share
         if abs(delta) < _INSTITUTION_SHARE_WARNING:
             continue

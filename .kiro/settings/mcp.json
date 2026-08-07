@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "riskprobe": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "riskprobe.mcp_server"]
+    }
+  }
+}

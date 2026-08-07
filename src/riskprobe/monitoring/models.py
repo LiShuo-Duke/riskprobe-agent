@@ -25,6 +25,9 @@ class ReferenceSnapshot(FrozenModel):
     dataset_id: str
     row_count: int
     positive_rate: float
+    target_column: str
+    segment_column: str
+    min_group_size: int
     segment_counts: dict[str, int]
     features: tuple[FeatureReference, ...]
     rules: tuple[RuleReference, ...]
@@ -47,9 +50,10 @@ class Alert(FrozenModel):
 
 
 class RootCause(FrozenModel):
-    scope: str
-    metric: str
+    dimension: str
+    value: str
     contribution: float
+    rank: int
     evidence: dict[str, float | int | str]
 
 

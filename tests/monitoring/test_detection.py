@@ -2,6 +2,7 @@ import hashlib
 
 import polars as pl
 
+from riskprobe.features.catalog import FeatureCatalog
 from riskprobe.monitoring.detection import detect_anomalies
 from riskprobe.monitoring.reference import build_reference_snapshot
 
@@ -123,6 +124,37 @@ def test_label_and_institution_population_changes_are_detected(reference_fixture
         and alert.scope_value == institution_code
         and alert.metric == "share"
         and alert.severity == "warning"
+        for alert in alerts
+    )
+
+
+def test_population_detection_uses_snapshot_role_metadata_and_shared_group_threshold(
+    reference_fixture,
+) -> None:
+    config = reference_fixture["config"].model_copy(
+        update={
+            "columns": reference_fixture["config"].columns.model_copy(
+                update={"target": "event", "segment": "cohort"}
+            )
+        }
+    )
+    frame = reference_fixture["frame"].rename({"target": "event", "institution": "cohort"})
+    reference = build_reference_snapshot(**dict(reference_fixture, frame=frame, config=config))
+    reference_segment = next(iter(reference.segment_counts))
+    current = frame.with_columns(pl.lit(reference_segment).alias("cohort"))
+    feature_only_catalog = FeatureCatalog(
+        features=tuple(
+            spec
+            for spec in reference_fixture["catalog"].features
+            if spec.name in {feature.feature for feature in reference.features}
+        )
+    )
+
+    alerts = detect_anomalies(reference, current, (), feature_only_catalog)
+
+    assert any(
+        alert.alert_type == "population"
+        and alert.scope_value == reference_segment
         for alert in alerts
     )
 

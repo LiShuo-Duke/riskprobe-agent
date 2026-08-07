@@ -5,7 +5,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 
 class StrictModel(BaseModel):
@@ -88,6 +88,10 @@ class FeatureFamilyConfig(StrictModel):
         if any(not prefix for prefixes in families.values() for prefix in prefixes):
             raise ValueError("feature family prefixes must be non-empty")
         return MappingProxyType(dict(families))
+
+    @field_serializer("families")
+    def serialize_families(self, families: Mapping[str, tuple[str, ...]]) -> dict[str, list[str]]:
+        return {name: list(prefixes) for name, prefixes in families.items()}
 
     def select_columns(
         self,

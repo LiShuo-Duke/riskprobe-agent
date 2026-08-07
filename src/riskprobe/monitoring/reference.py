@@ -48,6 +48,9 @@ def build_reference_snapshot(
         "dataset_id": dataset_id,
         "row_count": profile.row_count,
         "positive_rate": _positive_rate(profile),
+        "target_column": config.columns.target,
+        "segment_column": config.columns.segment,
+        "min_group_size": config.validation.min_group_size,
         "segment_counts": _deidentified_segment_counts(
             profile.segment_counts.items(), config.validation.min_group_size
         ),

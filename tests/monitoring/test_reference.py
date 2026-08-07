@@ -47,6 +47,15 @@ def test_reference_snapshot_contains_aggregates_not_entities(reference_fixture) 
     assert snapshot.features[0].histogram_counts
 
 
+def test_reference_snapshot_preserves_non_detail_role_metadata(reference_fixture) -> None:
+    snapshot = build_reference_snapshot(**reference_fixture)
+    config = reference_fixture["config"]
+
+    assert snapshot.target_column == config.columns.target
+    assert snapshot.segment_column == config.columns.segment
+    assert snapshot.min_group_size == config.validation.min_group_size
+
+
 @pytest.mark.parametrize(
     "dataset_id",
     _PATH_LIKE_IDENTIFIERS,

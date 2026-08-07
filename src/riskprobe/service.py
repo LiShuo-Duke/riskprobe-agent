@@ -19,8 +19,11 @@ from sklearn.model_selection import train_test_split
 from riskprobe.artifacts import RunContext, RunStore
 from riskprobe.config import ProjectConfig
 from riskprobe.dates import normalize_date_series
+from riskprobe.features.catalog import FeatureCatalog
 from riskprobe.io.parquet import ParquetDataset
 from riskprobe.models import EvidenceCard, RiskRule, SliceMetrics
+from riskprobe.monitoring.models import ReferenceSnapshot
+from riskprobe.monitoring.reference import build_reference_snapshot
 from riskprobe.profiling import DatasetProfile, profile_dataset
 from riskprobe.reporting import (
     evidence_sort_key,
@@ -774,3 +777,31 @@ class RiskProbeService:
             except BaseException:
                 context.cleanup()
                 raise
+
+    def monitoring_snapshot(self) -> tuple[RunContext, ReferenceSnapshot]:
+        """Build and persist an aggregate reference snapshot beside an immutable run."""
+        context = self.run()
+        cards = tuple(
+            EvidenceCard.model_validate(item)
+            for item in json.loads((context.run_dir / "evidence_cards.json").read_text(encoding="utf-8"))
+        )
+        dataset = self._dataset()
+        profile = profile_dataset(dataset, self.config)
+        feature_names = self._feature_names(dataset)
+        frame = dataset.collect(
+            [
+                self.config.columns.entity,
+                self.config.columns.snapshot,
+                self.config.columns.segment,
+                self.config.columns.target,
+                *feature_names,
+            ]
+        )
+        catalog = FeatureCatalog.from_columns(feature_names, self.config.features.families)
+        snapshot = build_reference_snapshot(frame, profile, cards, catalog, self.config)
+        output_dir = self.store.runs_dir / "monitoring" / context.run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "reference_snapshot.json").write_text(
+            snapshot.model_dump_json(indent=2), encoding="utf-8"
+        )
+        return context, snapshot

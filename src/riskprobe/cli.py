@@ -4,6 +4,14 @@ from typing import NoReturn, Sequence
 
 import click
 import typer
+
+from riskprobe.features.catalog import FeatureCatalog
+from riskprobe.io.parquet import ParquetDataset
+from riskprobe.models import EvidenceCard, RiskRule, RuleMetrics
+from riskprobe.monitoring.detection import detect_anomalies
+from riskprobe.monitoring.diagnosis import diagnose_alerts
+from riskprobe.monitoring.injection import DriftScenario, evaluate_alerts, inject_drift
+from riskprobe.monitoring.reference import build_reference_snapshot
 from typer.core import TyperGroup
 
 from riskprobe.config import ProjectConfig
@@ -185,3 +193,131 @@ def run(
             sort_keys=True,
         )
     )
+
+
+def _monitoring_inputs(config: ProjectConfig):
+    dataset = ParquetDataset(config.dataset.path)
+    profile = RiskProbeService(config=config, runs_dir=Path(".")).inspect()
+    roles = (config.columns.entity, config.columns.snapshot, config.columns.segment, config.columns.target)
+    features = config.features.select_columns(dataset.schema().names(), roles)
+    frame = dataset.collect([config.columns.segment, config.columns.target, *features])
+    return frame, profile, FeatureCatalog.from_columns(features, config.features.families)
+
+
+def _write_monitoring_json(output_dir: Path, name: str, payload: object) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / name).write_text(
+        json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+@app.command()
+def snapshot(
+    config: Path = typer.Option(..., help="Local YAML project configuration."),
+    runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+) -> None:
+    """Create an aggregate-only monitoring reference snapshot."""
+    service = _service(config, runs_dir)
+    try:
+        context, reference = service.monitoring_snapshot()
+    except Exception:
+        _fail("snapshot_error", "Check the local configuration and source data, then rerun snapshot.")
+    typer.echo(json.dumps({"command": "snapshot", "reference_run_id": context.run_id, "snapshot_id": reference.snapshot_id}, sort_keys=True))
+
+
+@app.command()
+def monitor(
+    reference_run_id: str = typer.Option(..., help="Existing monitoring reference run ID."),
+    current_config: Path = typer.Option(..., help="Local YAML configuration for current data."),
+    runs_dir: Path = typer.Option(..., help="Local monitoring runs directory."),
+) -> None:
+    """Compare a current local dataset to an aggregate reference snapshot."""
+    try:
+        reference = __import__("riskprobe.monitoring.models", fromlist=["ReferenceSnapshot"]).ReferenceSnapshot.model_validate_json(
+            (runs_dir / "monitoring" / reference_run_id / "reference_snapshot.json").read_text(encoding="utf-8")
+        )
+        current = ProjectConfig.from_yaml(current_config)
+        frame, _, catalog = _monitoring_inputs(current)
+        alerts = detect_anomalies(reference, frame, (), catalog)
+        diagnoses = diagnose_alerts(alerts, reference, frame, catalog, top_k=3)
+        output_dir = runs_dir / "monitoring" / reference_run_id / "current"
+        _write_monitoring_json(output_dir, "anomaly_alerts.json", [item.model_dump(mode="json") for item in alerts])
+        _write_monitoring_json(output_dir, "diagnoses.json", [item.model_dump(mode="json") for item in diagnoses])
+    except Exception:
+        _fail("monitor_error", "Check the aggregate reference run and current local configuration.")
+    typer.echo(json.dumps({"alert_count": len(alerts), "command": "monitor"}, sort_keys=True))
+
+
+@app.command("evaluate-drift")
+def evaluate_drift(
+    config: Path = typer.Option(..., help="Local YAML project configuration."),
+    runs_dir: Path = typer.Option(..., help="Local monitoring runs directory."),
+    seed: int = typer.Option(..., help="Deterministic drift injection seed."),
+) -> None:
+    """Inject six reproducible drift scenarios and report aggregate detection scores."""
+    try:
+        project_config = ProjectConfig.from_yaml(config)
+        frame, profile, catalog = _monitoring_inputs(project_config)
+        metrics = RuleMetrics(
+            support_count=100,
+            coverage=0.10,
+            base_bad_rate=0.10,
+            hit_bad_rate=0.20,
+            non_hit_bad_rate=0.08,
+            lift=2.0,
+            precision=0.20,
+            recall=0.20,
+            p_value=0.01,
+        )
+        baseline_card = EvidenceCard(
+            rule=RiskRule(rule_id="synthetic_monitor_rule", conditions=(), origin="evaluation"),
+            train=metrics,
+            test=metrics,
+            slices=(),
+            lift_ci=(1.5, 2.5),
+            adjusted_p_value=0.01,
+            segment_consistency=1.0,
+            max_time_decay=0.0,
+            grade="Stable",
+        )
+        reference = build_reference_snapshot(frame, profile, (baseline_card,), catalog, project_config)
+        institution = str(frame.get_column(project_config.columns.segment)[0])
+        scenarios = (
+            DriftScenario(scenario_id="missingness", drift_type="missingness", target="browse_pv_30d", magnitude=0.60),
+            DriftScenario(scenario_id="numeric", drift_type="numeric_shift", target="browse_pv_30d", magnitude=5.00),
+            DriftScenario(scenario_id="population", drift_type="population_shift", target=project_config.columns.segment, magnitude=0.60, institution=institution),
+            DriftScenario(scenario_id="label", drift_type="label_shift", target=project_config.columns.target, magnitude=1.00),
+            DriftScenario(scenario_id="schema", drift_type="schema", target="browse_pv_30d", magnitude=0.30),
+            DriftScenario(scenario_id="rule-decay", drift_type="rule_decay", target="browse_pv_30d", magnitude=1.00),
+        )
+        all_alerts = []
+        truths = []
+        all_diagnoses = []
+        for offset, scenario in enumerate(scenarios):
+            injected = inject_drift(frame, scenario, seed + offset)
+            current_cards = (baseline_card,)
+            truth = injected.truth
+            if scenario.drift_type == "population_shift":
+                truth = truth.model_copy(update={"expected_scope_value": institution})
+            elif scenario.drift_type == "label_shift":
+                truth = truth.model_copy(update={"expected_scope_value": reference.dataset_id})
+            elif scenario.drift_type == "rule_decay":
+                current_cards = (
+                    baseline_card.model_copy(
+                        update={"test": metrics.model_copy(update={"lift": 1.0})}
+                    ),
+                )
+                truth = truth.model_copy(update={"expected_scope_value": baseline_card.rule.rule_id})
+            alerts = detect_anomalies(reference, injected.frame, current_cards, catalog)
+            all_alerts.extend(alerts)
+            truths.append(truth)
+            all_diagnoses.extend(diagnose_alerts(alerts, reference, injected.frame, catalog, top_k=3))
+        score = evaluate_alerts(all_alerts, truths, top_k=3)
+        output_dir = runs_dir / "monitoring" / f"evaluation-{reference.snapshot_id[:16]}"
+        _write_monitoring_json(output_dir, "anomaly_alerts.json", [item.model_dump(mode="json") for item in all_alerts])
+        _write_monitoring_json(output_dir, "diagnoses.json", [item.model_dump(mode="json") for item in all_diagnoses])
+        _write_monitoring_json(output_dir, "drift_evaluation.json", score.model_dump(mode="json"))
+    except Exception:
+        _fail("evaluation_error", "Check the local configuration, synthetic-compatible features, and --seed.")
+    typer.echo(json.dumps({"command": "evaluate-drift", **score.model_dump(mode="json")}, sort_keys=True))

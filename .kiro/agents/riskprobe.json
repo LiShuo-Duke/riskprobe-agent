@@ -1,0 +1,18 @@
+{
+  "name": "riskprobe",
+  "description": "Analyze risk rules and anomalies through privacy-safe local tools.",
+  "tools": ["@riskprobe"],
+  "includeMcpJson": true,
+  "includePowers": false,
+  "resources": ["skill://.kiro/skills/riskprobe/SKILL.md"],
+  "permissions": {
+    "rules": [
+      {"capability": "mcp", "match": ["riskprobe/*"], "effect": "allow"},
+      {"capability": "shell", "effect": "deny"},
+      {"capability": "fs_read", "effect": "deny"},
+      {"capability": "fs_write", "effect": "deny"},
+      {"capability": "web_fetch", "effect": "deny"},
+      {"capability": "web_search", "effect": "deny"}
+    ]
+  }
+}

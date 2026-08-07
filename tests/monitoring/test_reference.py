@@ -8,6 +8,24 @@ from riskprobe.monitoring.models import Alert
 from riskprobe.monitoring.reference import build_reference_snapshot
 
 
+_PATH_LIKE_IDENTIFIERS = (
+    "/private/customer-data.parquet",
+    r"C:\\private\\customer-data.parquet",
+    "file:///private/customer-data.parquet",
+    "private/customer-data.parquet",
+    r"..\\private\\customer-data.parquet",
+    r"C:private\\customer-data.parquet",
+)
+_PATH_LIKE_IDENTIFIER_IDS = (
+    "posix-path",
+    "windows-path",
+    "file-uri",
+    "relative-posix-path",
+    "relative-windows-path",
+    "drive-relative-windows-path",
+)
+
+
 def test_reference_snapshot_contains_aggregates_not_entities(reference_fixture) -> None:
     snapshot = build_reference_snapshot(**reference_fixture)
     payload = snapshot.model_dump_json()
@@ -23,22 +41,8 @@ def test_reference_snapshot_contains_aggregates_not_entities(reference_fixture) 
 
 @pytest.mark.parametrize(
     "dataset_id",
-    [
-        "/private/customer-data.parquet",
-        r"C:\\private\\customer-data.parquet",
-        "file:///private/customer-data.parquet",
-        "private/customer-data.parquet",
-        r"..\\private\\customer-data.parquet",
-        r"C:private\\customer-data.parquet",
-    ],
-    ids=[
-        "posix-path",
-        "windows-path",
-        "file-uri",
-        "relative-posix-path",
-        "relative-windows-path",
-        "drive-relative-windows-path",
-    ],
+    _PATH_LIKE_IDENTIFIERS,
+    ids=_PATH_LIKE_IDENTIFIER_IDS,
 )
 def test_reference_snapshot_rejects_path_like_dataset_ids(
     reference_fixture,
@@ -46,35 +50,67 @@ def test_reference_snapshot_rejects_path_like_dataset_ids(
 ) -> None:
     profile = replace(reference_fixture["profile"], dataset_id=dataset_id)
 
-    with pytest.raises(ValueError, match="stable deidentified"):
+    with pytest.raises(ValueError, match="path-like identifier"):
         build_reference_snapshot(**dict(reference_fixture, profile=profile))
 
 
-def test_reference_snapshot_preserves_stable_deidentified_segment_codes(
+@pytest.mark.parametrize(
+    "segment_code",
+    _PATH_LIKE_IDENTIFIERS,
+    ids=_PATH_LIKE_IDENTIFIER_IDS,
+)
+def test_reference_snapshot_rejects_path_like_segment_codes(
     reference_fixture,
+    segment_code: str,
 ) -> None:
-    profile = replace(
-        reference_fixture["profile"],
-        dataset_id="joint-model-deidentified",
-        segment_counts={"inst-a-deid": 120, "inst-b-deid": 100},
-    )
-
-    snapshot = build_reference_snapshot(**dict(reference_fixture, profile=profile))
-
-    assert snapshot.dataset_id == "joint-model-deidentified"
-    assert snapshot.segment_counts == {"inst-a-deid": 120, "inst-b-deid": 100}
-    assert snapshot.rules[0].rule_id == reference_fixture["evidence_cards"][0].rule.rule_id
-
-
-def test_reference_snapshot_rejects_non_deidentified_segment_codes(reference_fixture) -> None:
     minimum = reference_fixture["config"].validation.min_group_size
-    profile = replace(
-        reference_fixture["profile"],
-        segment_counts={"Acme Hospital": minimum, "private/customer-segment": minimum},
+    profile = replace(reference_fixture["profile"], segment_counts={segment_code: minimum})
+
+    with pytest.raises(ValueError, match="path-like identifier"):
+        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+
+
+@pytest.mark.parametrize(
+    "rule_id",
+    _PATH_LIKE_IDENTIFIERS,
+    ids=_PATH_LIKE_IDENTIFIER_IDS,
+)
+def test_reference_snapshot_rejects_path_like_rule_ids(
+    reference_fixture,
+    rule_id: str,
+) -> None:
+    card = reference_fixture["evidence_cards"][0]
+    path_like_card = card.model_copy(
+        update={"rule": card.rule.model_copy(update={"rule_id": rule_id})}
     )
 
-    with pytest.raises(ValueError, match="stable deidentified"):
-        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+    with pytest.raises(ValueError, match="path-like identifier"):
+        build_reference_snapshot(**dict(reference_fixture, evidence_cards=(path_like_card,)))
+
+
+@pytest.mark.parametrize("stable_code", ["d1", "1ab", "A12"])
+def test_reference_snapshot_preserves_non_path_stable_codes_verbatim(
+    reference_fixture,
+    stable_code: str,
+) -> None:
+    minimum = reference_fixture["config"].validation.min_group_size
+    card = reference_fixture["evidence_cards"][0]
+    stable_code_card = card.model_copy(
+        update={"rule": card.rule.model_copy(update={"rule_id": stable_code})}
+    )
+    profile = replace(
+        reference_fixture["profile"],
+        dataset_id=stable_code,
+        segment_counts={stable_code: minimum},
+    )
+
+    snapshot = build_reference_snapshot(
+        **dict(reference_fixture, profile=profile, evidence_cards=(stable_code_card,))
+    )
+
+    assert snapshot.dataset_id == stable_code
+    assert snapshot.segment_counts == {stable_code: minimum}
+    assert snapshot.rules[0].rule_id == stable_code
 
 
 def test_reference_snapshot_suppresses_small_segment_counts(reference_fixture) -> None:

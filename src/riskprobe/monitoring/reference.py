@@ -1,8 +1,8 @@
 import hashlib
 import json
 import math
-import re
 from collections.abc import Iterable
+from urllib.parse import unquote, urlsplit
 
 import polars as pl
 
@@ -15,7 +15,6 @@ from .models import FeatureReference, ReferenceSnapshot, RuleReference
 
 _CREATED_AT = "1970-01-01T00:00:00Z"
 _QUANTILES = (0.0, 0.25, 0.5, 0.75, 1.0)
-_STABLE_DEIDENTIFIED_CODE = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 
 
 def build_reference_snapshot(
@@ -131,7 +130,7 @@ def _quantile(values: tuple[float, ...], quantile: float) -> float:
 
 def _rule_reference(card: EvidenceCard) -> RuleReference:
     return RuleReference(
-        rule_id=card.rule.rule_id,
+        rule_id=_stable_deidentified_code(card.rule.rule_id),
         coverage=card.test.coverage,
         bad_rate=card.test.hit_bad_rate,
         lift=card.test.lift,
@@ -148,8 +147,14 @@ def _stable_deidentified_dataset_id(dataset_id: str) -> str:
 
 
 def _stable_deidentified_code(identifier: str) -> str:
-    if _STABLE_DEIDENTIFIED_CODE.fullmatch(identifier) is None:
-        raise ValueError("identifier must be a stable deidentified code")
+    decoded = unquote(identifier)
+    if (
+        urlsplit(decoded).scheme.lower() == "file"
+        or "/" in decoded
+        or "\\" in decoded
+        or (len(decoded) >= 2 and decoded[0].isalpha() and decoded[1] == ":")
+    ):
+        raise ValueError("path-like identifier is not allowed in a reference snapshot")
     return identifier
 
 

@@ -58,3 +58,24 @@ Result: installation succeeded and `.venv/bin/python -c 'import mcp; print("mcp-
 - `.venv/bin/python -m pytest -v`: **224 passed**
 - `.venv/bin/ruff check .`: passed
 - `git diff --check`: passed
+
+## Fix round 2
+
+### TDD evidence
+
+- **RED (HEAD `9a757cb`):** Replaced the Task 1 fixture with the required `privacy_key` and `token_namespace` arguments and added regressions for domain-separated full HMAC tokens; hex-encoded path and base64-encoded entity identifiers absent from serialized snapshots; non-empty keyword-only keys; strict namespaces; cross-namespace comparison rejection; and an actual forced segment-token map collision. The focused command failed as expected: **24 failed, 1 passed**, because the previous API accepted neither required parameter.
+- **GREEN:** Implemented the smallest snapshot contract change. The focused Task 1 suite passed: **25 passed**.
+
+### Remediations and rationale
+
+- `build_reference_snapshot` now requires keyword-only `privacy_key: bytes` and `token_namespace: str`. Format validation alone cannot establish that a caller-controlled ID is opaque, so dataset IDs, rule IDs, and segments are all tokenized at the snapshot boundary with domain-separated HMAC-SHA-256 and full hexadecimal digests. The transient key is not placed in models, canonical payloads, exception text, logs, or documentation.
+- `ReferenceSnapshot` records the caller-provided, strict-safe, non-secret `token_namespace` and exposes `assert_comparable_token_namespace`. Comparison fails closed if namespaces differ; no namespace fingerprint is derived from the key.
+- Segment aggregation detects an existing generated token before inserting into its map and raises `token collision` rather than overwriting an aggregate. Duplicate rule IDs, nonnumeric selected-feature rejection, and non-finite handling remain fail-closed.
+- Updated the Task 1 fixture and the confirmed design security contract to document why the caller must supply both privacy parameters.
+
+### Verification
+
+- `.venv/bin/python -m pytest tests/monitoring/test_reference.py -v`: **25 passed**
+- `.venv/bin/python -m pytest -v`: **225 passed**
+- `.venv/bin/ruff check .`: passed
+- `git diff --check`: passed

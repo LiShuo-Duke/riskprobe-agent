@@ -48,7 +48,8 @@ def reference_fixture(tmp_path, synthetic_config):
         "evidence_cards": (evidence_card,),
         "catalog": catalog,
         "config": synthetic_config,
-        "segment_token_key": b"task-1-public-test-key-only",
+        "privacy_key": b"task-1-public-test-privacy-key",
+        "token_namespace": "riskprobe-test-v1",
     }
 
 

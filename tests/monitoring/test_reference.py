@@ -1,3 +1,7 @@
+from dataclasses import replace
+import hashlib
+import hmac
+
 import polars as pl
 import pytest
 from pydantic import ValidationError
@@ -16,9 +20,41 @@ def test_reference_snapshot_contains_aggregates_not_entities(reference_fixture) 
     assert "emb_00" not in payload
     assert str(reference_fixture["config"].dataset.path) not in payload
     assert "bank_north" not in payload
+    assert reference_fixture["segment_token_key"].decode() not in payload
     assert snapshot.row_count > 0
     assert snapshot.features[0].histogram_counts
     assert all(key.startswith("segment_") for key in snapshot.segment_counts)
+
+
+def test_reference_segment_tokens_are_keyed_stable_and_not_legacy_hashes(reference_fixture) -> None:
+    token_key = reference_fixture["segment_token_key"]
+    first = build_reference_snapshot(**reference_fixture)
+    second = build_reference_snapshot(**reference_fixture)
+    expected = "segment_" + hmac.new(
+        token_key,
+        b"riskprobe-monitoring-segment-v1:\x00bank_north",
+        hashlib.sha256,
+    ).hexdigest()[:16]
+    legacy = "segment_" + hashlib.sha256(
+        b"riskprobe-monitoring-segment-v1:bank_north"
+    ).hexdigest()[:16]
+    alternate = build_reference_snapshot(
+        **dict(reference_fixture, segment_token_key=b"independent-test-segment-key")
+    )
+
+    assert first.segment_counts == second.segment_counts
+    assert expected in first.segment_counts
+    assert legacy not in first.segment_counts
+    assert first.segment_counts != alternate.segment_counts
+
+
+def test_reference_omits_segment_aggregates_without_a_key(reference_fixture) -> None:
+    fixture_without_key = dict(reference_fixture)
+    fixture_without_key.pop("segment_token_key")
+
+    snapshot = build_reference_snapshot(**fixture_without_key)
+
+    assert snapshot.segment_counts == {}
 
 
 def test_reference_snapshot_has_deterministic_aggregates_and_identifier(reference_fixture) -> None:
@@ -54,6 +90,29 @@ def test_reference_features_use_only_fail_closed_config_selection(reference_fixt
     assert "undeclared_text" not in feature_names
 
 
+@pytest.mark.parametrize(
+    "series",
+    [
+        lambda rows: pl.Series("order_cnt_7d", [True] * rows),
+        lambda rows: pl.Series("order_cnt_7d", ["category"] * rows),
+        lambda rows: pl.Series("order_cnt_7d", ["category"] * rows).cast(pl.Categorical),
+        lambda rows: pl.Series("order_cnt_7d", [object()] * rows, dtype=pl.Object),
+    ],
+    ids=["boolean", "string", "categorical", "object"],
+)
+def test_reference_rejects_selected_non_numeric_features(
+    reference_fixture,
+    series: object,
+) -> None:
+    frame = reference_fixture["frame"].with_columns(series(reference_fixture["frame"].height))
+
+    with pytest.raises(
+        ValueError,
+        match="selected feature 'order_cnt_7d' has unsupported dtype; numeric features are required",
+    ):
+        build_reference_snapshot(**dict(reference_fixture, frame=frame))
+
+
 def test_reference_feature_histograms_use_quantile_boundaries(reference_fixture) -> None:
     snapshot = build_reference_snapshot(**reference_fixture)
 
@@ -64,13 +123,20 @@ def test_reference_feature_histograms_use_quantile_boundaries(reference_fixture)
         assert feature.zero_rate >= 0.0
 
 
-def test_reference_snapshot_converts_rule_metrics_to_aggregates(reference_fixture) -> None:
-    snapshot = build_reference_snapshot(**reference_fixture)
+def test_reference_treats_nan_and_infinities_as_missing_not_distribution_values(
+    reference_fixture,
+) -> None:
+    rows = reference_fixture["frame"].height
+    values = [0.0, float("nan"), float("inf"), float("-inf"), 2.0] + [None] * (rows - 5)
+    frame = reference_fixture["frame"].with_columns(pl.Series("order_cnt_7d", values))
 
-    assert snapshot.rules[0].rule_id == "rule_order_cancel"
-    assert snapshot.rules[0].coverage == pytest.approx(0.02)
-    assert snapshot.rules[0].bad_rate == pytest.approx(0.3)
-    assert snapshot.rules[0].lift == pytest.approx(3.0)
+    snapshot = build_reference_snapshot(**dict(reference_fixture, frame=frame))
+    feature = next(feature for feature in snapshot.features if feature.feature == "order_cnt_7d")
+
+    assert feature.missing_rate == pytest.approx((rows - 2) / rows)
+    assert feature.zero_rate == pytest.approx(0.5)
+    assert feature.quantile_edges == (0.0, 0.5, 1.0, 1.5, 2.0)
+    assert feature.histogram_counts == (1, 0, 0, 1)
 
 
 def test_reference_snapshot_handles_all_missing_and_constant_features(reference_fixture) -> None:
@@ -94,6 +160,66 @@ def test_reference_snapshot_handles_all_missing_and_constant_features(reference_
     assert constant.zero_rate == 1.0
     assert constant.quantile_edges == (0.0, 0.0)
     assert constant.histogram_counts == (snapshot.row_count,)
+
+
+def test_reference_snapshot_handles_empty_frames(reference_fixture) -> None:
+    empty_profile = replace(
+        reference_fixture["profile"],
+        row_count=0,
+        positive_rate=None,
+        segment_counts={},
+    )
+    snapshot = build_reference_snapshot(
+        **dict(reference_fixture, frame=reference_fixture["frame"].head(0), profile=empty_profile)
+    )
+
+    assert snapshot.row_count == 0
+    assert snapshot.positive_rate == 0.0
+    assert snapshot.segment_counts == {}
+    assert all(feature.missing_rate == 0.0 for feature in snapshot.features)
+    assert all(feature.histogram_counts == () for feature in snapshot.features)
+
+
+def test_reference_snapshot_converts_rule_metrics_to_aggregates(reference_fixture) -> None:
+    snapshot = build_reference_snapshot(**reference_fixture)
+
+    assert snapshot.rules[0].rule_id == "6c1469285066"
+    assert snapshot.rules[0].coverage == pytest.approx(0.02)
+    assert snapshot.rules[0].bad_rate == pytest.approx(0.3)
+    assert snapshot.rules[0].lift == pytest.approx(3.0)
+
+
+def test_reference_rejects_duplicate_rule_ids(reference_fixture) -> None:
+    duplicate = reference_fixture["evidence_cards"][0]
+
+    with pytest.raises(ValueError, match="duplicate rule identifier"):
+        build_reference_snapshot(**dict(reference_fixture, evidence_cards=(duplicate, duplicate)))
+
+
+@pytest.mark.parametrize(
+    "unsafe_identifier",
+    ["/private/customer.parquet", "https://example.test/dataset", "user_0001", "dataset\nlog"],
+    ids=["path", "uri", "entity", "control-character"],
+)
+def test_reference_rejects_unsafe_dataset_identifiers(reference_fixture, unsafe_identifier: str) -> None:
+    profile = replace(reference_fixture["profile"], dataset_id=unsafe_identifier)
+
+    with pytest.raises(ValueError, match="dataset identifier must be an opaque safe ID"):
+        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+
+
+@pytest.mark.parametrize(
+    "unsafe_identifier",
+    ["/private/rule", "mailto:user@example.test", "entity_0001", "rule\tlog"],
+    ids=["path", "uri", "entity", "control-character"],
+)
+def test_reference_rejects_unsafe_rule_identifiers(reference_fixture, unsafe_identifier: str) -> None:
+    evidence_card = reference_fixture["evidence_cards"][0]
+    unsafe_rule = evidence_card.rule.model_copy(update={"rule_id": unsafe_identifier})
+    unsafe_card = evidence_card.model_copy(update={"rule": unsafe_rule})
+
+    with pytest.raises(ValueError, match="rule identifier must be an opaque safe ID"):
+        build_reference_snapshot(**dict(reference_fixture, evidence_cards=(unsafe_card,)))
 
 
 def test_alert_model_is_strict_and_immutable() -> None:

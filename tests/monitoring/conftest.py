@@ -32,7 +32,7 @@ def reference_fixture(tmp_path, synthetic_config):
         p_value=0.01,
     )
     evidence_card = EvidenceCard(
-        rule=RiskRule(rule_id="rule_order_cancel", conditions=(), origin="test"),
+        rule=RiskRule(rule_id="6c1469285066", conditions=(), origin="test"),
         train=metrics,
         test=metrics,
         slices=(),
@@ -48,6 +48,7 @@ def reference_fixture(tmp_path, synthetic_config):
         "evidence_cards": (evidence_card,),
         "catalog": catalog,
         "config": synthetic_config,
+        "segment_token_key": b"task-1-public-test-key-only",
     }
 
 

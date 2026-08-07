@@ -37,3 +37,24 @@ Result: installation succeeded and `.venv/bin/python -c 'import mcp; print("mcp-
 ## Commits
 
 - Implementation checkpoint: `f5cc07b feat: add privacy-safe monitoring snapshots`
+
+## Fix round 1
+
+### TDD evidence
+
+- **RED (HEAD `2ef0287`):** Added keyed-token, no-key fail-closed, non-numeric selected-feature, identifier-boundary, duplicate-rule, non-finite, and empty-frame regressions. The focused command failed as expected: **23 failed, 1 passed**; the new key argument was unsupported and the old static segment hashes remained visible.
+- **GREEN:** Added the smallest compatible `segment_token_key: bytes | None` contract. The focused Task 1 suite then passed: **24 passed**.
+
+### Remediations
+
+- Segment aggregation uses a caller-provided HMAC key and a domain-separated message. The key is transient, absent from models/canonical payloads, and never emitted. Without a key, `segment_counts` is `{}` so downstream detection can opt into matching keyed tokens explicitly.
+- Selected features now support numeric Polars dtypes only. Boolean, String, Categorical, and Object dtypes raise the stable error `selected feature '<name>' has unsupported dtype; numeric features are required`; categorical monitoring is intentionally deferred to a dedicated model task.
+- Snapshot dataset IDs require the opaque `dataset_<lowercase-hex>` form; rule IDs require the existing Plan 1 lowercase hexadecimal digest form. Path, URI, control-character, and entity-style inputs fail at the snapshot boundary. Duplicate rule IDs are rejected.
+- Added executable coverage for finite values combined with `NaN`, `+inf`, and `-inf`, plus empty frames. Non-finite numeric values count as missing and never enter histogram bins.
+
+### Verification
+
+- `.venv/bin/python -m pytest tests/monitoring/test_reference.py -v`: **24 passed**
+- `.venv/bin/python -m pytest -v`: **224 passed**
+- `.venv/bin/ruff check .`: passed
+- `git diff --check`: passed

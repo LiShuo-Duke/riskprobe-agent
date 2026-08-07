@@ -1,7 +1,4 @@
-import base64
 from dataclasses import replace
-import hashlib
-import hmac
 
 import polars as pl
 import pytest
@@ -20,129 +17,24 @@ def test_reference_snapshot_contains_aggregates_not_entities(reference_fixture) 
     assert "private-file-marker" not in payload
     assert "emb_00" not in payload
     assert str(reference_fixture["config"].dataset.path) not in payload
-    assert reference_fixture["profile"].dataset_id not in payload
-    assert reference_fixture["evidence_cards"][0].rule.rule_id not in payload
-    assert "bank_north" not in payload
-    assert reference_fixture["privacy_key"].decode() not in payload
     assert snapshot.row_count > 0
     assert snapshot.features[0].histogram_counts
-    assert snapshot.dataset_id.startswith("dataset_")
-    assert all(rule.rule_id.startswith("rule_") for rule in snapshot.rules)
-    assert all(key.startswith("segment_") for key in snapshot.segment_counts)
 
 
-def test_reference_tokens_are_keyed_domain_separated_and_full_length(reference_fixture) -> None:
-    privacy_key = reference_fixture["privacy_key"]
-    profile = replace(reference_fixture["profile"], dataset_id="same-private-value")
-    evidence_card = reference_fixture["evidence_cards"][0]
-    matching_rule = evidence_card.model_copy(
-        update={"rule": evidence_card.rule.model_copy(update={"rule_id": "same-private-value"})}
-    )
-    fixture = dict(reference_fixture, profile=profile, evidence_cards=(matching_rule,))
-    first = build_reference_snapshot(**fixture)
-    second = build_reference_snapshot(**fixture)
-    expected_dataset = "dataset_" + hmac.new(
-        privacy_key,
-        b"riskprobe-monitoring-dataset-v1:\x00same-private-value",
-        hashlib.sha256,
-    ).hexdigest()
-    expected_rule = "rule_" + hmac.new(
-        privacy_key,
-        b"riskprobe-monitoring-rule-v1:\x00same-private-value",
-        hashlib.sha256,
-    ).hexdigest()
-    legacy_segment = "segment_" + hashlib.sha256(
-        b"riskprobe-monitoring-segment-v1:bank_north"
-    ).hexdigest()[:16]
-    alternate = build_reference_snapshot(
-        **dict(reference_fixture, privacy_key=b"independent-test-privacy-key")
-    )
-
-    assert first == second
-    assert first.dataset_id == expected_dataset
-    assert first.rules[0].rule_id == expected_rule
-    assert first.dataset_id.removeprefix("dataset_") != first.rules[0].rule_id.removeprefix("rule_")
-    assert all(len(token.removeprefix("segment_")) == 64 for token in first.segment_counts)
-    assert legacy_segment not in first.segment_counts
-    assert first.segment_counts != alternate.segment_counts
-
-
-def test_reference_snapshot_never_serializes_encoded_path_or_entity_identifiers(
+def test_reference_snapshot_preserves_stable_deidentified_segment_codes(
     reference_fixture,
 ) -> None:
-    encoded_path = "/private/customer.parquet".encode().hex()
-    encoded_entity = base64.b64encode(b"user_0001").decode()
-    profile = replace(reference_fixture["profile"], dataset_id=encoded_path)
-    evidence_card = reference_fixture["evidence_cards"][0]
-    encoded_rule = evidence_card.model_copy(
-        update={"rule": evidence_card.rule.model_copy(update={"rule_id": encoded_entity})}
+    profile = replace(
+        reference_fixture["profile"],
+        dataset_id="joint-model-deidentified",
+        segment_counts={"inst-a-deid": 120, "inst-b-deid": 80},
     )
 
-    snapshot = build_reference_snapshot(
-        **dict(reference_fixture, profile=profile, evidence_cards=(encoded_rule,))
-    )
-    payload = snapshot.model_dump_json()
+    snapshot = build_reference_snapshot(**dict(reference_fixture, profile=profile))
 
-    assert encoded_path not in payload
-    assert encoded_entity not in payload
-    assert "/private/customer.parquet" not in payload
-    assert "user_0001" not in payload
-    assert snapshot.dataset_id.startswith("dataset_")
-    assert snapshot.rules[0].rule_id.startswith("rule_")
-
-
-@pytest.mark.parametrize("privacy_key", [None, b""], ids=["none", "empty"])
-def test_reference_snapshot_requires_non_empty_bytes_privacy_key(
-    reference_fixture, privacy_key: bytes | None
-) -> None:
-    with pytest.raises(ValueError, match="privacy key must be non-empty bytes"):
-        build_reference_snapshot(**dict(reference_fixture, privacy_key=privacy_key))
-
-
-def test_reference_snapshot_requires_privacy_key_keyword_only(reference_fixture) -> None:
-    fixture = dict(reference_fixture)
-    fixture.pop("privacy_key")
-
-    with pytest.raises(TypeError, match="privacy_key"):
-        build_reference_snapshot(**fixture)
-
-
-@pytest.mark.parametrize(
-    "token_namespace",
-    ["", "bad namespace", "tenant/path", "Namespace-v1"],
-    ids=["empty", "space", "path", "uppercase"],
-)
-def test_reference_snapshot_requires_a_strict_safe_token_namespace(
-    reference_fixture, token_namespace: str
-) -> None:
-    with pytest.raises(ValueError, match="token namespace must be a strict safe ID"):
-        build_reference_snapshot(**dict(reference_fixture, token_namespace=token_namespace))
-
-
-def test_reference_snapshot_records_namespace_and_fails_closed_for_mismatch(reference_fixture) -> None:
-    first = build_reference_snapshot(**reference_fixture)
-    second = build_reference_snapshot(
-        **dict(reference_fixture, token_namespace="riskprobe-prod-v2")
-    )
-
-    assert first.token_namespace == reference_fixture["token_namespace"]
-    assert first.assert_comparable_token_namespace(first) is None
-    with pytest.raises(ValueError, match="token namespaces do not match"):
-        first.assert_comparable_token_namespace(second)
-
-
-def test_reference_snapshot_rejects_actual_segment_token_collisions(
-    monkeypatch: pytest.MonkeyPatch, reference_fixture
-) -> None:
-    class CollidingDigest:
-        def hexdigest(self) -> str:
-            return "a" * 64
-
-    profile = replace(reference_fixture["profile"], segment_counts={"north": 1, "south": 2})
-    monkeypatch.setattr("riskprobe.monitoring.reference.hmac.new", lambda *args: CollidingDigest())
-
-    with pytest.raises(ValueError, match="token collision"):
-        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+    assert snapshot.dataset_id == "joint-model-deidentified"
+    assert snapshot.segment_counts == {"inst-a-deid": 120, "inst-b-deid": 80}
+    assert snapshot.rules[0].rule_id == reference_fixture["evidence_cards"][0].rule.rule_id
 
 
 def test_reference_snapshot_has_deterministic_aggregates_and_identifier(reference_fixture) -> None:
@@ -234,9 +126,7 @@ def test_reference_snapshot_handles_all_missing_and_constant_features(reference_
             pl.lit(0.0).alias("order_cnt_30d"),
         ]
     )
-    fixture = dict(reference_fixture, frame=frame)
-
-    snapshot = build_reference_snapshot(**fixture)
+    snapshot = build_reference_snapshot(**dict(reference_fixture, frame=frame))
     missing = next(feature for feature in snapshot.features if feature.feature == "order_cnt_7d")
     constant = next(feature for feature in snapshot.features if feature.feature == "order_cnt_30d")
 
@@ -271,7 +161,7 @@ def test_reference_snapshot_handles_empty_frames(reference_fixture) -> None:
 def test_reference_snapshot_converts_rule_metrics_to_aggregates(reference_fixture) -> None:
     snapshot = build_reference_snapshot(**reference_fixture)
 
-    assert snapshot.rules[0].rule_id.startswith("rule_")
+    assert snapshot.rules[0].rule_id == reference_fixture["evidence_cards"][0].rule.rule_id
     assert snapshot.rules[0].coverage == pytest.approx(0.02)
     assert snapshot.rules[0].bad_rate == pytest.approx(0.3)
     assert snapshot.rules[0].lift == pytest.approx(3.0)

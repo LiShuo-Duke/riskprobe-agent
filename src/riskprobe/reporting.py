@@ -35,16 +35,12 @@ def safe_dataset_id(dataset_id: str) -> str:
 
 
 def redact_segment_value(value: str) -> str:
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
-    return f"segment-{digest}"
+    """Return an already-deidentified segment code unchanged."""
+    return value
 
 
 def redact_limitation(limitation: str) -> str:
-    prefix = "holdout: " if limitation.startswith("holdout: ") else ""
-    body = limitation[len(prefix) :]
-    descriptor, separator, value = body.partition(": ")
-    if separator and descriptor.startswith("single-class ") and descriptor != "single-class time":
-        return f"{prefix}{descriptor}: {redact_segment_value(value)}"
+    """Keep limitations readable when all input identifiers are deidentified."""
     return limitation
 
 

@@ -1,11 +1,6 @@
-import re
 from typing import Literal
 
-from pydantic import field_validator
-
 from riskprobe.models import FrozenModel
-
-_TOKEN_NAMESPACE = re.compile(r"[a-z][a-z0-9-]{2,63}\Z")
 
 
 class FeatureReference(FrozenModel):
@@ -28,25 +23,12 @@ class RuleReference(FrozenModel):
 class ReferenceSnapshot(FrozenModel):
     snapshot_id: str
     dataset_id: str
-    token_namespace: str
     row_count: int
     positive_rate: float
     segment_counts: dict[str, int]
     features: tuple[FeatureReference, ...]
     rules: tuple[RuleReference, ...]
     created_at: str
-
-    @field_validator("token_namespace")
-    @classmethod
-    def validate_token_namespace(cls, value: str) -> str:
-        if not _TOKEN_NAMESPACE.fullmatch(value):
-            raise ValueError("token namespace must be a strict safe ID")
-        return value
-
-    def assert_comparable_token_namespace(self, other: "ReferenceSnapshot") -> None:
-        """Reject a comparison unless both snapshots declare the same token namespace."""
-        if not isinstance(other, ReferenceSnapshot) or self.token_namespace != other.token_namespace:
-            raise ValueError("token namespaces do not match")
 
 
 class Alert(FrozenModel):

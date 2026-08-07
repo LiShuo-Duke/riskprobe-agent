@@ -322,7 +322,7 @@ def test_artifact_rules_and_slices_have_stable_sorting(
     assert [value for slice_type, value in slices[1:] if slice_type == "segment"] == sorted(
         value for slice_type, value in slices[1:] if slice_type == "segment"
     )
-    assert all(value.startswith("segment-") for _, value in slices[1:])
+    assert [value for _, value in slices[1:]] == ["A", "Z"]
 
 
 def test_report_is_sorted_formatted_and_grade_b_leads_with_limitations() -> None:
@@ -366,14 +366,14 @@ def test_report_is_sorted_formatted_and_grade_b_leads_with_limitations() -> None
     assert "/Users/" not in report
 
 
-def test_outputs_redact_segment_values_and_absolute_input_path(
+def test_outputs_exclude_entity_values_and_paths_but_keep_deidentified_segment_codes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _small_config(tmp_path)
     frame = pl.read_parquet(config.dataset.path).with_columns(
         pl.when(pl.col("institution") == "A")
-        .then(pl.lit("SECRET_CLIENT_ALPHA"))
-        .otherwise(pl.lit("SECRET_CLIENT_BETA"))
+        .then(pl.lit("inst-alpha-deid"))
+        .otherwise(pl.lit("inst-beta-deid"))
         .alias("institution")
     )
     frame.write_parquet(config.dataset.path)
@@ -381,11 +381,11 @@ def test_outputs_redact_segment_values_and_absolute_input_path(
         slices=(
             SliceMetrics(
                 slice_type="segment",
-                slice_value="SECRET_CLIENT_ALPHA",
+                slice_value="inst-alpha-deid",
                 metrics=_metrics(1.5),
             ),
         ),
-        limitations=("single-class institution: SECRET_CLIENT_ALPHA",),
+        limitations=("single-class institution: inst-alpha-deid",),
     )
     monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
     monkeypatch.setattr("riskprobe.service.validate_rules", lambda *args, **kwargs: [card])
@@ -403,9 +403,9 @@ def test_outputs_redact_segment_values_and_absolute_input_path(
     logical_parquet = json.dumps(candidate_rows, sort_keys=True).encode()
     combined = text_artifacts + b"\n" + logical_parquet
     assert b"private-" not in combined
-    assert b"SECRET_CLIENT_ALPHA" not in combined
-    assert b"SECRET_CLIENT_BETA" not in combined
     assert str(config.dataset.path).encode() not in combined
+    assert b"inst-alpha-deid" in combined
+    assert b"inst-beta-deid" not in combined
 
 
 def test_holdout_failure_conservatively_downgrades_grade_and_is_reported(

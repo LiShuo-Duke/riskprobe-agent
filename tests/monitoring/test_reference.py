@@ -21,20 +21,80 @@ def test_reference_snapshot_contains_aggregates_not_entities(reference_fixture) 
     assert snapshot.features[0].histogram_counts
 
 
+@pytest.mark.parametrize(
+    "dataset_id",
+    [
+        "/private/customer-data.parquet",
+        r"C:\\private\\customer-data.parquet",
+        "file:///private/customer-data.parquet",
+        "private/customer-data.parquet",
+        r"..\\private\\customer-data.parquet",
+        r"C:private\\customer-data.parquet",
+    ],
+    ids=[
+        "posix-path",
+        "windows-path",
+        "file-uri",
+        "relative-posix-path",
+        "relative-windows-path",
+        "drive-relative-windows-path",
+    ],
+)
+def test_reference_snapshot_rejects_path_like_dataset_ids(
+    reference_fixture,
+    dataset_id: str,
+) -> None:
+    profile = replace(reference_fixture["profile"], dataset_id=dataset_id)
+
+    with pytest.raises(ValueError, match="stable deidentified"):
+        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+
+
 def test_reference_snapshot_preserves_stable_deidentified_segment_codes(
     reference_fixture,
 ) -> None:
     profile = replace(
         reference_fixture["profile"],
         dataset_id="joint-model-deidentified",
-        segment_counts={"inst-a-deid": 120, "inst-b-deid": 80},
+        segment_counts={"inst-a-deid": 120, "inst-b-deid": 100},
     )
 
     snapshot = build_reference_snapshot(**dict(reference_fixture, profile=profile))
 
     assert snapshot.dataset_id == "joint-model-deidentified"
-    assert snapshot.segment_counts == {"inst-a-deid": 120, "inst-b-deid": 80}
+    assert snapshot.segment_counts == {"inst-a-deid": 120, "inst-b-deid": 100}
     assert snapshot.rules[0].rule_id == reference_fixture["evidence_cards"][0].rule.rule_id
+
+
+def test_reference_snapshot_rejects_non_deidentified_segment_codes(reference_fixture) -> None:
+    minimum = reference_fixture["config"].validation.min_group_size
+    profile = replace(
+        reference_fixture["profile"],
+        segment_counts={"Acme Hospital": minimum, "private/customer-segment": minimum},
+    )
+
+    with pytest.raises(ValueError, match="stable deidentified"):
+        build_reference_snapshot(**dict(reference_fixture, profile=profile))
+
+
+def test_reference_snapshot_suppresses_small_segment_counts(reference_fixture) -> None:
+    minimum = reference_fixture["config"].validation.min_group_size
+    profile = replace(
+        reference_fixture["profile"],
+        segment_counts={
+            "inst-c-deid": minimum + 1,
+            "inst-a-deid": minimum,
+            "inst-b-deid": minimum - 1,
+        },
+    )
+
+    snapshot = build_reference_snapshot(**dict(reference_fixture, profile=profile))
+
+    assert snapshot.segment_counts == {
+        "inst-a-deid": minimum,
+        "inst-c-deid": minimum + 1,
+    }
+    assert list(snapshot.segment_counts) == ["inst-a-deid", "inst-c-deid"]
 
 
 def test_reference_snapshot_has_deterministic_aggregates_and_identifier(reference_fixture) -> None:

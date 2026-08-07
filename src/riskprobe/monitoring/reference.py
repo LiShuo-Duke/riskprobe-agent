@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import re
 from collections.abc import Iterable
 
 import polars as pl
@@ -14,6 +15,7 @@ from .models import FeatureReference, ReferenceSnapshot, RuleReference
 
 _CREATED_AT = "1970-01-01T00:00:00Z"
 _QUANTILES = (0.0, 0.25, 0.5, 0.75, 1.0)
+_STABLE_DEIDENTIFIED_CODE = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 
 
 def build_reference_snapshot(
@@ -42,11 +44,14 @@ def build_reference_snapshot(
     )
     rules = tuple(sorted((_rule_reference(card) for card in evidence_cards), key=lambda rule: rule.rule_id))
     _require_unique_rule_ids(rules)
+    dataset_id = _stable_deidentified_dataset_id(profile.dataset_id)
     snapshot_data = {
-        "dataset_id": profile.dataset_id,
+        "dataset_id": dataset_id,
         "row_count": profile.row_count,
         "positive_rate": _positive_rate(profile),
-        "segment_counts": _deidentified_segment_counts(profile.segment_counts.items()),
+        "segment_counts": _deidentified_segment_counts(
+            profile.segment_counts.items(), config.validation.min_group_size
+        ),
         "features": features,
         "rules": rules,
         "created_at": _CREATED_AT,
@@ -138,12 +143,27 @@ def _require_unique_rule_ids(rules: tuple[RuleReference, ...]) -> None:
         raise ValueError("duplicate rule identifier")
 
 
+def _stable_deidentified_dataset_id(dataset_id: str) -> str:
+    return _stable_deidentified_code(dataset_id)
+
+
+def _stable_deidentified_code(identifier: str) -> str:
+    if _STABLE_DEIDENTIFIED_CODE.fullmatch(identifier) is None:
+        raise ValueError("identifier must be a stable deidentified code")
+    return identifier
+
+
 def _deidentified_segment_counts(
     segment_counts: Iterable[tuple[str, int]],
+    min_group_size: int,
 ) -> dict[str, int]:
-    return {
-        str(segment): int(count)
+    retained_counts = tuple(
+        (str(segment), int(count))
         for segment, count in sorted(segment_counts, key=lambda item: str(item[0]))
+        if count >= min_group_size
+    )
+    return {
+        _stable_deidentified_code(segment): count for segment, count in retained_counts
     }
 
 

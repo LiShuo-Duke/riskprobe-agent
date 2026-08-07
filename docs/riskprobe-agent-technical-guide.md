@@ -222,6 +222,124 @@ riskprobe evaluate-drift --config PATH --runs-dir PATH --seed INTEGER
 
 `evaluate-drift` 会逐一执行六种注入、检测与诊断，输出四项总体评分（precision、recall、false positive rate、Top-3 hit rate），并写入 `anomaly_alerts.json`、`diagnoses.json`、`drift_evaluation.json`。这些命令、根因模块、注册表、MCP 和 Agent 配置目前均不能作为已实现接口使用。
 
+## 9.1 Plan 3：数据适配、公开/公司运行与简历证据闭环（全部计划，尚未实现）
+
+Plan 3 的目标是把公开多表信用数据与公司本地脱敏 Parquet 宽表都收敛到 Plan 1 的统一数据契约，再由 Plan 2 的安全监控、根因与受限 Agent 编排形成可复核闭环。**本节所有接口、CLI、配置和运行手册均为计划，当前尚未实现。**Plan 1 完成是数据适配前提；若需展示 MCP/Kiro Agent 或以白名单工具辅助公司任务，还必须先完成并审查通过 Plan 2。全流程只使用本地 Polars/Python/Parquet，明确不使用 SQL、Spark SQL、数据仓库连接、外部模型 API、数据拉取或文件覆盖。
+
+### 9.1.1 公开 Home Credit：本地多表聚合为统一行为宽表
+
+计划模块和接口为：
+
+```python
+HomeCreditPaths.from_directory(path) -> HomeCreditPaths
+prepare_home_credit(paths, output_path, seed=42) -> HomeCreditPreparationResult
+```
+
+输入目录必须存在 `application_train.csv`，并至少存在一张历史表：`previous_application.csv`、`installments_payments.csv`、`POS_CASH_balance.csv`、`credit_card_balance.csv`、`bureau.csv`。适配器不得读取 `application_test.csv`、结果型预测文件或未白名单字段；使用 Polars `LazyFrame` 进行列裁剪并按 `SK_ID_CURR` 本地聚合。输出满足 Plan 1 契约，列顺序起始为 `entity_id`、`target`、`customer_segment`，追加行为特征和固定 `snapshot_date="public_relative_reference"`；不保留原始 `TARGET` 名称及未白名单列。
+
+| 历史源 | 计划列白名单 | 相对历史窗口与计划聚合 |
+|---|---|---|
+| previous application | `SK_ID_CURR`、`DAYS_DECISION`、`AMT_APPLICATION`、`AMT_CREDIT`、`NAME_CONTRACT_STATUS` | 近 **30/90/365 天**申请次数、申请/授信金额、拒绝率 |
+| installments | `SK_ID_CURR`、`DAYS_INSTALMENT`、`DAYS_ENTRY_PAYMENT`、`AMT_INSTALMENT`、`AMT_PAYMENT` | 近 **30/90/365 天**记录数、逾期天数均值、少还比例 |
+| POS cash | `SK_ID_CURR`、`MONTHS_BALANCE`、`SK_DPD`、`SK_DPD_DEF` | 近 **3/6/12 月**活跃月数、DPD 均值和最大值 |
+| credit card | `SK_ID_CURR`、`MONTHS_BALANCE`、`AMT_BALANCE`、`AMT_PAYMENT_CURRENT`、`SK_DPD` | 近 **3/6/12 月**余额均值、支付/余额比、DPD 最大值 |
+| bureau | `SK_ID_CURR`、`DAYS_CREDIT`、`AMT_CREDIT_SUM`、`AMT_CREDIT_SUM_DEBT`、`CREDIT_ACTIVE` | 近 **90/365 天**查询数、活跃授信数、债务/授信比 |
+
+其中 `application_train.csv` 仅读取 `SK_ID_CURR`、`TARGET`、`NAME_INCOME_TYPE`、`DAYS_BIRTH`、`AMT_INCOME_TOTAL`。Home Credit 的 `DAYS_*` 和 `MONTHS_BALANCE` 仅用于相对历史窗口，绝不伪造绝对申请日期、观察日期或表现日期。公开配置将固定如下，因此公开实验只能做固定种子 Train/Test 与跨客群验证，不得声称严格 OOT、时间切片、跨机构或线上效果：
+
+```yaml
+dataset:
+  id: home_credit_public
+columns:
+  entity: entity_id
+  snapshot: snapshot_date
+  segment: customer_segment
+  target: target
+target:
+  positive_value: 1
+  positive_meaning: bad_debt
+  performance_window_days: null
+snapshot:
+  meaning: public_relative_reference
+segment_display_name: customer_segment
+time_validation_enabled: false
+```计划 CLI 是：
+
+```bash
+riskprobe prepare-home-credit --input-dir PATH --output PATH
+```
+
+它只输出表数、行列数、特征族与输出路径，不输出客户样本；用户自行下载 CSV，CSV 和生成的 Parquet 均不随 Git 分发。
+
+### 9.1.2 公司 Parquet：只读预检与 64 列特征批次
+
+计划接口为：
+
+```python
+preflight_company_dataset(config) -> CompanyPreflight
+plan_feature_batches(schema, catalog, batch_size=64) -> tuple[FeatureBatch, ...]
+```
+
+`preflight_company_dataset` 先通过 `scan_parquet().collect_schema()` 验证实体、截面、分层、标签四个角色列和特征族，再仅列裁剪扫描角色列，以计算行数、标签率、日期范围、分层计数、特征族计数和元数据等级。它不读取全部宽表、不导出样本、不写回源文件；验收时源 Parquet 的 `mtime_ns` 前后必须相同。
+
+`FeatureBatch` 保存 `index`、`features`、`required_columns`。`required_columns` 固定附加 entity/snapshot/segment/target，`features` 不含角色列。默认 `batch_size=64`，**977** 个特征需切成 **16** 个顺序稳定、无遗漏、无重复的批次。
+
+仓库只提供虚构示例：`anonymous_id`、`cutoff_date`、`org_code`、`bad_label`，以及 `ord_x_`、`brw_x_`、`multi_x_`、`emb_x_` 特征前缀。真实配置固定为被忽略的 `configs/company.local.yaml`，报告的分层显示名固定为 `institution`。`cutoff_date` 是客户特征截止日，不是申请日或坏账日；表现窗口未知时仍为 B 级，不能称为严格 OOT。
+
+计划 CLI：
+
+```bash
+riskprobe preflight-company --config configs/company.local.yaml
+```
+
+它只输出聚合结果（行数、特征数、特征族计数、批次数、标签率、分层数、元数据等级和限制），不显示真实机构、实体、样本行、规则或真实路径。公司 Parquet、真实字段映射、真实配置、运行产物和内部报告均必须在 Git 之外；运行前后用 `git check-ignore` 与 `git ls-files` 验证隔离。
+
+### 9.1.3 基准记录：实测计时、原始计数和可追溯性
+
+计划模块 `benchmarking.py` 以 `time.perf_counter` 记录 `inspect`、`discover`、`validate`、`monitor`、`report` 阶段。每个 `BenchmarkRecord` 至少保存：run/task/dataset ID、测量时间、代码版本、配置哈希、数据指纹、人工分钟、Agent 分钟、阶段耗时、候选规则数、证据通过数、人工复核/接受数、异常 TP/FP/FN、根因 Top-3 命中数和根因案例数。所有计数和分钟必须非负，接受数不超过复核数。
+
+关键指标必须由原始计数推导，而非人工填写舍入比例：
+
+```text
+precision                 = TP / (TP + FP)
+recall                    = TP / (TP + FN)
+false_positive_rate       = FP / (FP + TN)               （TN 可用时）
+root_cause_top3_hit_rate  = top3_hit_count / root_cause_case_count
+rule_review_acceptance    = accepted_rule_count / reviewed_rule_count
+```
+
+没有实测 `manual_minutes` 时，程序必须拒绝计算“提效”。基准 CLI 读取人工预先填写、且不会被程序改写的本地 baseline：
+
+```bash
+riskprobe benchmark --config PATH --runs-dir PATH --baseline-record PATH
+```
+
+记录只写入被忽略的运行目录，终端不打印公司规则表达式。
+
+### 9.1.4 简历证据：三次真实任务是量化表述的最小门槛
+
+计划 `resume_evidence.py` 只聚合本地 `BenchmarkRecord`。生成量化公司经历前，必须有至少 **3** 个不同 `task_id` 的完整任务，每条均含人工基线、Agent 耗时和原始计数；不足三次或字段缺失即失败，不得使用默认值、示例数字、估算或编造。总提效为总分钟加权而不是简单平均：
+
+```text
+efficiency_rate = (Σ manual_minutes - Σ agent_minutes) / Σ manual_minutes
+```
+
+规则接受率与异常/根因指标按跨任务原始分子分母汇总。`ResumeEvidence` 必须保留来源 `run_id` 列表；简历只可引用其中存在且可追溯的数字，缺一项就省略该句。计划 CLI：
+
+```bash
+riskprobe resume-evidence --records-dir PATH --output reports/internal/resume_evidence.md
+```
+
+输出可含公开项目与公司实习两段草稿，但公司证据只可写入 Git 忽略的内部目录。
+
+### 9.1.5 端到端运行顺序与验收边界
+
+1. **公开闭环：** 用户在仓库外下载 Home Credit；按列白名单与相对窗口聚合为 Parquet；以 `public_relative_reference` 及非时间验证运行 Plan 1；Plan 2 完成后，再以合成漂移验证监控、根因和受限 Agent。公开结果只能报告 Train/Test 与跨客群结论。
+2. **公司闭环：** 在仓库外保留脱敏 Parquet 和 `company.local.yaml`；只读预检后按 64 列分批运行确定性分析；人工复核并记录真实基线与阶段耗时；完成至少三次任务后才生成内部量化证据。
+3. **Agent 闭环：** 仅在 Plan 2 的注册表、输出门控、MCP、Kiro 最小权限均完成并审查通过后，`@riskprobe` 才可编排 `inspect → discover → validate` 或 `detect → diagnose → report`。其只接收脱敏聚合结果，失败最多重试 **1** 次，不能读取明细、任意路径、Shell、网络或写入数据。
+
+Plan 3 的完成门槛是：公开适配不伪造时间验证；公司预检不改写源文件；977 维为 16 个批次；公开/公司显示分别为 `customer_segment`/`institution`；三次任务前拒绝量化简历；私有数据、配置、结果和内部证据均不在 Git 中。当前全部尚未达到，不能称为 Plan 3 已完成。
+
 ## 10. 运行方式、产物、失败处理与可复现性
 
 当前可用 CLI：
@@ -262,7 +380,7 @@ CLI 对参数错误输出结构化 JSON（`argument_error`）；配置读取失�
 
 - 数据为 **30,000** 行、**23** 个特征，含 **7** 个教育分层；总体违约率 **22.12%**；
 - 使用 **70/30** 随机分层划分，Train/Test 为 **21,000 / 9,000**；
-- 产生 **150** 条候选规则及其证据卡；Top 测试规则的 Lift 为 **3.2837**、覆盖率 **6.011%**、命中违约率 **72.64%**、等级为 **B**；
+- 产生 **150** 条候选规则及其证据卡；Top 测试规则的 Lift 为 **3.2837**、覆盖率 **6.011%**、命中违约率 **72.64%**、规则证据等级为 **Stable**；数据元数据等级为 **B**；
 - 未进行时间验证，表现窗口未知；运行 ID 为 `acc8ea38446954df`；六项核心产物均存在，重跑会复用该运行。
 
 这不是严格 OOT 验证，也不是线上收益证明：切分是随机分层而非按时间外推，未做时间验证，且标签表现窗口未知。因此不能由上述结果推断无时间穿越、上线可用性、坏账挽回金额、AUC/KS 改善或实际业务提效。
@@ -271,9 +389,12 @@ CLI 对参数错误输出结构化 JSON（`argument_error`）；配置读取失�
 
 | 范围 | 当前状态 | 可对外准确表述 |
 |---|---|---|
-| Task 1：监控模型与参考快照 | **完成且审查通过** | 已具备不含实体明细、可确定性复现的参考快照 |
-| Task 2：检测器 | **有实现，但有两项 Important 待修复** | 已有 Schema/缺失率/PSI/标签率/分层占比/规则衰减检测；新增分层未告警、自定义 target 识别不可靠，尚未审查闭环 |
-| Task 3–8 | **仅计划** | 漂移注入、根因、注册表/门控、MCP、Kiro 权限、监控 CLI 均不得称为完成 |
-| 公开 UCI 基准 | **已运行** | 仅按第 11 节的已核验事实介绍，且明确其不是严格 OOT 或线上收益 |
+| Plan 1：本地确定性核心引擎 | **完成** | 已完成数据契约、inspect、特征目录、规则发现/验证、六项不可变运行产物和本地 CLI |
+| Plan 2 Task 1：监控模型与参考快照 | **完成且审查通过** | 已具备不含实体明细、可确定性复现、包含特征/分层/规则聚合指标的参考快照 |
+| Plan 2 Task 2：检测器 | **有实现，但有两项 Important 待修复** | 已有 Schema/缺失率/PSI/标签率/分层占比/规则衰减检测；新增分层未告警、自定义 target 识别不可靠，尚未审查闭环 |
+| Plan 2 Task 3–8 | **仅计划** | 漂移注入评分、根因、注册表/门控、MCP、Kiro 权限与监控 CLI 均不得称为完成 |
+| Plan 3：公开/公司数据适配与证据 | **仅计划** | Home Credit 多表适配、公司只读预检/64 列分批、基准计时和实测简历生成均未实现；不得称为已交付 |
+| Kiro/MCP Agent | **仅计划** | 当前只有受限 Agent 架构与最小权限 SOP，尚无可用 MCP 服务或 `@riskprobe` Agent |
+| 公开 UCI 基准 | **已运行** | 仅按第 11 节的已核验事实介绍：Top 规则为 Stable、数据为 B 级，且不是严格 OOT 或线上收益 |
 
 面试或项目介绍应优先说明“确定性引擎输出证据，Agent 只做受限编排和解释”的架构取舍，并在每个效果数字旁保留数据划分、元数据等级、表现窗口与人工复核边界。

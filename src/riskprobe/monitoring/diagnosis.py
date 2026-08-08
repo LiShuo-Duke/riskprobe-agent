@@ -1,12 +1,13 @@
 """Deterministic, aggregate-only attribution for monitoring alerts."""
 
+import math
 from collections.abc import Iterable
 
 import polars as pl
 
 from riskprobe.features.catalog import FeatureCatalog
 
-from .models import Alert, Diagnosis, ReferenceSnapshot, RootCause
+from .models import Alert, Diagnosis, FeatureReference, ReferenceSnapshot, RootCause
 
 _CREATED_AT = "1970-01-01T00:00:00Z"
 
@@ -18,7 +19,7 @@ def diagnose_alerts(
     catalog: FeatureCatalog,
     top_k: int,
 ) -> list[Diagnosis]:
-    """Rank segment and feature-family aggregate contributions for each alert."""
+    """Rank deterministic aggregate contributions for every alert type."""
     if top_k < 1:
         raise ValueError("top_k must be positive")
     references = {feature.feature: feature for feature in reference.features}
@@ -40,16 +41,95 @@ def _causes_for_alert(
     alert: Alert,
     reference: ReferenceSnapshot,
     current_frame: pl.DataFrame,
-    references: dict[str, object],
+    references: dict[str, FeatureReference],
     catalog: FeatureCatalog,
 ) -> list[RootCause]:
-    if (
-        alert.scope != "feature"
-        or alert.scope_value not in references
-        or reference.segment_column not in current_frame.columns
-    ):
+    if alert.alert_type == "schema":
+        return _rank(
+            [("schema", alert.scope_value, 1.0, {"metric": alert.metric})]
+        )
+    if alert.alert_type == "label":
+        causes = [
+            (
+                "target", reference.target_column, abs(alert.delta or 0.0),
+                {"reference_rate": alert.reference_value, "current_rate": alert.current_value},
+            )
+        ]
+        if reference.segment_column in current_frame.columns:
+            for segment, subset in _eligible_segments(current_frame, reference):
+                values = subset.get_column(reference.target_column).to_list()
+                rate = sum(value == 1 for value in values) / len(values) if values else 0.0
+                causes.append(
+                    (
+                        "segment", segment,
+                        abs(rate - reference.positive_rate) * (subset.height / current_frame.height),
+                        {"reference_rate": reference.positive_rate, "current_rate": rate},
+                    )
+                )
+        return _rank(causes)
+    if alert.alert_type == "population":
+        return _rank(
+            [
+                (
+                    "segment",
+                    alert.scope_value,
+                    abs(alert.delta or 0.0),
+                    {"reference_share": alert.reference_value, "current_share": alert.current_value},
+                )
+            ]
+        )
+    if alert.alert_type == "rule_decay":
+        return _rank(
+            [
+                (
+                    "rule",
+                    alert.scope_value,
+                    abs(alert.delta or 0.0),
+                    {"reference_lift": alert.reference_value, "current_lift": alert.current_value},
+                )
+            ]
+        )
+    if alert.alert_type == "missingness" and alert.scope == "family":
+        features = [feature for feature in references.values() if feature.family == alert.scope_value]
+        feature_causes: list[tuple[str, str, float, dict[str, float | int | str]]] = []
+        segment_totals: dict[str, float] = {}
+        for feature in sorted(features, key=lambda item: item.feature):
+            feature_contributions = _missingness_contributions(current_frame, reference, feature)
+            feature_total = sum(item[2] for item in feature_contributions)
+            feature_causes.append(
+                (
+                    "feature",
+                    feature.feature,
+                    feature_total,
+                    {"alert_metric": alert.metric, "family": alert.scope_value},
+                )
+            )
+            for _, segment, contribution, _ in feature_contributions:
+                segment_totals[segment] = segment_totals.get(segment, 0.0) + contribution
+        causes = [
+            (
+                "segment",
+                segment,
+                contribution,
+                {"alert_metric": alert.metric, "feature_count": len(features)},
+            )
+            for segment, contribution in segment_totals.items()
+        ]
+        causes.extend(feature_causes)
+        causes.append(
+            (
+                "family",
+                alert.scope_value,
+                sum(item[2] for item in feature_causes),
+                {"alert_metric": alert.metric, "feature_count": len(features)},
+            )
+        )
+        return _rank(causes)
+    if alert.scope != "feature" or alert.scope_value not in references:
         return []
     feature = references[alert.scope_value]
+    if reference.segment_column not in current_frame.columns or feature.feature not in current_frame.columns:
+        return []
     if alert.alert_type == "missingness":
         contributions = _missingness_contributions(current_frame, reference, feature)
     elif alert.alert_type == "distribution":
@@ -57,36 +137,51 @@ def _causes_for_alert(
     else:
         contributions = []
     family = next(
-        (spec.family for spec in catalog.features if spec.name == alert.scope_value),
-        feature.family,
+        (spec.family for spec in catalog.features if spec.name == alert.scope_value), feature.family
     )
     if contributions:
+        # Keep the feature as an explicit truth dimension.  Segment and family
+        # aggregates remain additive, while the feature root cause prevents the
+        # evaluator from comparing a feature-level truth to an opaque diagnosis.
+        contributions.append(
+            (
+                "feature",
+                feature.feature,
+                abs(alert.delta or 0.0),
+                {"alert_metric": alert.metric, "family": family},
+            )
+        )
         contributions.append(
             (
                 "family",
                 family,
-                sum(item[2] for item in contributions) / (2 * len(contributions)),
+                sum(item[2] for item in contributions if item[0] == "segment"),
                 {"alert_metric": alert.metric, "feature_count": 1},
             )
         )
     return _rank(contributions)
 
 
+def _missing_rate(series: pl.Series) -> float:
+    invalid = sum(
+        1 for value in series.drop_nulls().to_list()
+        if not math.isfinite(float(value))
+    )
+    return (series.null_count() + invalid) / len(series) if len(series) else 0.0
+
+
 def _missingness_contributions(
-    frame: pl.DataFrame, reference: ReferenceSnapshot, feature: object
+    frame: pl.DataFrame, reference: ReferenceSnapshot, feature: FeatureReference
 ) -> list[tuple[str, str, float, dict[str, float | int | str]]]:
-    reference_rate = feature.missing_rate
     contributions = []
     for segment, subset in _eligible_segments(frame, reference):
-        missing_rate = subset.get_column(feature.feature).null_count() / subset.height
-        contribution = abs(missing_rate - reference_rate) * (subset.height / frame.height)
+        missing_rate = _missing_rate(subset.get_column(feature.feature))
+        contribution = abs(missing_rate - feature.missing_rate) * (subset.height / frame.height)
         contributions.append(
             (
-                "segment",
-                segment,
-                contribution,
+                "segment", segment, contribution,
                 {
-                    "reference_missing_rate": reference_rate,
+                    "reference_missing_rate": feature.missing_rate,
                     "current_missing_rate": missing_rate,
                     "current_share": subset.height / frame.height,
                 },
@@ -96,20 +191,24 @@ def _missingness_contributions(
 
 
 def _distribution_contributions(
-    frame: pl.DataFrame, reference: ReferenceSnapshot, feature: object
+    frame: pl.DataFrame, reference: ReferenceSnapshot, feature: FeatureReference
 ) -> list[tuple[str, str, float, dict[str, float | int | str]]]:
-    reference_mean = sum(feature.quantile_edges) / len(feature.quantile_edges) if feature.quantile_edges else 0.0
+    reference_center = (
+        sum(feature.quantile_edges) / len(feature.quantile_edges)
+        if feature.quantile_edges else 0.0
+    )
     contributions = []
     for segment, subset in _eligible_segments(frame, reference):
-        values = subset.get_column(feature.feature).drop_nulls()
-        current_mean = float(values.mean()) if values.len() else 0.0
-        contribution = abs(current_mean - reference_mean) * (subset.height / frame.height)
+        values = tuple(
+            float(value) for value in subset.get_column(feature.feature).drop_nulls().to_list()
+            if math.isfinite(float(value))
+        )
+        current_center = sum(values) / len(values) if values else 0.0
+        contribution = abs(current_center - reference_center) * (subset.height / frame.height)
         contributions.append(
             (
-                "segment",
-                segment,
-                contribution,
-                {"reference_center": reference_mean, "current_center": current_mean},
+                "segment", segment, contribution,
+                {"reference_center": reference_center, "current_center": current_center},
             )
         )
     return contributions
@@ -130,7 +229,18 @@ def _eligible_segments(
 def _rank(
     contributions: list[tuple[str, str, float, dict[str, float | int | str]]]
 ) -> list[RootCause]:
-    ordered = sorted(contributions, key=lambda item: (-item[2], item[0], item[1]))
+    dimension_order = {
+        "segment": 0,
+        "family": 1,
+        "feature": 2,
+        "target": 3,
+        "rule": 4,
+        "schema": 5,
+    }
+    ordered = sorted(
+        contributions,
+        key=lambda item: (-item[2], dimension_order.get(item[0], 99), item[0], item[1]),
+    )
     return [
         RootCause(
             dimension=dimension,

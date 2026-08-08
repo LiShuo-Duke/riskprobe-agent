@@ -652,7 +652,13 @@ class RiskProbeService:
     def inspect(self) -> DatasetProfile:
         return profile_dataset(self._dataset(), self.config)
 
+    def _assert_rule_conclusion_allowed(self, profile: DatasetProfile) -> None:
+        if profile.metadata_grade not in {"A", "B"}:
+            raise ValueError("metadata grade below B blocks rule conclusions")
+
     def discover(self) -> list[RiskRule]:
+        profile = self.inspect()
+        self._assert_rule_conclusion_allowed(profile)
         dataset = self._dataset()
         feature_names = self._feature_names(dataset)
         train, _, _, _ = self._partitions(dataset, feature_names)
@@ -676,6 +682,7 @@ class RiskProbeService:
 
             try:
                 profile = profile_dataset(dataset, self.config)
+                self._assert_rule_conclusion_allowed(profile)
                 artifact_profile = replace(
                     profile,
                     dataset_id=expected_dataset_id,

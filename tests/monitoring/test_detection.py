@@ -192,3 +192,43 @@ def test_alert_ids_are_stable_sha256_prefixes(reference_fixture) -> None:
             f"{alert.alert_type}|{alert.scope}|{alert.scope_value}|{alert.metric}".encode()
         ).hexdigest()[:12]
         assert alert.alert_id == expected
+
+
+def test_missing_target_and_segment_roles_are_critical_schema_alerts(reference_fixture) -> None:
+    reference = _reference_snapshot(reference_fixture)
+    current = reference_fixture["frame"].drop(
+        [reference.target_column, reference.segment_column]
+    )
+
+    alerts = _alerts(reference_fixture, current)
+
+    assert {
+        (alert.scope_value, alert.severity)
+        for alert in alerts
+        if alert.alert_type == "schema"
+    } >= {
+        (reference.target_column, "critical"),
+        (reference.segment_column, "critical"),
+    }
+
+
+def test_population_alerts_include_new_and_disappeared_eligible_groups(reference_fixture) -> None:
+    reference = _reference_snapshot(reference_fixture)
+    segment = reference.segment_column
+    current = reference_fixture["frame"].with_columns(
+        pl.when(pl.arange(0, pl.len()) < reference_fixture["frame"].height // 2)
+        .then(pl.lit("new-group"))
+        .otherwise(pl.lit("new-group"))
+        .alias(segment)
+    )
+
+    alerts = _alerts(reference_fixture, current)
+
+    assert any(
+        alert.alert_type == "population" and alert.scope_value == "new-group"
+        for alert in alerts
+    )
+    assert any(
+        alert.alert_type == "population" and alert.scope_value in reference.segment_counts
+        for alert in alerts
+    )

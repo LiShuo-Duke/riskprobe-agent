@@ -21,6 +21,13 @@ class RuleReference(FrozenModel):
 
 
 class ReferenceSnapshot(FrozenModel):
+    """Aggregate reference data with no temporal bucket or month dimension.
+
+    Monitoring conclusions are limited to the dimensions represented below;
+    rule-validation time splits are a separate capability and are not encoded as
+    monitoring drift evidence.
+    """
+
     snapshot_id: str
     dataset_id: str
     row_count: int

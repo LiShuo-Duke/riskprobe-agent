@@ -25,6 +25,8 @@ class RuleReviewSummary(_StrictModel):
     def validate_counts(self) -> "RuleReviewSummary":
         if self.evidence_passed_count > self.candidate_rule_count:
             raise ValueError("evidence_passed_count cannot exceed candidate_rule_count")
+        if self.reviewed_rule_count > self.candidate_rule_count:
+            raise ValueError("reviewed_rule_count cannot exceed candidate_rule_count")
         if self.accepted_rule_count > self.reviewed_rule_count:
             raise ValueError("accepted_rule_count cannot exceed reviewed_rule_count")
         return self
@@ -64,6 +66,8 @@ class BenchmarkRecord(_StrictModel):
     anomaly_false_negative_count: int = Field(ge=0)
     root_cause_top3_hit_count: int = Field(ge=0)
     root_cause_case_count: int = Field(ge=0)
+    baseline_fingerprint: str | None = None
+    baseline_task_id: str
 
     @model_validator(mode="after")
     def validate_consistency(self) -> "BenchmarkRecord":
@@ -82,6 +86,8 @@ class BenchmarkRecord(_StrictModel):
         )
         if len({timing.stage for timing in self.stage_timings}) != len(self.stage_timings):
             raise ValueError("stage_timings must contain each stage at most once")
+        if self.baseline_task_id != self.task_id:
+            raise ValueError("baseline_task_id must match task_id")
         return self
 
     @property

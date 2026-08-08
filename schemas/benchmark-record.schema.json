@@ -24,7 +24,8 @@
     "anomaly_false_positive_count",
     "anomaly_false_negative_count",
     "root_cause_top3_hit_count",
-    "root_cause_case_count"
+    "root_cause_case_count",
+    "baseline_task_id"
   ],
   "properties": {
     "run_id": {"type": "string"},
@@ -53,7 +54,9 @@
     "anomaly_false_positive_count": {"type": "integer", "minimum": 0},
     "anomaly_false_negative_count": {"type": "integer", "minimum": 0},
     "root_cause_top3_hit_count": {"type": "integer", "minimum": 0},
-    "root_cause_case_count": {"type": "integer", "minimum": 0}
+    "root_cause_case_count": {"type": "integer", "minimum": 0},
+    "baseline_task_id": {"type": "string", "description": "Must equal task_id and binds the measured record to its human baseline."},
+    "baseline_fingerprint": {"type": ["string", "null"], "description": "Fingerprint of the immutable human baseline file."}
   },
   "$defs": {
     "stageTiming": {

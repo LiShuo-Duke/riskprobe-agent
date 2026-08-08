@@ -38,6 +38,22 @@ def detect_anomalies(
     alerts: list[Alert] = []
     anomalous_missingness: dict[str, list[Alert]] = {}
 
+    for role, column in (("target", reference.target_column), ("segment", reference.segment_column)):
+        if column not in current_frame.columns:
+            alerts.append(
+                _alert(
+                    "schema",
+                    "critical",
+                    "dataset",
+                    column,
+                    "role_column",
+                    role,
+                    None,
+                    None,
+                    {},
+                )
+            )
+
     for feature in reference.features:
         if feature.feature not in current_frame.columns:
             alerts.append(
@@ -203,13 +219,25 @@ def _population_alerts(
     for segment in sorted(set(reference.segment_counts).union(current_counts)):
         reference_count = reference.segment_counts.get(segment, 0)
         current_count = current_counts.get(segment, 0)
-        if (
-            reference_count < reference.min_group_size
-            or current_count < reference.min_group_size
-        ):
+        # A group is eligible when it is sufficiently represented on either side.
+        # This preserves alerts for legal groups that appear or disappear while
+        # suppressing groups that are small in both snapshots.
+        if reference_count < reference.min_group_size and current_count < reference.min_group_size:
             continue
-        reference_share = reference_count / reference.row_count
-        current_share = current_count / current_frame.height
+        if reference_count == 0 and current_count >= reference.min_group_size:
+            reference_share = 0.0
+            current_share = current_count / current_frame.height
+        elif current_count == 0 and reference_count >= reference.min_group_size:
+            reference_share = reference_count / reference.row_count
+            current_share = 0.0
+        else:
+            if (
+                reference_count < reference.min_group_size
+                or current_count < reference.min_group_size
+            ):
+                continue
+            reference_share = reference_count / reference.row_count
+            current_share = current_count / current_frame.height
         delta = current_share - reference_share
         if abs(delta) < _INSTITUTION_SHARE_WARNING:
             continue

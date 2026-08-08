@@ -152,11 +152,14 @@ class ProjectConfig(StrictModel):
     features: FeatureFamilyConfig
     segment_display_name: Literal["institution", "customer_segment"] = "institution"
     time_validation_enabled: bool = True
+    metadata_grade_override: Literal["A", "B", "C", "D"] | None = None
     discovery: DiscoveryConfig = DiscoveryConfig()
     validation: ValidationConfig = ValidationConfig()
 
     @property
-    def metadata_grade(self) -> Literal["A", "B"]:
+    def metadata_grade(self) -> Literal["A", "B", "C", "D"]:
+        if self.metadata_grade_override is not None:
+            return self.metadata_grade_override
         return "A" if self.target.performance_window_days is not None else "B"
 
     @classmethod

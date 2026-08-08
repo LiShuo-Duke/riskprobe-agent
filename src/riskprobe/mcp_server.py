@@ -15,112 +15,189 @@ from riskprobe.models import EvidenceCard
 from riskprobe.monitoring.detection import detect_anomalies as detect_alerts
 from riskprobe.monitoring.diagnosis import diagnose_alerts
 from riskprobe.monitoring.models import ReferenceSnapshot
-from riskprobe.privacy import assert_safe_payload, suppress_small_groups
+from riskprobe.privacy import assert_safe_payload, redact_payload, stable_token, suppress_small_groups
 from riskprobe.profiling import profile_dataset
 from riskprobe.registry import DatasetRegistry
 from riskprobe.service import RiskProbeService
 
 _RUN_ID = re.compile(r"^[0-9a-f]{16}$")
 mcp = FastMCP("riskprobe")
+_SERVER_TOOLS: Any = None
 
 
 class RiskProbeTools:
-    """Synchronous operations that accept only registered IDs and return safe aggregates."""
+    """Aggregate-only operations with an explicit in-process workflow state."""
 
     def __init__(self, registry: DatasetRegistry, store: RunStore) -> None:
         self.registry = registry
         self.store = store
+        self._inspected: set[str] = set()
+        self._discovered: dict[str, tuple[str, ...]] = {}
+        self._validated: dict[str, str] = {}
+        self._detected: dict[str, dict[str, Any]] = {}
+        self._diagnosed: set[str] = set()
+        self._retry_counts: dict[str, int] = {}
+        self._alert_handles: dict[str, tuple[str, str]] = {}
 
     def inspect_dataset(self, dataset_id: str) -> dict[str, Any]:
         config = self.registry.get_config(dataset_id)
         profile = profile_dataset(ParquetDataset(config.dataset.path), config)
-        payload = {
-            "dataset_id": dataset_id,
-            "metadata_grade": profile.metadata_grade,
-            "row_count": profile.row_count,
-            "feature_count": profile.feature_count,
-            "positive_rate": profile.positive_rate,
-            "segment_counts": suppress_small_groups(
-                (
-                    {"segment": segment, "count": count}
-                    for segment, count in profile.segment_counts.items()
+        self._inspected.add(dataset_id)
+        return self._safe(
+            {
+                "dataset_id": dataset_id,
+                "metadata_grade": profile.metadata_grade,
+                "row_count": profile.row_count,
+                "feature_count": profile.feature_count,
+                "positive_rate": profile.positive_rate,
+                "segment_counts": suppress_small_groups(
+                    ({"segment": segment, "count": count} for segment, count in profile.segment_counts.items()),
+                    "count",
+                    config.validation.min_group_size,
                 ),
-                "count",
-                config.validation.min_group_size,
-            ),
-            "limitations": sorted(issue.code for issue in profile.issues),
-        }
-        return self._safe(payload)
+                "limitations": sorted(issue.code for issue in profile.issues),
+            }
+        )
 
-    def discover_rules(self, dataset_id: str) -> dict[str, Any]:
+    def discover_rules(
+        self, dataset_id: str, objective: str, constraints: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require(dataset_id in self._inspected, "inspect must complete before discover")
+        if not isinstance(objective, str) or objective.strip() != "risk":
+            raise ValueError("objective must be the supported 'risk' objective")
+        if not isinstance(constraints, dict):
+            raise ValueError("constraints must be an object")
+        if constraints:
+            raise ValueError("non-empty constraints are unsupported and must be rejected")
         service = self._service(dataset_id)
-        payload = {
-            "dataset_id": dataset_id,
-            "rules": [
-                {
-                    "rule_id": rule.rule_id,
-                    "origin": rule.origin,
-                    "expression": " AND ".join(
-                        f"{condition.feature} {condition.operator} {condition.value}"
-                        for condition in rule.conditions
-                    ),
-                }
-                for rule in service.discover()
-            ],
-        }
-        return self._safe(payload)
+        rules = service.discover()
+        rule_ids = tuple(rule.rule_id for rule in rules)
+        self._discovered[dataset_id] = rule_ids
+        return self._safe(
+            {
+                "dataset_id": dataset_id,
+                "objective": objective,
+                "rule_count": len(rule_ids),
+                "rules": [
+                    {"rule_id": rule.rule_id, "condition_count": len(rule.conditions), "origin": rule.origin}
+                    for rule in rules
+                ],
+            }
+        )
 
-    def validate_rules(self, dataset_id: str) -> dict[str, Any]:
-        context = self._service(dataset_id).run()
+    def validate_rules(
+        self, dataset_id: str, rule_ids: list[str], split_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require(dataset_id in self._discovered, "discover must complete before validate")
+        if not isinstance(rule_ids, list) or not isinstance(split_config, dict):
+            raise ValueError("rule_ids and split_config are required")
+        if split_config:
+            raise ValueError("non-empty split_config is unsupported and must be rejected")
+        discovered = set(self._discovered[dataset_id])
+        if not set(rule_ids).issubset(discovered):
+            raise ValueError("rule_ids must come from discover")
+        context = self._run_dataset(dataset_id)
+        self._validated[dataset_id] = context.run_id
         cards = self._read_cards(context.run_dir / "evidence_cards.json")
+        grade_counts: dict[str, int] = {}
+        for card in cards:
+            grade_counts[card.grade] = grade_counts.get(card.grade, 0) + 1
         return self._safe(
             {
                 "dataset_id": dataset_id,
                 "run_id": context.run_id,
-                "evidence_cards": [card.model_dump(mode="json") for card in cards],
+                "evidence_card_count": len(cards),
+                "retry_count": self._retry_counts.get(dataset_id, 0),
+                "grade_counts": grade_counts,
             }
         )
 
     def detect_anomalies(self, reference_run_id: str, current_dataset_id: str) -> dict[str, Any]:
+        self._require(reference_run_id and _RUN_ID.fullmatch(reference_run_id) is not None, "reference run ID is invalid")
+        self._require(current_dataset_id in self._validated, "validate must complete before detect")
         reference = self._reference_snapshot(reference_run_id)
         config = self.registry.get_config(current_dataset_id)
-        service = self._service(current_dataset_id)
-        current_context = service.run()
+        current_context = self._run_dataset(current_dataset_id)
         frame, profile, catalog = self._frame_profile_catalog(config)
         cards = self._read_cards(current_context.run_dir / "evidence_cards.json")
         alerts = detect_alerts(reference, frame, cards, catalog)
+        self._detected[current_context.run_id] = {
+            "reference": reference, "frame": frame, "catalog": catalog, "alerts": tuple(alerts),
+            "dataset_id": current_dataset_id,
+            "run_dir": current_context.run_dir,
+        }
+        alert_handles = []
+        for alert in alerts:
+            handle = stable_token(f"{current_context.run_id}:{alert.alert_id}", namespace="alert")
+            self._alert_handles[handle] = (current_context.run_id, alert.alert_id)
+            alert_handles.append(handle)
         return self._safe(
             {
                 "reference_run_id": reference_run_id,
                 "current_dataset_id": current_dataset_id,
-                "alerts": [alert.model_dump(mode="json") for alert in alerts],
+                "run_id": current_context.run_id,
+                "alert_count": len(alerts),
+                "alert_ids": alert_handles,
+                "severity_counts": {
+                    severity: sum(alert.severity == severity for alert in alerts)
+                    for severity in ("warning", "critical")
+                },
                 "metadata_grade": profile.metadata_grade,
+                "retry_count": self._retry_counts.get(current_dataset_id, 0),
             }
         )
 
-    def diagnose_anomaly(self, reference_run_id: str, current_dataset_id: str) -> dict[str, Any]:
-        reference = self._reference_snapshot(reference_run_id)
-        config = self.registry.get_config(current_dataset_id)
-        current_context = self._service(current_dataset_id).run()
-        frame, _, catalog = self._frame_profile_catalog(config)
-        cards = self._read_cards(current_context.run_dir / "evidence_cards.json")
-        alerts = detect_alerts(reference, frame, cards, catalog)
-        diagnoses = diagnose_alerts(alerts, reference, frame, catalog, top_k=3)
+    def diagnose_anomaly(self, alert_ids: list[str]) -> dict[str, Any]:
+        self._require(isinstance(alert_ids, list) and alert_ids, "alert_ids are required")
+        handles = set(alert_ids)
+        if not handles.issubset(self._alert_handles):
+            raise ValueError("alert_ids must come from detect")
+        run_ids = {self._alert_handles[handle][0] for handle in handles}
+        self._require(len(run_ids) == 1, "alert_ids must belong to one detect run")
+        run_id = next(iter(run_ids))
+        context = self._detected[run_id]
+        raw_ids = {self._alert_handles[handle][1] for handle in handles}
+        alerts = tuple(alert for alert in context["alerts"] if alert.alert_id in raw_ids)
+        diagnoses = diagnose_alerts(
+            alerts, context["reference"], context["frame"], context["catalog"], top_k=3
+        )
+        self._diagnosed.add(run_id)
         return self._safe(
             {
-                "reference_run_id": reference_run_id,
-                "current_dataset_id": current_dataset_id,
-                "diagnoses": [diagnosis.model_dump(mode="json") for diagnosis in diagnoses],
+                "run_id": run_id,
+                "diagnosis_count": len(diagnoses),
+                "root_cause_count": sum(len(diagnosis.root_causes) for diagnosis in diagnoses),
             }
         )
 
-    def build_report(self, dataset_id: str) -> dict[str, Any]:
-        context = self._service(dataset_id).run()
-        markdown = (context.run_dir / "risk_report.md").read_text(encoding="utf-8")
-        return self._safe({"report_id": context.run_id, "markdown": markdown})
+    def build_report(self, run_id: str, report_type: str) -> dict[str, Any]:
+        self._require(run_id in self._diagnosed, "diagnose must complete before report")
+        if report_type not in {"summary", "monitoring"}:
+            raise ValueError("unsupported report_type")
+        context = self._detected[run_id]
+        report = (context["run_dir"] / "risk_report.md").read_text(encoding="utf-8")
+        return self._safe(
+            {
+                "report_id": run_id,
+                "report_type": report_type,
+                "section_count": report.count("\n## "),
+                "available": bool(report),
+            }
+        )
 
     def _service(self, dataset_id: str) -> RiskProbeService:
         return RiskProbeService(config=self.registry.get_config(dataset_id), runs_dir=self.store.runs_dir)
+
+    def _run_dataset(self, dataset_id: str) -> Any:
+        service = self._service(dataset_id)
+        try:
+            return service.run()
+        except Exception:
+            attempts = self._retry_counts.get(dataset_id, 0)
+            if attempts >= 1:
+                raise
+            self._retry_counts[dataset_id] = attempts + 1
+            return service.run()
 
     def _reference_snapshot(self, run_id: str) -> ReferenceSnapshot:
         if not _RUN_ID.fullmatch(run_id):
@@ -148,13 +225,22 @@ class RiskProbeTools:
 
     @staticmethod
     def _safe(payload: dict[str, Any]) -> dict[str, Any]:
-        assert_safe_payload(payload)
-        return payload
+        redacted = redact_payload(payload)
+        assert_safe_payload(redacted)
+        return redacted
+
+    @staticmethod
+    def _require(condition: bool, message: str) -> None:
+        if not condition:
+            raise ValueError(message)
 
 
 def get_tools() -> RiskProbeTools:
-    registry_path = Path(os.environ.get("RISKPROBE_REGISTRY", "configs/datasets.example.yaml"))
-    return RiskProbeTools(DatasetRegistry.from_yaml(registry_path), RunStore("runs"))
+    global _SERVER_TOOLS
+    if _SERVER_TOOLS is None:
+        registry_path = Path(os.environ.get("RISKPROBE_REGISTRY", "configs/datasets.example.yaml"))
+        _SERVER_TOOLS = RiskProbeTools(DatasetRegistry.from_yaml(registry_path), RunStore("runs"))
+    return _SERVER_TOOLS
 
 
 @mcp.tool()
@@ -163,13 +249,13 @@ def inspect_dataset(dataset_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def discover_rules(dataset_id: str) -> dict[str, Any]:
-    return get_tools().discover_rules(dataset_id)
+def discover_rules(dataset_id: str, objective: str, constraints: dict[str, Any]) -> dict[str, Any]:
+    return get_tools().discover_rules(dataset_id, objective, constraints)
 
 
 @mcp.tool()
-def validate_rules(dataset_id: str) -> dict[str, Any]:
-    return get_tools().validate_rules(dataset_id)
+def validate_rules(dataset_id: str, rule_ids: list[str], split_config: dict[str, Any]) -> dict[str, Any]:
+    return get_tools().validate_rules(dataset_id, rule_ids, split_config)
 
 
 @mcp.tool()
@@ -178,13 +264,13 @@ def detect_anomalies(reference_run_id: str, current_dataset_id: str) -> dict[str
 
 
 @mcp.tool()
-def diagnose_anomaly(reference_run_id: str, current_dataset_id: str) -> dict[str, Any]:
-    return get_tools().diagnose_anomaly(reference_run_id, current_dataset_id)
+def diagnose_anomaly(alert_ids: list[str]) -> dict[str, Any]:
+    return get_tools().diagnose_anomaly(alert_ids)
 
 
 @mcp.tool()
-def build_report(dataset_id: str) -> dict[str, Any]:
-    return get_tools().build_report(dataset_id)
+def build_report(run_id: str, report_type: str) -> dict[str, Any]:
+    return get_tools().build_report(run_id, report_type)
 
 
 if __name__ == "__main__":

@@ -32,12 +32,29 @@ def aggregate_benchmarks(records: list[BenchmarkRecord]) -> ResumeEvidence:
     task_ids = {record.task_id for record in records}
     if len(task_ids) < 3:
         raise ValueError("at least 3 completed tasks with distinct task IDs are required")
+    if len(task_ids) != len(records):
+        raise ValueError("benchmark records must have unique task IDs")
     if any(record.manual_minutes is None for record in records):
         raise ValueError("every completed task requires a measured manual baseline")
+    if any(record.baseline_fingerprint is None for record in records):
+        raise ValueError("every benchmark record requires baseline provenance")
+    if any(
+        abs(record.agent_minutes - sum(item.seconds for item in record.stage_timings) / 60) > 1e-9
+        for record in records
+    ):
+        raise ValueError("agent_minutes must equal recorded stage timings")
     if len({record.run_id for record in records}) != len(records):
         raise ValueError("benchmark records must have unique run IDs")
-    manual_minutes = sum(record.manual_minutes or 0.0 for record in records)
+    for field in ("dataset_id", "config_hash", "data_fingerprint"):
+        if len({getattr(record, field) for record in records}) != 1:
+            raise ValueError(f"benchmark records must share {field}")
+    if any(
+        record.baseline_task_id is not None and record.baseline_task_id != record.task_id
+        for record in records
+    ):
+        raise ValueError("baseline task identity does not match benchmark task")
     agent_minutes = sum(record.agent_minutes for record in records)
+    manual_minutes = sum(record.manual_minutes or 0.0 for record in records)
     if manual_minutes <= 0:
         raise ValueError("measured manual baselines must total more than zero")
     reviewed = sum(record.reviewed_rule_count for record in records)

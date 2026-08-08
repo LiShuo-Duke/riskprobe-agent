@@ -228,3 +228,21 @@ def test_unusable_runs_directory_is_a_safe_actionable_error(tmp_path: Path) -> N
         "message": "Choose a writable local --runs-dir directory.",
     }
     assert str(runs_file) not in result.stdout
+
+
+def test_evaluate_drift_rejects_repository_runs_dir() -> None:
+    result = runner.invoke(
+        app,
+        [
+            "evaluate-drift",
+            "--config",
+            "configs/synthetic.example.yaml",
+            "--runs-dir",
+            "runs",
+            "--seed",
+            "42",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["error"] == "evaluation_error"

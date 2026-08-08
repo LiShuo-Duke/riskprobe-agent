@@ -12,10 +12,12 @@ def make_record(task_id: str, manual: float = 60.0, agent: float = 30.0) -> Benc
         measured_at="2026-08-05T10:00:00Z",
         code_version="0.1.0",
         config_hash="cfg123",
-        data_fingerprint=f"data-{task_id}",
+        data_fingerprint="data-shared",
+        baseline_fingerprint="sha256:baseline",
+        baseline_task_id=task_id,
         manual_minutes=manual,
         agent_minutes=agent,
-        stage_timings=(StageTiming(stage="inspect", seconds=12.0),),
+        stage_timings=(StageTiming(stage="inspect", seconds=1800.0),),
         candidate_rule_count=30,
         evidence_passed_count=15,
         reviewed_rule_count=10,
@@ -55,3 +57,9 @@ def test_resume_draft_uses_only_aggregated_measurements() -> None:
     assert "50.0%" in draft.company_experience
     assert "3 completed" in draft.company_experience
     assert "Run ID" not in draft.public_project
+
+
+def test_resume_evidence_rejects_mixed_dataset_config_or_data_identity() -> None:
+    records = [make_record("001"), make_record("002"), make_record("003")]
+    with pytest.raises(ValueError, match="dataset_id|config_hash|data_fingerprint"):
+        aggregate_benchmarks(records[:2] + [records[2].model_copy(update={"dataset_id": "other"})])

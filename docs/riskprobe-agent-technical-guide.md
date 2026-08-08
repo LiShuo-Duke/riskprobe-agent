@@ -140,7 +140,7 @@ Task 2 的 `detect_anomalies` 已实现固定的聚合检测器，但**尚未完
 1. **新增分层未告警**：当前总体分层占比检查只遍历参考快照已有的分层，因此新出现的分层不会触发告警；
 2. **自定义 target 列识别不可靠**：标签列优先猜测 `target`、`label`、`outcome`，否则从非特征数值二值列猜测，不能可靠识别任意自定义的 `columns.target`。
 
-现有检测规则和固定阈值如下：
+现有检测规则和固定阈值如下。`ReferenceSnapshot` 当前没有时间戳、月份或时间桶字段，因此监控 detect/diagnose 只在 dataset、segment、feature、family、rule 维度闭合；规则验证阶段独立的时间分区/月度验证不能被表述为监控时间漂移或月度根因结论。
 
 | 检测 | 当前行为 | 阈值 |
 |---|---|---|
@@ -185,7 +185,7 @@ PSI = Σ_i (p_current,i - p_reference,i)
 contribution = abs(current_metric - reference_metric) × current_share
 ```
 
-标签和规则告警按分层和月份计算坏账率或 Lift 变化的绝对贡献，再按特征目录汇总到特征族。每个 `RootCause` 固定包含 `dimension`、`value`、`contribution`、`rank`、`evidence`；排序键为贡献降序、`dimension`、`value`，确保确定性。默认评估 Top-**3**。
+诊断会显式保留 feature 根因，并将同族特征贡献聚合为 family 根因；segment/family/feature 的比较维度与漂移真值保持一致。当前参考快照没有时间/月度字段，因此不伪造月份根因；若未来实现时间诊断，必须先在模型中加入明确时间聚合字段和定义。
 
 ### Task 5：注册表与安全输出门控
 

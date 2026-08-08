@@ -1,5 +1,6 @@
 import hashlib
 import json
+import stat
 import time
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -18,7 +19,7 @@ from riskprobe.io.parquet import ParquetDataset
 from riskprobe.models import EvidenceCard, RiskRule, RuleMetrics
 from riskprobe.monitoring.detection import detect_anomalies
 from riskprobe.monitoring.diagnosis import diagnose_alerts
-from riskprobe.monitoring.injection import DriftScenario, evaluate_alerts, inject_drift
+from riskprobe.monitoring.injection import DetectionScore, DriftScenario, evaluate_alerts, inject_drift
 from riskprobe.monitoring.reference import build_reference_snapshot
 from typer.core import TyperGroup
 
@@ -266,6 +267,7 @@ def evaluate_drift(
 ) -> None:
     """Inject six reproducible drift scenarios and report aggregate detection scores."""
     try:
+        runs_dir = _protected_path(runs_dir)
         project_config = ProjectConfig.from_yaml(config)
         frame, profile, catalog = _monitoring_inputs(project_config)
         metrics = RuleMetrics(
@@ -303,6 +305,7 @@ def evaluate_drift(
         all_alerts = []
         truths = []
         all_diagnoses = []
+        scenario_scores: dict[str, DetectionScore] = {}
         for offset, scenario in enumerate(scenarios):
             injected = inject_drift(frame, scenario, seed + offset)
             current_cards = (baseline_card,)
@@ -319,17 +322,54 @@ def evaluate_drift(
                 )
                 truth = truth.model_copy(update={"expected_scope_value": baseline_card.rule.rule_id})
             alerts = detect_anomalies(reference, injected.frame, current_cards, catalog)
+            diagnoses = diagnose_alerts(alerts, reference, injected.frame, catalog, top_k=3)
+            scenario_scores[scenario.scenario_id] = evaluate_alerts(
+                alerts, (truth,), top_k=3, diagnoses=diagnoses
+            )
             all_alerts.extend(alerts)
             truths.append(truth)
-            all_diagnoses.extend(diagnose_alerts(alerts, reference, injected.frame, catalog, top_k=3))
-        score = evaluate_alerts(all_alerts, truths, top_k=3)
-        output_dir = runs_dir / "monitoring" / f"evaluation-{reference.snapshot_id[:16]}"
+            all_diagnoses.extend(diagnoses)
+        score = DetectionScore(
+            precision=sum(item.precision for item in scenario_scores.values()) / len(scenario_scores),
+            recall=sum(item.recall for item in scenario_scores.values()) / len(scenario_scores),
+            false_positive_rate=None,
+            false_discovery_rate=sum(item.false_discovery_rate for item in scenario_scores.values()) / len(scenario_scores),
+            top_k_root_cause_hit=sum(item.top_k_root_cause_hit for item in scenario_scores.values()) / len(scenario_scores),
+        )
+        output_dir = _protected_path(
+            runs_dir / "monitoring" / f"evaluation-{reference.snapshot_id[:16]}"
+        )
         _write_monitoring_json(output_dir, "anomaly_alerts.json", [item.model_dump(mode="json") for item in all_alerts])
         _write_monitoring_json(output_dir, "diagnoses.json", [item.model_dump(mode="json") for item in all_diagnoses])
-        _write_monitoring_json(output_dir, "drift_evaluation.json", score.model_dump(mode="json"))
+        _write_monitoring_json(
+            output_dir,
+            "drift_evaluation.json",
+            {**score.model_dump(mode="json"), "scenarios": {
+                scenario_id: item.model_dump(mode="json")
+                for scenario_id, item in sorted(scenario_scores.items())
+            }},
+        )
     except Exception:
         _fail("evaluation_error", "Check the local configuration, synthetic-compatible features, and --seed.")
     typer.echo(json.dumps({"command": "evaluate-drift", **score.model_dump(mode="json")}, sort_keys=True))
+
+
+def _repository_root() -> Path:
+    candidate = Path(__file__).resolve().parents[2]
+    return candidate if (candidate / ".git").exists() else Path.cwd().resolve()
+
+
+def _protected_path(path: Path, *, output: bool = False) -> Path:
+    """Allow only owner-private paths outside the repository checkout."""
+    resolved = path.expanduser().resolve()
+    repo = _repository_root()
+    if resolved == repo or repo in resolved.parents:
+        raise ValueError("benchmark outputs must not be written inside the repository")
+    parent = resolved.parent if output else resolved
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not parent.is_dir() or stat.S_IMODE(parent.stat().st_mode) & 0o077:
+        raise ValueError("benchmark output directory must be owner-private")
+    return resolved
 
 
 def _code_version() -> str:
@@ -412,10 +452,19 @@ def benchmark(
     """Measure local workflow stages without changing the manual baseline record."""
     try:
         project_config = ProjectConfig.from_yaml(config)
+        runs_dir = _protected_path(runs_dir)
         baseline = BenchmarkRecord.model_validate_json(
             baseline_record.read_text(encoding="utf-8")
         )
         service = RiskProbeService(config=project_config, runs_dir=runs_dir)
+        config_hash = service.store.config_fingerprint(project_config)
+        data_fingerprint = _file_fingerprint(project_config.dataset.path)
+        if (
+            baseline.dataset_id != project_config.dataset.id
+            or baseline.config_hash != config_hash
+            or baseline.data_fingerprint != data_fingerprint
+        ):
+            raise ValueError("baseline record identity does not match current dataset and configuration")
         timings: list[StageTiming] = []
 
         started = time.perf_counter()
@@ -442,8 +491,10 @@ def benchmark(
             update={
                 "agent_minutes": total_agent_minutes(timings),
                 "code_version": _code_version(),
-                "config_hash": service.store.config_fingerprint(project_config),
-                "data_fingerprint": _file_fingerprint(project_config.dataset.path),
+                "config_hash": config_hash,
+                "data_fingerprint": data_fingerprint,
+                "baseline_fingerprint": _file_fingerprint(baseline_record),
+                "baseline_task_id": baseline.task_id,
                 "dataset_id": project_config.dataset.id,
                 "run_id": context.run_id,
                 "measured_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -451,7 +502,10 @@ def benchmark(
             }
         ).validate_consistency()
         output = context.run_dir / "benchmark_record.json"
+        if output.exists():
+            raise FileExistsError("benchmark record already exists and is immutable")
         output.write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        output.chmod(0o400)
     except Exception:
         _fail(
             "benchmark_error",
@@ -476,13 +530,17 @@ def resume_evidence(
 ) -> None:
     """Create internal resume text only from complete measured benchmark records."""
     try:
+        records_dir = _protected_path(records_dir)
+        output = _protected_path(output, output=True)
         records = [
             BenchmarkRecord.model_validate_json(path.read_text(encoding="utf-8"))
             for path in sorted(records_dir.rglob("benchmark_record.json"))
         ]
         evidence = aggregate_benchmarks(records)
-        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.exists():
+            raise FileExistsError("resume evidence output already exists and is immutable")
         output.write_text(render_markdown(evidence), encoding="utf-8")
+        output.chmod(0o400)
     except Exception as error:
         _fail("resume_evidence_error", str(error))
     typer.echo(

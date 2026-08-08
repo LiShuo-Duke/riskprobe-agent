@@ -12,6 +12,7 @@ def _record(manual_minutes: float | None = None) -> BenchmarkRecord:
         code_version="0.1.0",
         config_hash="cfg123",
         data_fingerprint="data123",
+        baseline_task_id="joint-validation-001",
         manual_minutes=manual_minutes,
         agent_minutes=32.0,
         stage_timings=(StageTiming(stage="inspect", seconds=12.0),),
@@ -54,3 +55,36 @@ def test_benchmark_record_requires_manual_minutes_field_even_when_null() -> None
 
     with pytest.raises(ValueError, match="manual_minutes"):
         BenchmarkRecord.model_validate(payload)
+
+
+def test_benchmark_record_rejects_duplicate_stage_timings() -> None:
+    with pytest.raises(ValueError, match="stage_timings"):
+        _record(manual_minutes=64.0).model_copy(
+            update={
+                "stage_timings": (
+                    StageTiming(stage="inspect", seconds=12.0),
+                    StageTiming(stage="inspect", seconds=13.0),
+                )
+            }
+        ).validate_consistency()
+
+
+def test_benchmark_record_requires_baseline_task_binding() -> None:
+    payload = _record(manual_minutes=64.0).model_dump(exclude={"baseline_task_id"})
+
+    with pytest.raises(ValueError, match="baseline_task_id"):
+        BenchmarkRecord.model_validate(payload)
+
+
+def test_benchmark_record_rejects_baseline_task_mismatch() -> None:
+    with pytest.raises(ValueError, match="baseline_task_id"):
+        _record(manual_minutes=64.0).model_copy(
+            update={"baseline_task_id": "other-task"}
+        ).validate_consistency()
+
+
+    record = _record(manual_minutes=64.0).model_copy(
+        update={"baseline_fingerprint": "sha256:baseline", "baseline_task_id": "joint-validation-001"}
+    )
+    assert record.baseline_fingerprint == "sha256:baseline"
+    assert record.baseline_task_id == record.task_id

@@ -1030,3 +1030,11 @@ def test_distinct_same_footer_inputs_do_not_reuse_a_completed_run(
 
     assert first.run_id != second.run_id
     assert second.is_existing is False
+
+
+def test_below_b_metadata_grade_blocks_rule_discovery(tmp_path: Path) -> None:
+    config = _small_config(tmp_path).model_copy(update={"metadata_grade_override": "C"})
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    with pytest.raises(ValueError, match="below B"):
+        service.discover()

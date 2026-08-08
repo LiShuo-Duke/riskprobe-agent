@@ -1,6 +1,6 @@
 # RiskProbe Agent 完整流程技术说明
 
-> 用途：项目介绍、面试准备与本地复现。本文区分**当前已实现**、**已有实现但尚未审查闭环**与**计划设计**，不将计划功能描述为已交付能力。
+> 用途：项目介绍、面试准备与本地复现。本文区分**当前已实现能力**与**真实数据运行边界**，不把未执行的真实公司运行或业务效果描述为已交付结果。
 
 ## 1. 定位、边界与架构
 
@@ -9,10 +9,10 @@ RiskProbe Agent 是一个面向风控规则发现、证据验证与异常感知�
 首期明确**不做** SQL/Spark SQL 或数据仓库连接、Web 前端、在线流处理、自动策略上线、任意 Python 执行、多 Agent 角色扮演、强化学习、外部 LLM API 依赖，也不替代既有评分模型。系统不会自动修改、删除或上线任何风控策略，最终业务决策始终由人工完成。
 
 ```text
-Kiro Custom Agent（计划）
+Kiro Custom Agent（本地已实现）
   目标理解、白名单工具选择、证据充分性检查、报告总结
                          │ 只接收聚合结果
-Local MCP / CLI（MCP 为计划；CLI 核心命令已实现）
+Local MCP / CLI（本地 stdio MCP 与 CLI 已实现）
   inspect / discover / validate / monitor / diagnose / report
                          │
 确定性 Risk Engine（当前核心引擎已实现）
@@ -29,9 +29,9 @@ Local MCP / CLI（MCP 为计划；CLI 核心命令已实现）
 
 公开仓库与公司环境必须隔离：不得提交公司数据、真实字段名、真实配置、规则阈值、运行结果、密钥、原始日志、样本行或实际公司路径。Kiro 上下文也不应挂载数据目录。公开项目只能使用公开数据与合成数据，且不得把公司实验的效果、覆盖机构数或提效比例写成公开结论。
 
-面向 MCP 的白名单注册表属于 **Task 5 计划设计**：工具只接受已登记 `dataset_id`，不接受任意文件路径、SQL、Python 代码或用户级筛选；允许的 ID 正则为 `^[a-z][a-z0-9_-]{2,63}$`，配置只在服务启动时加载，调用参数不能覆盖数据路径。当前核心 `ProjectConfig` 已将 `dataset.id` 作为字符串配置，注册表及该正则门控尚未接入，因而不能把 MCP 级路径隔离说成已经完成。
+面向 MCP 的白名单注册表已实现：工具只接受已登记 `dataset_id`，不接受任意文件路径、SQL、Python 代码或用户级筛选；允许的 ID 正则为 `^[a-z][a-z0-9_-]{2,63}$`，配置只在服务启动时加载，调用参数不能覆盖数据路径。`DatasetRegistry` 在服务启动时加载并执行白名单、路径和配置门控，MCP 调用不能借此传递数据文件路径。
 
-计划中的安全输出契约还会递归拒绝实体标识、样本行、原始数据或文件路径类字段，并抑制样本量小于最小分组阈值的分组。任何工具返回均只能包含稳定脱敏编码和聚合指标，不能包含实体 ID、原始样本、未脱敏字段、真实路径或低样本量分组。
+安全输出契约已实现并作为所有 MCP 工具的返回前门控：递归拒绝实体标识、样本行、原始数据或文件路径类字段，抑制样本量小于最小分组阈值的分组；工具返回只包含稳定脱敏编码和聚合指标，不包含实体 ID、原始样本、未脱敏字段、真实路径或低样本量分组。
 
 ## 3. 配置、角色列和元数据等级
 
@@ -55,7 +55,7 @@ Local MCP / CLI（MCP 为计划；CLI 核心命令已实现）
 | C | 疑似标签穿越或样本构造异常 | 仅允许数据诊断，不输出规则结论 |
 | D | 数据契约不通过 | 停止分析 |
 
-当前 `ProjectConfig.metadata_grade` 会在已知 `performance_window_days` 时给出 A，否则给出 B；当前代码路径尚未产生 C/D。设计的 Agent/MCP 状态机规定低于 B 必须阻断稳定规则结论，C/D 的完整阻断属于后续编排与门控要求。
+当前 `ProjectConfig.metadata_grade` 会在已知 `performance_window_days` 时给出 A，否则给出 B；已实现的 Agent/MCP 编排在低于 B 时阻断稳定规则结论，并对 C/D 元数据状态执行完整阻断。B 级结果会保留标签成熟度限制，不得称为严格 OOT、无时间穿越或可直接上线。
 
 ## 4. 从 inspect 到分区：当前核心流程
 
@@ -133,12 +133,9 @@ B 级数据会在证据卡和运行限制中写入“标签表现窗口未知”
 
 数值特征以 **0%、25%、50%、75%、100%** 分位点建固定分箱，重复边界会去重；常量特征形成一个计数桶。`snapshot_id` 是对以下规范化、键排序、紧凑 JSON 的 **完整 SHA-256**：`dataset_id`、行数、正类率、经抑制的分层计数、特征聚合、规则聚合与固定创建时间。因此它可复现且不依赖样本行。
 
-## 8. 监控检测器：已有实现，但未完成审查闭环（Task 2）
+## 8. 监控检测器：Task 2 已实现并完成统一审查修复
 
-Task 2 的 `detect_anomalies` 已实现固定的聚合检测器，但**尚未完成审查闭环，不能称为监控功能完成**。现有两项 Important 问题必须明确保留：
-
-1. **新增分层未告警**：当前总体分层占比检查只遍历参考快照已有的分层，因此新出现的分层不会触发告警；
-2. **自定义 target 列识别不可靠**：标签列优先猜测 `target`、`label`、`outcome`，否则从非特征数值二值列猜测，不能可靠识别任意自定义的 `columns.target`。
+Task 2 的 `detect_anomalies` 已实现固定的聚合检测器，并已修复统一审查发现的角色列、分层并集和最小样本边界问题。检测器使用 `ReferenceSnapshot` 保存的真实 `target_column`、`segment_column` 与 `min_group_size`，不再猜测自定义角色列；缺失 target/segment 会产生 critical Schema 告警，新增或消失且达到最小样本量的分层会参与 population 告警，低样本分组仍被抑制。
 
 现有检测规则和固定阈值如下。`ReferenceSnapshot` 当前没有时间戳、月份或时间桶字段，因此监控 detect/diagnose 只在 dataset、segment、feature、family、rule 维度闭合；规则验证阶段独立的时间分区/月度验证不能被表述为监控时间漂移或月度根因结论。
 
@@ -160,13 +157,13 @@ PSI = Σ_i (p_current,i - p_reference,i)
 
 其中参考与当前桶概率均下限截断为 `1e-6`，当前数据始终沿用参考快照的边界。两个及以上同一特征族的缺失率告警会额外生成族级告警；严重等级取其中最高等级。告警 ID 为 `SHA-256("alert_type|scope|scope_value|metric")` 的前 **12** 位，输出排序固定。
 
-## 9. Task 3–8：尚未实现的计划设计
+## 9. Plan 2 Task 3–8：已实现的本地监控、诊断、安全工具与 Agent 编排
 
-以下内容是已写入实施计划的接口与数值，均不是当前已完成能力。
+以下能力已在本地实现并通过统一审查后的全量测试；所有能力仍保持本地-only，不提供网络服务、不上传数据、不使用 SQL 或外部模型 API。由于当前 `ReferenceSnapshot` 不保存时间/月度聚合字段，监控诊断闭合在 dataset、segment、feature、family、rule 维度；时间/月度监控不是当前已交付能力。
 
-### Task 3：六类有真值漂移注入与评分
+### Task 3：六类有真值漂移注入与评分（已实现）
 
-计划接口为 `inject_drift(frame, scenario, seed) -> InjectedDrift` 与 `evaluate_alerts(alerts, truth, top_k=3) -> DetectionScore`。六类漂移严格限定为：
+已实现接口为 `inject_drift(frame, scenario, seed) -> InjectedDrift` 与 `evaluate_alerts(alerts, truth, top_k=3, diagnoses=()) -> DetectionScore`。六类漂移严格限定为：
 
 1. `missingness`：在目标切片按 `magnitude` 置空；
 2. `numeric_shift`：数值增加 `magnitude × reference_std`；
@@ -175,25 +172,25 @@ PSI = Σ_i (p_current,i - p_reference,i)
 5. `schema`：删除目标列；
 6. `rule_decay`：对命中目标规则的正类按 `magnitude` 将 `1→0` 翻转。
 
-注入返回新 DataFrame，原始 DataFrame 不变；同一 seed 必须可复现，并随结果写出机器可读真值。检测评分以 `(alert_type, scope_value)` 匹配真值，输出 precision、recall、false positive rate 与根因 Top-**3** 命中率。
+注入返回新 DataFrame，原始 DataFrame 不变；同一 seed 必须可复现，并随结果写出机器可读真值。检测评分以 `(alert_type, scope_value)` 匹配真值，输出 precision、recall、`false_positive_rate`（存在 TN 时）或 `None`（无 TN 时）、`false_discovery_rate` 与根因 Top-**3** 命中率。
 
-### Task 4：根因贡献排序
+### Task 4：根因贡献排序（已实现）
 
-计划接口为 `diagnose_alerts(alerts, reference, current_frame, catalog, top_k)`。对特征缺失率或 PSI 告警，按分层计算：
+已实现接口为 `diagnose_alerts(alerts, reference, current_frame, catalog, top_k)`。对特征缺失率或 PSI 告警，按分层计算：
 
 ```text
 contribution = abs(current_metric - reference_metric) × current_share
 ```
 
-诊断会显式保留 feature 根因，并将同族特征贡献聚合为 family 根因；segment/family/feature 的比较维度与漂移真值保持一致。当前参考快照没有时间/月度字段，因此不伪造月份根因；若未来实现时间诊断，必须先在模型中加入明确时间聚合字段和定义。
+诊断会显式保留 feature 根因，并将同族特征贡献聚合为 family 根因；segment/family/feature/target/rule/schema 的比较维度与漂移真值保持一致。当前参考快照没有时间/月度字段，因此不伪造月份根因；若未来实现时间诊断，必须先在模型中加入明确时间聚合字段和定义。
 
-### Task 5：注册表与安全输出门控
+### Task 5：注册表与安全输出门控（已实现）
 
-计划创建 `DatasetRegistry.from_yaml()` 与 `get_config(dataset_id)`，由白名单将 dataset ID 映射到服务启动时加载的本地配置。`assert_safe_payload` 递归检查禁用字段；`suppress_small_groups(records, count_key, min_group_size)` 删除样本量不足的分组。示例测试使用 `min_group_size=100`，计数 `99` 被删除、`101` 保留。
+已实现 `DatasetRegistry.from_yaml()`、`get_config(dataset_id)`、`assert_safe_payload` 与 `suppress_small_groups`。注册表由服务启动时加载，只接受白名单 dataset ID；MCP 返回前对字符串值统一生成稳定 opaque token，递归拒绝路径/实体/样本字段，小样本分组按 `min_group_size` 抑制。
 
-### Task 6：本地 MCP 六工具
+### Task 6：本地 MCP 六工具（已实现）
 
-计划的 FastMCP 服务只暴露以下六个同名工具：
+本地 stdio FastMCP 服务暴露以下六个同名工具：
 
 ```text
 inspect_dataset(dataset_id)
@@ -204,15 +201,15 @@ diagnose_anomaly(alert_ids)
 build_report(run_id, report_type)
 ```
 
-每个工具先经注册表解析，再返回固定 Pydantic JSON 并调用安全输出检查。`discover_rules` 仅返回规则 ID、脱敏表达式、来源和聚合 Train 指标；`build_report` 返回逻辑报告 ID 与 Markdown 内容，不返回真实磁盘路径。注册表位置仅可由 `RISKPROBE_REGISTRY` 指向注册表文件，不能借此传递数据文件路径。
+每个工具先经注册表解析和状态机门控，再返回固定安全 JSON 并调用值级隐私检查；执行顺序由 `inspect → discover → validate → detect → diagnose → report` 约束，非法跳步、C/D 元数据和缺少前置运行状态均 fail-closed。`discover_rules` 仅接受 `objective="risk"` 且当前不支持非空 constraints；`validate_rules` 当前不支持非空 split_config，均采用 fail-closed。`build_report` 返回逻辑报告 ID 与聚合报告状态，不返回真实磁盘路径。注册表位置仅可由 `RISKPROBE_REGISTRY` 指向注册表文件，不能借此传递数据文件路径。
 
-### Task 7：Kiro Agent 最小权限
+### Task 7：Kiro Agent 最小权限（已实现）
 
-计划中的 workspace Agent 名为 `riskprobe`，只暴露 `@riskprobe`，允许 `mcp` 的 `riskprobe/*`；明确 deny `shell`、`fs_read`、`fs_write`、`web_fetch`、`web_search` 五类内置能力。SOP 为：先 inspect；C/D 停止；规则先 discover 后 validate；异常先 detect 后 diagnose；同一失败最多重试 **1** 次；B 级禁止声称严格 OOT、无穿越或可上线；报告必须列出证据与限制，且不得请求明细或真实路径。
+workspace Agent 名为 `riskprobe`，只暴露 `@riskprobe`，允许 `mcp` 的 `riskprobe/*`；明确 deny `shell`、`fs_read`、`fs_write`、`web_fetch`、`web_search` 五类内置能力。SOP 为：先 inspect；C/D 停止；规则先 discover 后 validate；异常先 detect 后 diagnose；同一失败最多重试 **1** 次；B 级禁止声称严格 OOT、无穿越或可上线；报告必须列出证据与限制，且不得请求明细或真实路径。
 
-### Task 8：监控 CLI 与端到端评估
+### Task 8：监控 CLI 与端到端评估（已实现）
 
-计划新增三条命令：
+已实现三条命令：
 
 ```bash
 riskprobe snapshot --config PATH --runs-dir PATH
@@ -220,15 +217,15 @@ riskprobe monitor --reference-run-id ID --current-config PATH --runs-dir PATH
 riskprobe evaluate-drift --config PATH --runs-dir PATH --seed INTEGER
 ```
 
-`evaluate-drift` 会逐一执行六种注入、检测与诊断，输出四项总体评分（precision、recall、false positive rate、Top-3 hit rate），并写入 `anomaly_alerts.json`、`diagnoses.json`、`drift_evaluation.json`。这些命令、根因模块、注册表、MCP 和 Agent 配置目前均不能作为已实现接口使用。
+`evaluate-drift` 会逐场景执行六种注入、检测与诊断，输出总体和分场景 Precision、Recall、FDR 及根因 Top-3 命中率；由于没有 TN，`false_positive_rate` 明确为 `null`。它写入 `anomaly_alerts.json`、`diagnoses.json`、`drift_evaluation.json`，且输出目录要求为仓库外 owner-private 路径。
 
 ## 9.1 Plan 3：数据适配、公开/公司运行与简历证据闭环（代码已实现；真实公司运行未执行）
 
-Plan 3 已实现公开多表信用数据和公司本地脱敏 Parquet 宽表到 Plan 1 统一契约的代码、CLI、虚构示例配置及运行手册；新增模块的基础测试已通过。真实公司 Parquet、真实本地配置、人工基线、运行产物与量化简历证据均**未执行且不得视为已交付结果**。Plan 1 完成是数据适配前提；若需展示 MCP/Kiro Agent 或以白名单工具辅助公司任务，还必须先完成并审查通过 Plan 2。全流程只使用本地 Polars/Python/Parquet，明确不使用 SQL、Spark SQL、数据仓库连接、外部模型 API、数据拉取或文件覆盖。
+Plan 3 已实现公开多表信用数据和公司本地脱敏 Parquet 宽表到 Plan 1 统一契约的代码、CLI、虚构示例配置及运行手册；新增模块的基础测试已通过。真实公司 Parquet、真实本地配置、人工基线、运行产物与量化简历证据均**未执行且不得视为已交付结果**。Plan 1 完成是数据适配前提；Plan 2 的注册表、输出门控、MCP 与 Kiro Agent 已完成并通过统一审查，可用于合成漂移和受限本地编排验证。
 
 ### 9.1.1 公开 Home Credit：本地多表聚合为统一行为宽表
 
-计划模块和接口为：
+实现模块和接口为：
 
 ```python
 HomeCreditPaths.from_directory(path) -> HomeCreditPaths
@@ -237,7 +234,7 @@ prepare_home_credit(paths, output_path, seed=42) -> HomeCreditPreparationResult
 
 输入目录必须存在 `application_train.csv`，并至少存在一张历史表：`previous_application.csv`、`installments_payments.csv`、`POS_CASH_balance.csv`、`credit_card_balance.csv`、`bureau.csv`。适配器不得读取 `application_test.csv`、结果型预测文件或未白名单字段；使用 Polars `LazyFrame` 进行列裁剪并按 `SK_ID_CURR` 本地聚合。输出满足 Plan 1 契约，列顺序起始为 `entity_id`、`target`、`customer_segment`，追加行为特征和固定 `snapshot_date="public_relative_reference"`；不保留原始 `TARGET` 名称及未白名单列。
 
-| 历史源 | 计划列白名单 | 相对历史窗口与计划聚合 |
+| 历史源 | 列白名单 | 相对历史窗口与聚合 |
 |---|---|---|
 | previous application | `SK_ID_CURR`、`DAYS_DECISION`、`AMT_APPLICATION`、`AMT_CREDIT`、`NAME_CONTRACT_STATUS` | 近 **30/90/365 天**申请次数、申请/授信金额、拒绝率 |
 | installments | `SK_ID_CURR`、`DAYS_INSTALMENT`、`DAYS_ENTRY_PAYMENT`、`AMT_INSTALMENT`、`AMT_PAYMENT` | 近 **30/90/365 天**记录数、逾期天数均值、少还比例 |
@@ -265,7 +262,7 @@ segment_display_name: customer_segment
 time_validation_enabled: false
 ```
 
-计划 CLI 是：
+CLI 是：
 
 ```bash
 riskprobe prepare-home-credit --input-dir PATH --output PATH
@@ -275,7 +272,7 @@ riskprobe prepare-home-credit --input-dir PATH --output PATH
 
 ### 9.1.2 公司 Parquet：只读预检与 64 列特征批次
 
-计划接口为：
+实现接口为：
 
 ```python
 preflight_company_dataset(config) -> CompanyPreflight
@@ -288,7 +285,7 @@ plan_feature_batches(schema, catalog, batch_size=64) -> tuple[FeatureBatch, ...]
 
 仓库只提供虚构示例：`anonymous_id`、`cutoff_date`、`org_code`、`bad_label`，以及 `ord_x_`、`brw_x_`、`multi_x_`、`emb_x_` 特征前缀。真实配置固定为被忽略的 `configs/company.local.yaml`，报告的分层显示名固定为 `institution`。`cutoff_date` 是客户特征截止日，不是申请日或坏账日；表现窗口未知时仍为 B 级，不能称为严格 OOT。
 
-计划 CLI：
+CLI：
 
 ```bash
 riskprobe preflight-company --config configs/company.local.yaml
@@ -298,7 +295,7 @@ riskprobe preflight-company --config configs/company.local.yaml
 
 ### 9.1.3 基准记录：实测计时、原始计数和可追溯性
 
-计划模块 `benchmarking.py` 以 `time.perf_counter` 记录 `inspect`、`discover`、`validate`、`monitor`、`report` 阶段。每个 `BenchmarkRecord` 至少保存：run/task/dataset ID、测量时间、代码版本、配置哈希、数据指纹、人工分钟、Agent 分钟、阶段耗时、候选规则数、证据通过数、人工复核/接受数、异常 TP/FP/FN、根因 Top-3 命中数和根因案例数。所有计数和分钟必须非负，接受数不超过复核数。
+已实现模块 `benchmarking.py` 以 `time.perf_counter` 记录 `inspect`、`discover`、`validate`、`monitor`、`report` 阶段。每个 `BenchmarkRecord` 至少保存：run/task/dataset ID、测量时间、代码版本、配置哈希、数据指纹、人工分钟、Agent 分钟、阶段耗时、候选规则数、证据通过数、人工复核/接受数、异常 TP/FP/FN、根因 Top-3 命中数和根因案例数。所有计数和分钟必须非负，接受数不超过复核数。
 
 关键指标必须由原始计数推导，而非人工填写舍入比例：
 
@@ -320,13 +317,13 @@ riskprobe benchmark --config PATH --runs-dir PATH --baseline-record PATH
 
 ### 9.1.4 简历证据：三次真实任务是量化表述的最小门槛
 
-计划 `resume_evidence.py` 只聚合本地 `BenchmarkRecord`。生成量化公司经历前，必须有至少 **3** 个不同 `task_id` 的完整任务，每条均含人工基线、Agent 耗时和原始计数；不足三次或字段缺失即失败，不得使用默认值、示例数字、估算或编造。总提效为总分钟加权而不是简单平均：
+已实现模块 `resume_evidence.py` 只聚合本地 `BenchmarkRecord`。生成量化公司经历前，必须有至少 **3** 个不同 `task_id` 的完整任务，每条均含人工基线、Agent 耗时和原始计数；不足三次或字段缺失即失败，不得使用默认值、示例数字、估算或编造。总提效为总分钟加权而不是简单平均：
 
 ```text
 efficiency_rate = (Σ manual_minutes - Σ agent_minutes) / Σ manual_minutes
 ```
 
-规则接受率与异常/根因指标按跨任务原始分子分母汇总。`ResumeEvidence` 必须保留来源 `run_id` 列表；简历只可引用其中存在且可追溯的数字，缺一项就省略该句。计划 CLI：
+规则接受率与异常/根因指标按跨任务原始分子分母汇总。`ResumeEvidence` 必须保留来源 `run_id` 列表；简历只可引用其中存在且可追溯的数字，缺一项就省略该句。CLI：
 
 ```bash
 riskprobe resume-evidence --records-dir PATH --output reports/internal/resume_evidence.md
@@ -376,7 +373,7 @@ riskprobe benchmark --config configs/company.local.yaml --runs-dir runs --baseli
 riskprobe resume-evidence --records-dir runs --output reports/internal/resume_evidence.md
 ```
 
-当前完整运行有六项产物：
+当前基础 `run` 运行有六项核心产物：
 
 ```text
 runs/<run_id>/
@@ -388,7 +385,7 @@ runs/<run_id>/
 └── risk_report.md
 ```
 
-`manifest.json` 记录数据指纹、配置指纹、代码版本、数据集 ID、时间验证开关、产物列表与完整性哈希。相同数据、配置和代码版本会命中同一运行 ID 并复用已有运行；规则排序、Bootstrap 种子和分层随机划分也固定。设计文档中的 `anomaly_alerts.json` 是监控全链路目标产物，当前六项核心运行产物尚不包含它。
+`manifest.json` 记录数据指纹、配置指纹、代码版本、数据集 ID、时间验证开关、产物列表与完整性哈希。相同数据、配置和代码版本会命中同一运行 ID 并复用已有运行；规则排序、Bootstrap 种子和分层随机划分也固定。基础 `run` 运行保留上述六项核心产物；监控与 `evaluate-drift` 运行另外写入 `anomaly_alerts.json`、`diagnoses.json` 和 `drift_evaluation.json`。
 
 CLI 对参数错误输出结构化 JSON（`argument_error`）；配置读取失败为 `configuration_error`；运行目录不可写为 `runs_directory_error`；数据检查、发现或完整运行失败分别输出 `inspection_error`、`discovery_error`、`run_error`。底层还会在缺少角色列、单标签切片、命中支持度不足、无正类、常量/全空特征、无效日期或不可用 Holdout 时停止、跳过相应指标或写入限制。发生异常时，未完成运行目录会清理；报告渲染失败时，设计目标是保留结构化中间产物以便重建。
 
@@ -409,10 +406,11 @@ CLI 对参数错误输出结构化 JSON（`argument_error`）；配置读取失�
 |---|---|---|
 | Plan 1：本地确定性核心引擎 | **完成** | 已完成数据契约、inspect、特征目录、规则发现/验证、六项不可变运行产物和本地 CLI |
 | Plan 2 Task 1：监控模型与参考快照 | **完成且审查通过** | 已具备不含实体明细、可确定性复现、包含特征/分层/规则聚合指标的参考快照 |
-| Plan 2 Task 2：检测器 | **有实现，但有两项 Important 待修复** | 已有 Schema/缺失率/PSI/标签率/分层占比/规则衰减检测；新增分层未告警、自定义 target 识别不可靠，尚未审查闭环 |
-| Plan 2 Task 3–8 | **仅计划** | 漂移注入评分、根因、注册表/门控、MCP、Kiro 权限与监控 CLI 均不得称为完成 |
+| Plan 2 Task 2：Schema、缺失、PSI、标签、分层与规则衰减检测 | **完成且审查修复通过** | 已实现角色元数据驱动的 Schema/缺失率/PSI/标签率/分层占比/规则 Lift 衰减检测；支持新增/消失分层与最小样本抑制 |
+| Plan 2 Task 3–4：漂移注入、评分与根因 | **完成且审查修复通过** | 已实现六类可复现真值注入、逐场景评分、FDR/FPR 边界和确定性根因排序；当前不提供月份根因 |
+| Plan 2 Task 5–8：注册表、隐私门控、MCP、Kiro Agent 与 CLI | **完成且审查修复通过** | 已实现本地白名单、值级 token 脱敏、MCP 六工具、最小权限 Kiro 配置和监控 CLI；仅本地 stdio，不提供网络服务 |
 | Plan 3：公开/公司数据适配与证据 | **通用代码、CLI、虚构示例与运行手册已实现；真实公司执行待完成** | 已可在本地准备用户自行下载的 Home Credit CSV、预检只读公司 Parquet、规划 64 列批次、记录本地基准并仅从完整记录生成内部草稿；尚无真实公司 Parquet、人工基线、三次真实任务或量化提效，故不得称为公司闭环或业务结果已交付 |
-| Kiro/MCP Agent | **仅计划** | 当前只有受限 Agent 架构与最小权限 SOP，尚无可用 MCP 服务或 `@riskprobe` Agent |
+| Kiro/MCP Agent | **本地实现** | 已提供本地 stdio MCP、`@riskprobe` Agent、权限 deny 规则与状态 SOP；不连接外部服务 |
 | 公开 UCI 基准 | **已运行** | 仅按第 11 节的已核验事实介绍：Top 规则为 Stable、数据为 B 级，且不是严格 OOT 或线上收益 |
 
 面试或项目介绍应优先说明“确定性引擎输出证据，Agent 只做受限编排和解释”的架构取舍，并在每个效果数字旁保留数据划分、元数据等级、表现窗口与人工复核边界。

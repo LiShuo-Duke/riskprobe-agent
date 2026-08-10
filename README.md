@@ -1,21 +1,62 @@
 # RiskProbe Agent
 
-RiskProbe 是一个本地只读的风控规则发现、证据验证、机构稳定性分析和漂移监控工具。它提供 Python 包、CLI 和标准 stdio MCP 服务，可被 Kiro、Codex、Trae 及其他 MCP 客户端使用。
+**Privacy-safe local risk intelligence for explainable rules, PSI drift monitoring, institution stability analysis, and MCP/CLI workflows.**
 
-## 核心能力
+RiskProbe is a local-first Python toolkit for credit-risk and model-monitoring workflows. It turns a confirmed local Parquet dataset into auditable aggregate evidence without uploading data or exposing entity-level records.
 
-- 在 Train 数据中发现可解释风险规则；
-- 在 Test/Holdout/时间切片中验证 Lift、覆盖率、置信区间和稳定性；
-- 先做全局规则，再做机构级稳定性和条件式局部发现；
-- 检测 Schema、缺失率、分布、分层占比、标签率和规则衰减告警；
-- 输出聚合报告，不读取或输出实体明细和样本行；
-- 默认在受限聚合字段展示已确认的真实机构名，显式关闭时使用稳定 token。
+> **Status:** `v0.1.0` initial public release. The project is local-only: GitHub distributes code and examples, not user data.
 
-RiskProbe 不上传 Parquet，不连接远程数据库，不执行任意 Shell，不访问网络，也不自动上线风控策略。
+## Why RiskProbe?
 
-## 安装
+Risk and model-monitoring workflows often need more than a model score: analysts need to know which rules are reproducible, whether performance is stable across institutions, whether drift is global or localized, and what evidence is safe to share with an Agent. RiskProbe keeps the deterministic calculations in Python and uses Kiro, Codex, Trae, or another MCP client only as a controlled orchestration layer.
 
-需要 Python 3.11 或更高版本。macOS/Linux：
+## Features
+
+- **Explainable rule discovery:** quantile and shallow-tree thresholds, LightGBM-assisted candidate generation, deterministic one-condition and two-condition rule search, stable rule IDs.
+- **Statistical validation:** Train/Test and optional time-slice validation with support, coverage, bad rate, Lift, precision, recall, Fisher p-values, BH/FDR adjustment, bootstrap Lift confidence intervals, segment consistency, and Lift decay.
+- **Institution stability:** global-first discovery, institution-level metrics, `Stable`/`Local`/`Unstable`/`Suspicious` grading, and conditional local-rule discovery for sufficiently supported institutions.
+- **Aggregate drift monitoring:** schema changes, missingness, PSI distribution drift, population-share changes, label-rate changes, and rule-Lift decay.
+- **Root-cause diagnosis:** aggregate feature, family, segment, label, rule, and schema dimensions with deterministic contribution ranking and TOP3 explanations.
+- **Read-only Parquet onboarding:** schema preview, explicit role confirmation, exact feature-list confirmation, allowlisted local registration, and no automatic role guessing.
+- **Cross-client Agent access:** standard stdio MCP for Kiro, Codex, Trae, and other MCP clients, plus CLI and reusable `AGENTS.md`/system-prompt instructions.
+- **Privacy controls:** aggregate-only outputs, stable tokens, suppressed small groups, default real institution names in restricted fields, and opt-out masking with `privacy.expose_segment_values=false`.
+
+### What is not currently implemented
+
+The public `v0.1.0` release does **not** claim ADASYN/SMOTE oversampling, KS testing, online serving, database connectors, remote data uploads, or automatic policy deployment. These are possible future directions, not current capabilities.
+
+## Architecture
+
+```text
+Local Parquet / DataFrame
+          │ read-only + allowlist
+          ▼
+Deterministic Risk Engine
+  profiling → discovery → validation → monitoring → diagnosis
+          │ aggregate JSON only
+          ▼
+CLI / stdio MCP
+          │
+Kiro Agent · Codex · Trae · other MCP clients
+```
+
+The core engine is client-independent. Kiro configuration provides the most integrated Agent experience; other MCP-capable clients use the same tools with their own configuration and project instructions.
+
+## Tech stack
+
+- Python 3.11+
+- Polars and PyArrow for local columnar data
+- Pydantic for typed configuration and contracts
+- LightGBM, scikit-learn, SciPy, and statsmodels for deterministic discovery and statistics
+- Typer for CLI
+- FastMCP for local stdio tool integration
+- PyYAML for project configuration
+
+## Quick start
+
+### 1. Install
+
+macOS/Linux:
 
 ```bash
 git clone https://github.com/LiShuo-Duke/riskprobe-agent.git
@@ -24,7 +65,7 @@ python3 -m venv .venv
 ./.venv/bin/python -m pip install -e .
 ```
 
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
 git clone https://github.com/LiShuo-Duke/riskprobe-agent.git
@@ -33,72 +74,66 @@ py -3 -m venv .venv
 .venv\Scripts\python.exe -m pip install -e .
 ```
 
-开发依赖：
+For development and tests:
 
 ```bash
 ./.venv/bin/python -m pip install -e '.[dev]'
 ```
 
-## 本地数据目录
+### 2. Run the public synthetic example
 
-RiskProbe 只访问用户明确配置的本地 allowlist 目录。macOS/Linux 示例：
+The example is deterministic and does not require private data:
+
+```bash
+mkdir -p data/synthetic
+./.venv/bin/riskprobe synthetic \
+  --output data/synthetic/behavior.parquet \
+  --rows 5000 \
+  --seed 42
+./.venv/bin/riskprobe inspect \
+  --config configs/synthetic.example.yaml \
+  --runs-dir runs
+./.venv/bin/riskprobe run \
+  --config configs/synthetic.example.yaml \
+  --runs-dir runs
+```
+
+Results are written to the local `runs/` directory, which is ignored by Git.
+
+### 3. Use a private local Parquet dataset
+
+Set an explicit allowlist before using the MCP server:
 
 ```bash
 mkdir -p "$HOME/riskprobe-data"
 export RISKPROBE_ALLOWED_DATA_ROOTS="$HOME/riskprobe-data"
 ```
 
-将 Parquet 放入该目录。不要把真实数据、个人配置、运行产物或密钥提交到 GitHub。
+Place the Parquet file inside that directory. RiskProbe does not upload it, modify it, or return entity-level rows.
 
-配置文件中的：
+## MCP and Agent clients
 
-```yaml
-privacy:
-  expose_segment_values: false
-```
-
-可以关闭受限报告中的真实机构名展示；默认值为 `true`。实体值、样本行、原始日志、真实路径和 Parquet 明细读取边界不受影响。
-
-## CLI
-
-生成合成数据并运行本地分析：
-
-```bash
-./.venv/bin/riskprobe synthetic --output ./behavior.parquet --rows 5000 --seed 42
-./.venv/bin/riskprobe inspect --config ./configs/synthetic.example.yaml --runs-dir ./runs
-./.venv/bin/riskprobe run --config ./configs/synthetic.example.yaml --runs-dir ./runs
-```
-
-CLI 结果写入用户指定的本地目录；`runs/` 已被 Git 忽略。
-
-## MCP
-
-RiskProbe MCP 是本地 stdio 服务，不是 HTTP 服务。直接启动：
+RiskProbe exposes a local stdio MCP server, not an HTTP endpoint:
 
 ```bash
 ./.venv/bin/python -m riskprobe.mcp_server
 ```
 
-通用 MCP 配置模板：
+Configuration templates:
 
 ```text
-configs/mcp/mcp.example.json
+configs/mcp/mcp.example.json       # generic MCP JSON
+configs/mcp/codex.example.toml     # Codex project configuration
+configs/mcp/trae.example.json      # Trae/manual MCP configuration
 ```
 
-Codex 和 Trae 的配置示例：
-
-```text
-configs/mcp/codex.example.toml
-configs/mcp/trae.example.json
-```
-
-模板中的 `/ABSOLUTE/PATH/...` 必须替换为用户自己的项目路径和数据目录。MCP 的工作流是：
+Replace template paths with paths on the user’s machine. The standard workflow is:
 
 ```text
 inspect_local_parquet_schema
-→ 用户确认实体/时间/机构/目标
+→ confirm entity / time / institution / target roles
 → preview_local_parquet_features
-→ 用户确认精确特征列
+→ confirm exact feature columns
 → register_local_parquet
 → inspect_dataset
 → discover_rules(objective="risk")
@@ -108,39 +143,58 @@ inspect_local_parquet_schema
 → build_report
 ```
 
-`discover_rules` 不接受非空 `constraints`。没有时间列时只做随机 Train/Test 验证，不得声称严格 OOT。
+`discover_rules` must not receive non-empty `constraints`; discovery thresholds come from the registered project configuration. If there is no real time column, only random Train/Test validation is allowed and results must not be described as strict OOT.
 
-## 各客户端使用
+### Client matrix
 
-- **Kiro**：打开仓库并选择 `riskprobe` Agent；自动读取 `.kiro/agents`、`.kiro/skills` 和 `.kiro/settings/mcp.json`。
-- **Codex**：配置 `configs/mcp/codex.example.toml`，并使用仓库根目录的 `AGENTS.md`。
-- **Trae**：在 MCP 管理界面导入 `configs/mcp/trae.example.json`，再加载 `docs/agent-system-prompt.md`。
-- **其他 MCP 客户端**：配置同一个本地 stdio MCP 命令，并加载 `AGENTS.md` 或通用提示词。
-- **不支持 MCP 的客户端**：可以使用 Python 包和 CLI，但无法获得工具调用式 Agent 流程。
+| Client | Integration | Full RiskProbe core | Native RiskProbe Agent config |
+|---|---|---:|---:|
+| Kiro | `.kiro/agents`, `.kiro/skills`, workspace MCP | Yes | Yes |
+| Codex | MCP TOML + `AGENTS.md` | Yes | Uses Codex instructions |
+| Trae | Manual MCP JSON + system prompt | Yes | Uses Trae instructions |
+| Other MCP client | Local stdio MCP + project prompt | Yes | Client-dependent |
+| No MCP support | Python package and CLI | CLI only | No |
 
-完整说明见：
+See [`docs/cross-client-usage.md`](docs/cross-client-usage.md) and [`docs/agent-system-prompt.md`](docs/agent-system-prompt.md).
 
-- `docs/cross-client-usage.md`
-- `docs/agent-system-prompt.md`
-- `AGENTS.md`
-- `docs/riskprobe-agent-technical-guide.md`
+## Privacy and safety boundaries
 
-## 安全边界
+- Local Parquet access is read-only and restricted to `RISKPROBE_ALLOWED_DATA_ROOTS`.
+- Outputs are aggregate-only; entity values, sample rows, raw logs, real filesystem paths, and Parquet detail reads are not part of the Agent surface.
+- Shell, arbitrary SQL/Python, network access, and automatic policy deployment are not part of the workflow.
+- Institution names are shown by default only in restricted aggregate fields and can be masked with:
 
-这是本地分析工具，不是在线数据服务：
+```yaml
+privacy:
+  expose_segment_values: false
+```
 
-- GitHub 只分发代码和脱敏示例配置；
-- 数据只从用户配置的本地 allowlist 目录读取；
-- 源 Parquet 以只读方式使用，不会被修改；
-- 不请求实体明细、样本行、原始日志或真实路径；
-- 不执行 Shell、网络访问、任意 SQL/Python 或自动策略上线；
-- 机构级规则仅供稳定性验证和人工复核。
+- Institution-local rules remain validation evidence for human review; they are not automatically promoted to global rules or production policies.
+- Grade-B evidence has an unknown performance window and must not be described as strict OOT or production-ready.
 
-## 开发验证
+## Repository layout
+
+```text
+src/riskprobe/             deterministic engine, CLI, MCP server
+configs/                   public example configs and MCP templates
+.kiro/                     Kiro Agent, Skill, and workspace MCP config
+AGENTS.md                  client-independent project rules
+docs/                      cross-client instructions and technical guide
+tests/                     unit, integration, and security-boundary tests
+```
+
+## Roadmap
+
+- Add optional, explicitly configured class-imbalance strategies after evaluating leakage and reproducibility implications.
+- Add complementary statistical tests such as KS only when their data contract and interpretation are specified.
+- Improve packaging and client adapters while keeping one deterministic engine.
+- Consider remote deployment only after authentication, tenant isolation, audit, and data-governance requirements are designed.
+
+## Development
 
 ```bash
 ./.venv/bin/python -m pytest --disable-warnings --maxfail=1
 ./.venv/bin/ruff check src tests
 ```
 
-公开发布前还应检查 Git tracked 文件中没有真实数据、个人路径、密钥、虚拟环境或运行产物。
+Contributions should preserve the local-only boundary, deterministic seeds, explicit role confirmation, aggregate-only output, and no automatic policy deployment.

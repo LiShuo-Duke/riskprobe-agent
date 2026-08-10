@@ -15,6 +15,7 @@ from riskprobe.config import ProjectConfig
 from riskprobe.features.catalog import QualityIssue
 from riskprobe.models import Condition, EvidenceCard, RiskRule, RuleMetrics, SliceMetrics
 from riskprobe.profiling import DatasetProfile
+from riskprobe.privacy import stable_token
 from riskprobe.reporting import render_risk_report
 from riskprobe.service import RiskProbeService
 
@@ -25,6 +26,7 @@ def _small_config(
     rows: int = 200,
     time_validation_enabled: bool = False,
     metadata_grade: str = "B",
+    expose_segment_values: bool = False,
 ) -> ProjectConfig:
     snapshots: list[object]
     if time_validation_enabled:
@@ -62,6 +64,7 @@ def _small_config(
             "snapshot": {"meaning": "customer_specified_feature_cutoff"},
             "features": {"families": {"feature": ["feature_"]}},
             "time_validation_enabled": time_validation_enabled,
+            "privacy": {"expose_segment_values": expose_segment_values},
             "discovery": {
                 "min_support": 0.05,
                 "max_single_rules": 2,
@@ -205,6 +208,61 @@ def test_service_failure_removes_incomplete_run(
 
     assert [path for path in (tmp_path / "runs").iterdir() if path.is_dir()] == []
     assert list((tmp_path / "runs").glob("*.parquet")) == []
+
+
+def test_report_shows_real_institution_names_by_default_and_hides_when_disabled() -> None:
+    profile = DatasetProfile(
+        dataset_id="safe-dataset-id",
+        row_count=100,
+        feature_count=1,
+        positive_rate=0.2,
+        segment_counts={"institution-a": 100},
+        snapshot_min=None,
+        snapshot_max=None,
+        metadata_grade="A",
+        issues=(),
+    )
+    institution = "institution-a"
+    analysis = {
+        "eligible_institution_count": 1,
+        "triggered_institution_count": 1,
+        "blocked_institution_count": 0,
+        "interpretation": "机构内结果仅供复核。",
+        "institution_reports": [
+            {
+                "institution_token": stable_token(institution, namespace="institution"),
+                "institution_name": institution,
+                "status": "completed",
+                "train_row_count": 60,
+                "test_row_count": 40,
+                "rule_count": 1,
+                "reason": "—",
+            }
+        ],
+    }
+    card = _card(
+        slices=(
+            SliceMetrics(
+                slice_type="segment",
+                slice_value=institution,
+                metrics=_metrics(1.5),
+            ),
+        ),
+        limitations=("holdout: single-class institution: institution-a",),
+    )
+
+    exposed = render_risk_report(profile, [card], institution_analysis=analysis)
+    hidden = render_risk_report(
+        profile,
+        [card],
+        institution_analysis=analysis,
+        expose_segment_values=False,
+    )
+
+    assert institution in exposed
+    assert stable_token(institution, namespace="institution") in exposed
+    assert institution not in hidden
+    assert stable_token(institution, namespace="institution") in hidden
 
 
 def test_disabled_time_split_is_stratified_projected_and_read_only(
@@ -550,6 +608,30 @@ def test_run_analyzes_same_snapshot_used_for_fingerprint_after_atomic_replacemen
     assert profile["row_count"] == 200
     assert pl.read_parquet(config.dataset.path).height == 80
     assert list((tmp_path / "runs").glob("*.parquet")) == []
+
+
+def test_monitoring_snapshot_rejects_source_changed_after_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=200)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+    replacement = tmp_path / "replacement.parquet"
+    pl.read_parquet(config.dataset.path).head(80).write_parquet(replacement)
+    real_run = service.run
+
+    def run_then_replace_source() -> object:
+        context = real_run()
+        replacement.replace(config.dataset.path)
+        return context
+
+    monkeypatch.setattr(service, "run", run_then_replace_source)
+
+    with pytest.raises(ValueError) as error:
+        service.monitoring_snapshot()
+
+    assert str(error.value) == "monitoring reference snapshot does not match run data"
+    assert str(config.dataset.path) not in str(error.value)
+    assert not (tmp_path / "runs" / "monitoring").exists()
 
 
 def test_empty_holdout_downgrades_each_card_and_reports_limitation(
@@ -1038,3 +1120,65 @@ def test_below_b_metadata_grade_blocks_rule_discovery(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="below B"):
         service.discover()
+
+
+def test_service_discover_with_metrics_is_deterministic_and_aggregate_only(tmp_path: Path) -> None:
+    config = _small_config(tmp_path, rows=400)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    first = service.discover_with_metrics()
+    second = service.discover_with_metrics()
+
+    assert first == second
+    assert all(isinstance(rule, RiskRule) for rule in first.rules)
+    assert str(tmp_path) not in str(first)
+    assert "private-" not in str(first)
+
+
+
+def test_random_split_preserves_institution_target_combinations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=200, time_validation_enabled=False)
+    captured: dict[str, pl.DataFrame] = {}
+
+    def fake_discover(train: pl.DataFrame, *args: object, **kwargs: object) -> list[RiskRule]:
+        captured["train"] = train
+        return [_rule()]
+
+    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    def fake_validate(
+        train: pl.DataFrame, test: pl.DataFrame, *args: object, **kwargs: object
+    ) -> list[EvidenceCard]:
+        captured["train"] = train
+        captured["test"] = test
+        return [_card()]
+
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+
+    RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    train = captured["train"]
+    counts = train.group_by(["institution", "target"]).len().sort(["institution", "target"])
+    assert counts["len"].to_list() == [35, 35, 35, 35]
+    test_counts = captured["test"].group_by(["institution", "target"]).len()
+    assert test_counts["len"].min() >= 1
+
+
+def test_sparse_institution_target_combination_reports_split_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=100, time_validation_enabled=False)
+    frame = pl.read_parquet(config.dataset.path).with_columns(
+        pl.when(pl.int_range(0, pl.len()) == 0)
+        .then(pl.lit("rare"))
+        .otherwise(pl.lit("A"))
+        .alias("institution")
+    )
+    frame.write_parquet(config.dataset.path)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+    metadata = json.loads((result.run_dir / "metadata_report.json").read_text())
+
+    assert any("institution" in limitation.lower() and "fell back" in limitation.lower() for limitation in metadata["limitations"])

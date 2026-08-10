@@ -56,7 +56,7 @@ dist/
 .worktrees/
 .superpowers/
 
-# IDE and operating system
-.DS_Store
-.vscode/
-.idea/
+# Local MCP overrides
+configs/mcp/*.local.json
+configs/mcp/*.local.toml
+.kiro/settings/mcp.local.json

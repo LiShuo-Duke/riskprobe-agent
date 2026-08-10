@@ -4,10 +4,35 @@ from pathlib import Path
 import polars as pl
 from typer.testing import CliRunner
 
-from riskprobe.cli import app
+from riskprobe.cli import _safe_alert_payload, app
+from riskprobe.monitoring.models import Alert
+from riskprobe.privacy import stable_token
 
 
 runner = CliRunner()
+
+
+def test_cli_monitoring_projection_respects_segment_name_authorization() -> None:
+    alert = Alert(
+        alert_id="alert-a",
+        alert_type="population",
+        severity="warning",
+        scope="institution",
+        scope_value="bank_north",
+        metric="share",
+        reference_value=0.2,
+        current_value=0.4,
+        delta=0.2,
+        evidence={},
+    )
+
+    hidden = _safe_alert_payload(alert, expose_segment_values=False)
+    exposed = _safe_alert_payload(alert, expose_segment_values=True)
+
+    assert hidden["scope_value"] == stable_token("bank_north")
+    assert "bank_north" not in str(hidden)
+    assert exposed["scope_value"] == stable_token("bank_north")
+    assert exposed["institution_name"] == "bank_north"
 
 
 def _write_config(path: Path, data_path: Path) -> None:

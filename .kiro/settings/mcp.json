@@ -2,7 +2,11 @@
   "mcpServers": {
     "riskprobe": {
       "command": ".venv/bin/python",
-      "args": ["-m", "riskprobe.mcp_server"]
+      "args": ["-m", "riskprobe.mcp_server"],
+      "env": {
+        "RISKPROBE_REGISTRY": "configs/datasets.example.yaml",
+        "RISKPROBE_ALLOWED_DATA_ROOTS": "${RISKPROBE_ALLOWED_DATA_ROOTS}"
+      }
     }
   }
 }

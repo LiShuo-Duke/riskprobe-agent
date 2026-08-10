@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "riskprobe": {
+      "command": "/ABSOLUTE/PATH/TO/riskprobe-agent/.venv/bin/python",
+      "args": ["-m", "riskprobe.mcp_server"],
+      "env": {
+        "RISKPROBE_REGISTRY": "/ABSOLUTE/PATH/TO/riskprobe-agent/configs/datasets.example.yaml",
+        "RISKPROBE_ALLOWED_DATA_ROOTS": "/ABSOLUTE/PATH/TO/APPROVED/DATA"
+      }
+    }
+  }
+}

@@ -21,6 +21,7 @@ from riskprobe.monitoring.detection import detect_anomalies
 from riskprobe.monitoring.diagnosis import diagnose_alerts
 from riskprobe.monitoring.injection import DetectionScore, DriftScenario, evaluate_alerts, inject_drift
 from riskprobe.monitoring.reference import build_reference_snapshot
+from riskprobe.privacy import assert_safe_payload, stable_token
 from typer.core import TyperGroup
 
 from riskprobe.config import ProjectConfig
@@ -214,6 +215,36 @@ def _monitoring_inputs(config: ProjectConfig):
     return frame, profile, FeatureCatalog.from_columns(features, config.features.families)
 
 
+def _safe_alert_payload(alert: object, *, expose_segment_values: bool) -> dict[str, object]:
+    payload = alert.model_dump(mode="json")
+    if payload.get("scope") == "institution":
+        scope_value = str(payload["scope_value"])
+        payload["scope_value"] = stable_token(scope_value)
+        if expose_segment_values:
+            payload["institution_name"] = scope_value
+    assert_safe_payload(payload)
+    return payload
+
+
+def _safe_diagnosis_payload(
+    diagnosis: object, *, expose_segment_values: bool
+) -> dict[str, object]:
+    payload = diagnosis.model_dump(mode="json")
+    for cause in payload.get("root_causes", []):
+        if not isinstance(cause, dict):
+            continue
+        value = cause.get("value")
+        if cause.get("dimension") == "institution" and expose_segment_values:
+            cause["institution_name"] = value
+        cause["value"] = (
+            value
+            if cause.get("dimension") == "institution" and expose_segment_values
+            else stable_token(value)
+        )
+    assert_safe_payload(payload)
+    return payload
+
+
 def _write_monitoring_json(output_dir: Path, name: str, payload: object) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / name).write_text(
@@ -252,8 +283,26 @@ def monitor(
         alerts = detect_anomalies(reference, frame, (), catalog)
         diagnoses = diagnose_alerts(alerts, reference, frame, catalog, top_k=3)
         output_dir = runs_dir / "monitoring" / reference_run_id / "current"
-        _write_monitoring_json(output_dir, "anomaly_alerts.json", [item.model_dump(mode="json") for item in alerts])
-        _write_monitoring_json(output_dir, "diagnoses.json", [item.model_dump(mode="json") for item in diagnoses])
+        _write_monitoring_json(
+            output_dir,
+            "anomaly_alerts.json",
+            [
+                _safe_alert_payload(
+                    item, expose_segment_values=current.privacy.expose_segment_values
+                )
+                for item in alerts
+            ],
+        )
+        _write_monitoring_json(
+            output_dir,
+            "diagnoses.json",
+            [
+                _safe_diagnosis_payload(
+                    item, expose_segment_values=current.privacy.expose_segment_values
+                )
+                for item in diagnoses
+            ],
+        )
     except Exception:
         _fail("monitor_error", "Check the aggregate reference run and current local configuration.")
     typer.echo(json.dumps({"alert_count": len(alerts), "command": "monitor"}, sort_keys=True))
@@ -293,14 +342,67 @@ def evaluate_drift(
             grade="Stable",
         )
         reference = build_reference_snapshot(frame, profile, (baseline_card,), catalog, project_config)
-        institution = str(frame.get_column(project_config.columns.segment)[0])
+        numeric_features = [
+            spec.name
+            for spec in catalog.features
+            if frame.schema[spec.name].is_numeric()
+        ]
+        if not numeric_features:
+            raise ValueError("evaluate-drift requires at least one numeric feature")
+        monitor_feature = numeric_features[0]
+        segment_column = project_config.columns.segment
+        target_column = project_config.columns.target
+        institution = str(frame.get_column(segment_column)[0])
         scenarios = (
-            DriftScenario(scenario_id="missingness", drift_type="missingness", target="browse_pv_30d", magnitude=0.60),
-            DriftScenario(scenario_id="numeric", drift_type="numeric_shift", target="browse_pv_30d", magnitude=5.00),
-            DriftScenario(scenario_id="population", drift_type="population_shift", target=project_config.columns.segment, magnitude=0.60, institution=institution),
-            DriftScenario(scenario_id="label", drift_type="label_shift", target=project_config.columns.target, magnitude=1.00),
-            DriftScenario(scenario_id="schema", drift_type="schema", target="browse_pv_30d", magnitude=0.30),
-            DriftScenario(scenario_id="rule-decay", drift_type="rule_decay", target="browse_pv_30d", magnitude=1.00),
+            DriftScenario(
+                scenario_id="missingness",
+                drift_type="missingness",
+                target=monitor_feature,
+                magnitude=0.60,
+                target_column=target_column,
+                segment_column=segment_column,
+            ),
+            DriftScenario(
+                scenario_id="numeric",
+                drift_type="numeric_shift",
+                target=monitor_feature,
+                magnitude=5.00,
+                target_column=target_column,
+                segment_column=segment_column,
+            ),
+            DriftScenario(
+                scenario_id="population",
+                drift_type="population_shift",
+                target=segment_column,
+                magnitude=0.60,
+                institution=institution,
+                target_column=target_column,
+                segment_column=segment_column,
+            ),
+            DriftScenario(
+                scenario_id="label",
+                drift_type="label_shift",
+                target=target_column,
+                magnitude=1.00,
+                target_column=target_column,
+                segment_column=segment_column,
+            ),
+            DriftScenario(
+                scenario_id="schema",
+                drift_type="schema",
+                target=monitor_feature,
+                magnitude=0.30,
+                target_column=target_column,
+                segment_column=segment_column,
+            ),
+            DriftScenario(
+                scenario_id="rule-decay",
+                drift_type="rule_decay",
+                target=monitor_feature,
+                magnitude=1.00,
+                target_column=target_column,
+                segment_column=segment_column,
+            ),
         )
         all_alerts = []
         truths = []
@@ -339,8 +441,28 @@ def evaluate_drift(
         output_dir = _protected_path(
             runs_dir / "monitoring" / f"evaluation-{reference.snapshot_id[:16]}"
         )
-        _write_monitoring_json(output_dir, "anomaly_alerts.json", [item.model_dump(mode="json") for item in all_alerts])
-        _write_monitoring_json(output_dir, "diagnoses.json", [item.model_dump(mode="json") for item in all_diagnoses])
+        _write_monitoring_json(
+            output_dir,
+            "anomaly_alerts.json",
+            [
+                _safe_alert_payload(
+                    item,
+                    expose_segment_values=project_config.privacy.expose_segment_values,
+                )
+                for item in all_alerts
+            ],
+        )
+        _write_monitoring_json(
+            output_dir,
+            "diagnoses.json",
+            [
+                _safe_diagnosis_payload(
+                    item,
+                    expose_segment_values=project_config.privacy.expose_segment_values,
+                )
+                for item in all_diagnoses
+            ],
+        )
         _write_monitoring_json(
             output_dir,
             "drift_evaluation.json",
@@ -350,7 +472,7 @@ def evaluate_drift(
             }},
         )
     except Exception:
-        _fail("evaluation_error", "Check the local configuration, synthetic-compatible features, and --seed.")
+        _fail("evaluation_error", "Check the local configuration and configured numeric features.")
     typer.echo(json.dumps({"command": "evaluate-drift", **score.model_dump(mode="json")}, sort_keys=True))
 
 

@@ -26,6 +26,16 @@ class _Candidate:
     expression: str
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveryResult:
+    rules: tuple[RiskRule, ...]
+    train_metrics: dict[str, RuleMetrics]
+    single_candidates_before_cap: int
+    single_rules_selected: int
+    pair_candidates_before_diversity: int
+    pair_rules_selected: int
+
+
 def _condition_key(condition: Condition) -> tuple[str, str, str]:
     value = json.dumps(condition.value, allow_nan=False, separators=(",", ":"))
     return condition.feature, condition.operator, value
@@ -283,12 +293,12 @@ def _diverse_pair_selection(
     return sorted(selected, key=_ranking_key, reverse=True)
 
 
-def discover_rules(
+def discover_with_metrics(
     train: pl.DataFrame,
     feature_names: list[str],
     target_col: str,
     config: DiscoveryConfig,
-) -> list[RiskRule]:
+) -> DiscoveryResult:
     missing_features = sorted(set(feature_names) - set(train.columns))
     if missing_features:
         missing = ", ".join(missing_features)
@@ -296,14 +306,35 @@ def discover_rules(
     if target_col not in train.columns:
         raise ValueError(f"missing target column: {target_col}")
     if train.is_empty():
-        return []
+        return DiscoveryResult((), {}, 0, 0, 0, 0)
 
     target = train.get_column(target_col).to_numpy()
     if np.unique(target).size < 2 or not np.any(target == 1):
-        return []
+        return DiscoveryResult((), {}, 0, 0, 0, 0)
 
     singles = _single_candidates(train, feature_names, target, config)
     selected_singles = singles[: config.max_single_rules]
     pairs = _pair_candidates(train, target, singles, config)
     selected_pairs = _diverse_pair_selection(pairs, config.max_pair_rules)
-    return [candidate.rule for candidate in selected_singles + selected_pairs]
+    selected = selected_singles + selected_pairs
+    rules = tuple(candidate.rule for candidate in selected)
+    train_metrics = {
+        candidate.rule.rule_id: candidate.metrics for candidate in selected
+    }
+    return DiscoveryResult(
+        rules=rules,
+        train_metrics=train_metrics,
+        single_candidates_before_cap=len(singles),
+        single_rules_selected=len(selected_singles),
+        pair_candidates_before_diversity=len(pairs),
+        pair_rules_selected=len(selected_pairs),
+    )
+
+
+def discover_rules(
+    train: pl.DataFrame,
+    feature_names: list[str],
+    target_col: str,
+    config: DiscoveryConfig,
+) -> list[RiskRule]:
+    return list(discover_with_metrics(train, feature_names, target_col, config).rules)

@@ -21,6 +21,7 @@ from riskprobe.config import ProjectConfig
 from riskprobe.dates import normalize_date_series
 from riskprobe.features.catalog import FeatureCatalog
 from riskprobe.io.parquet import ParquetDataset
+from riskprobe.institutions import discover_local_rules
 from riskprobe.models import EvidenceCard, RiskRule, SliceMetrics
 from riskprobe.monitoring.models import ReferenceSnapshot
 from riskprobe.monitoring.reference import build_reference_snapshot
@@ -32,7 +33,7 @@ from riskprobe.reporting import (
     render_risk_report,
     safe_dataset_id,
 )
-from riskprobe.rules.discovery import discover_rules
+from riskprobe.rules.discovery import DiscoveryResult, discover_rules, discover_with_metrics
 from riskprobe.rules.validation import validate_rules
 
 _DISCOVERY_SAMPLE_LIMIT = 50_000
@@ -52,6 +53,18 @@ _SNAPSHOT_MARKER_NAME = ".riskprobe-snapshot"
 _SNAPSHOT_LOCK_NAME = ".lock"
 _SNAPSHOT_FILE_NAME = "input.parquet"
 _SNAPSHOT_MARKER = b"riskprobe raw snapshot v1\n"
+
+
+def _restore_json_tuples(value: object) -> object:
+    """Restore tuple-shaped model fields after JSON list serialization."""
+    if isinstance(value, list):
+        return tuple(_restore_json_tuples(item) for item in value)
+    if isinstance(value, dict):
+        restored = {key: _restore_json_tuples(item) for key, item in value.items()}
+        if {"rule", "train", "test", "grade"}.issubset(restored) and "max_time_decay" not in restored:
+            restored["max_time_decay"] = 0.0
+        return restored
+    return value
 
 
 def _package_version() -> str:
@@ -300,20 +313,142 @@ def _time_split(
     )
 
 
-def _stratified_split(
-    frame: pl.DataFrame, target_col: str
-) -> tuple[pl.DataFrame, pl.DataFrame, None]:
+def _stratified_labels(
+    frame: pl.DataFrame, target_col: str, segment_col: str
+) -> np.ndarray:
+    return np.asarray(
+        [
+            json.dumps(
+                [segment, target],
+                default=str,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            for segment, target in frame.select([segment_col, target_col]).rows()
+        ],
+        dtype=object,
+    )
+
+
+def _target_key(value: object) -> str:
+    return json.dumps(value, default=str, ensure_ascii=True, separators=(",", ":"))
+
+
+def _constrained_composite_split(
+    frame: pl.DataFrame, target_col: str, segment_col: str
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Allocate every composite group to both partitions when feasible."""
     indices = np.arange(frame.height)
-    train_indices, test_indices = train_test_split(
+    targets = frame.get_column(target_col).to_list()
+    target_keys = [_target_key(value) for value in targets]
+    desired_train, _ = train_test_split(
         indices,
         train_size=0.7,
         random_state=42,
         shuffle=True,
         stratify=frame.get_column(target_col).to_numpy(),
     )
+    desired_counts: dict[str, int] = {}
+    for index in desired_train:
+        key = target_keys[int(index)]
+        desired_counts[key] = desired_counts.get(key, 0) + 1
+
+    groups: dict[str, list[int]] = {}
+    group_targets: dict[str, str] = {}
+    for index, (segment, target) in enumerate(
+        frame.select([segment_col, target_col]).rows()
+    ):
+        group_key = json.dumps(
+            [segment, target],
+            default=str,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        groups.setdefault(group_key, []).append(index)
+        group_targets[group_key] = target_keys[index]
+
+    allocations: dict[str, int] = {}
+    for target_key in sorted(desired_counts):
+        target_groups = [
+            group_key
+            for group_key in sorted(groups)
+            if group_targets[group_key] == target_key
+        ]
+        minimum = len(target_groups)
+        maximum = sum(len(groups[group_key]) - 1 for group_key in target_groups)
+        desired = desired_counts[target_key]
+        if desired < minimum or desired > maximum:
+            return None
+        remaining = desired - minimum
+        allocations.update({group_key: 1 for group_key in target_groups})
+        while remaining:
+            progressed = False
+            for group_key in target_groups:
+                capacity = len(groups[group_key]) - 1
+                if allocations[group_key] >= capacity:
+                    continue
+                allocations[group_key] += 1
+                remaining -= 1
+                progressed = True
+                if not remaining:
+                    break
+            if not progressed:
+                return None
+
+    train_indices: list[int] = []
+    for group_key in sorted(groups):
+        selected, _ = train_test_split(
+            np.asarray(groups[group_key]),
+            train_size=allocations[group_key],
+            random_state=42,
+            shuffle=True,
+        )
+        train_indices.extend(int(index) for index in selected)
+    train_set = set(train_indices)
+    test_indices = [index for index in indices if int(index) not in train_set]
+    return np.asarray(sorted(train_set)), np.asarray(test_indices)
+
+
+def _stratified_split_with_limitations(
+    frame: pl.DataFrame, target_col: str, segment_col: str
+) -> tuple[pl.DataFrame, pl.DataFrame, None, tuple[str, ...]]:
+    composite_labels = _stratified_labels(frame, target_col, segment_col)
+    composite_counts = np.unique(composite_labels, return_counts=True)[1]
+    use_composite = bool(composite_counts.size) and int(composite_counts.min()) >= 2
+    limitations: tuple[str, ...] = ()
+    split_indices = (
+        _constrained_composite_split(frame, target_col, segment_col)
+        if use_composite
+        else None
+    )
+    if split_indices is None:
+        indices = np.arange(frame.height)
+        train_indices, test_indices = train_test_split(
+            indices,
+            train_size=0.7,
+            random_state=42,
+            shuffle=True,
+            stratify=frame.get_column(target_col).to_numpy(),
+        )
+        limitations = (
+            "Institution × target stratification unavailable; fell back to target-only stratification",
+        )
+    else:
+        train_indices, test_indices = split_indices
     train = frame[sorted(int(index) for index in train_indices)]
     test = frame[sorted(int(index) for index in test_indices)]
-    return train, test, None
+    return train, test, None, limitations
+
+
+def _stratified_split(
+    frame: pl.DataFrame, target_col: str, segment_col: str | None = None
+) -> tuple[pl.DataFrame, pl.DataFrame, None]:
+    """Compatibility wrapper for deterministic stratified splitting."""
+    segment = segment_col or target_col
+    train, test, holdout, _ = _stratified_split_with_limitations(
+        frame, target_col, segment
+    )
+    return train, test, holdout
 
 
 def _candidate_frame(rules: list[RiskRule]) -> pl.DataFrame:
@@ -423,8 +558,16 @@ def _render_service_report(
     profile: DatasetProfile,
     cards: list[EvidenceCard],
     validation_limitations: tuple[str, ...],
+    institution_analysis: dict[str, Any] | None = None,
+    *,
+    expose_segment_values: bool = False,
 ) -> str:
-    report = render_risk_report(profile, cards)
+    report = render_risk_report(
+        profile,
+        cards,
+        institution_analysis=institution_analysis,
+        expose_segment_values=expose_segment_values,
+    )
     if validation_limitations and not cards:
         replacement = "\n".join(
             f"- {limitation}" for limitation in sorted(validation_limitations)
@@ -511,6 +654,7 @@ class RiskProbeService:
             ProjectConfig.from_yaml(config) if isinstance(config, Path) else config
         )
         self.store = RunStore(runs_dir)
+        self._split_limitations: tuple[str, ...] = ()
 
     def _dataset(self) -> ParquetDataset:
         return ParquetDataset(self.config.dataset.path)
@@ -535,8 +679,14 @@ class RiskProbeService:
         ]
         frame = dataset.collect(columns)
         if self.config.time_validation_enabled:
+            self._split_limitations = ()
             return _time_split(frame, self.config.columns.snapshot)
-        train, test, holdout = _stratified_split(frame, self.config.columns.target)
+        train, test, holdout, limitations = _stratified_split_with_limitations(
+            frame,
+            self.config.columns.target,
+            self.config.columns.segment,
+        )
+        self._split_limitations = limitations
         return train, test, holdout, 0
 
     def _discover_from_train(
@@ -551,6 +701,24 @@ class RiskProbeService:
                 seed=self.config.discovery.random_seed,
             )
         return discover_rules(
+            sample,
+            feature_names,
+            self.config.columns.target,
+            self.config.discovery,
+        )
+
+    def _discovery_result_from_train(
+        self, train: pl.DataFrame, feature_names: list[str]
+    ) -> DiscoveryResult:
+        discovery_columns = [*feature_names, self.config.columns.target]
+        sample = train.select(discovery_columns)
+        if sample.height > _DISCOVERY_SAMPLE_LIMIT:
+            sample = sample.sample(
+                n=_DISCOVERY_SAMPLE_LIMIT,
+                shuffle=True,
+                seed=self.config.discovery.random_seed,
+            )
+        return discover_with_metrics(
             sample,
             feature_names,
             self.config.columns.target,
@@ -656,6 +824,14 @@ class RiskProbeService:
         if profile.metadata_grade not in {"A", "B"}:
             raise ValueError("metadata grade below B blocks rule conclusions")
 
+    def discover_with_metrics(self) -> DiscoveryResult:
+        profile = self.inspect()
+        self._assert_rule_conclusion_allowed(profile)
+        dataset = self._dataset()
+        feature_names = self._feature_names(dataset)
+        train, _, _, _ = self._partitions(dataset, feature_names)
+        return self._discovery_result_from_train(train, feature_names)
+
     def discover(self) -> list[RiskRule]:
         profile = self.inspect()
         self._assert_rule_conclusion_allowed(profile)
@@ -694,6 +870,26 @@ class RiskProbeService:
                 rules = self._discover_from_train(train, feature_names)
                 cards, validation_limitations = self._validate(
                     train, test, holdout, rules
+                )
+                validation_limitations = tuple(
+                    sorted({*validation_limitations, *self._split_limitations})
+                )
+                institution_analysis = discover_local_rules(
+                    train,
+                    test,
+                    cards,
+                    feature_names,
+                    target_col=self.config.columns.target,
+                    segment_col=self.config.columns.segment,
+                    snapshot_col=self.config.columns.snapshot,
+                    time_validation_enabled=self.config.time_validation_enabled,
+                    discovery_config=self.config.discovery,
+                    validation_config=self.config.validation,
+                    confirmed_features=frozenset(feature_names),
+                    segment_display_name=self.config.segment_display_name,
+                    metadata_grade=self.config.metadata_grade,
+                    holdout=holdout,
+                    expose_segment_values=self.config.privacy.expose_segment_values,
                 )
                 if excluded_null_snapshot_rows:
                     null_snapshot_limitation = (
@@ -738,7 +934,17 @@ class RiskProbeService:
                         "metadata_grade": profile.metadata_grade,
                         "limitations": limitations,
                         "split_rows": split_rows,
+                        "split_strategy": (
+                            "time_group_split"
+                            if self.config.time_validation_enabled
+                            else (
+                                "institution_target_stratified"
+                                if not self._split_limitations
+                                else "target_stratified_fallback"
+                            )
+                        ),
                         "time_validation_enabled": self.config.time_validation_enabled,
+                        "institution_analysis": institution_analysis,
                     },
                 )
                 context.write_json(
@@ -764,6 +970,8 @@ class RiskProbeService:
                         artifact_profile,
                         cards,
                         validation_limitations,
+                        institution_analysis,
+                        expose_segment_values=self.config.privacy.expose_segment_values,
                     ),
                 )
                 context.write_canonical_json(
@@ -789,23 +997,40 @@ class RiskProbeService:
         """Build and persist an aggregate reference snapshot beside an immutable run."""
         context = self.run()
         cards = tuple(
-            EvidenceCard.model_validate(item)
+            EvidenceCard.model_validate(_restore_json_tuples(item))
             for item in json.loads((context.run_dir / "evidence_cards.json").read_text(encoding="utf-8"))
         )
-        dataset = self._dataset()
-        profile = profile_dataset(dataset, self.config)
-        feature_names = self._feature_names(dataset)
-        frame = dataset.collect(
-            [
-                self.config.columns.entity,
-                self.config.columns.snapshot,
-                self.config.columns.segment,
-                self.config.columns.target,
-                *feature_names,
-            ]
+        manifest = json.loads(
+            (context.run_dir / "manifest.json").read_text(encoding="utf-8")
         )
-        catalog = FeatureCatalog.from_columns(feature_names, self.config.features.families)
-        snapshot = build_reference_snapshot(frame, profile, cards, catalog, self.config)
+        expected_fingerprint = manifest["data_fingerprint"]
+        with _stable_dataset_snapshot(self.config.dataset.path) as snapshot_path:
+            snapshot_fingerprint = _parquet_metadata_fingerprint(snapshot_path)
+            if snapshot_fingerprint != expected_fingerprint:
+                raise ValueError(
+                    "monitoring reference snapshot does not match run data"
+                )
+            dataset = ParquetDataset(snapshot_path)
+            profile = profile_dataset(dataset, self.config)
+            feature_names = self._feature_names(dataset)
+            monitoring_columns = tuple(
+                dict.fromkeys(
+                    (
+                        self.config.columns.entity,
+                        self.config.columns.snapshot,
+                        self.config.columns.segment,
+                        self.config.columns.target,
+                        *feature_names,
+                    )
+                )
+            )
+            frame = dataset.collect(monitoring_columns)
+            catalog = FeatureCatalog.from_columns(
+                feature_names, self.config.features.families
+            )
+            snapshot = build_reference_snapshot(
+                frame, profile, cards, catalog, self.config
+            )
         output_dir = self.store.runs_dir / "monitoring" / context.run_id
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "reference_snapshot.json").write_text(

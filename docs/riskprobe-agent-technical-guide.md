@@ -29,9 +29,39 @@ Local MCP / CLI（本地 stdio MCP 与 CLI 已实现）
 
 公开仓库与公司环境必须隔离：不得提交公司数据、真实字段名、真实配置、规则阈值、运行结果、密钥、原始日志、样本行或实际公司路径。Kiro 上下文也不应挂载数据目录。公开项目只能使用公开数据与合成数据，且不得把公司实验的效果、覆盖机构数或提效比例写成公开结论。
 
-面向 MCP 的白名单注册表已实现：工具只接受已登记 `dataset_id`，不接受任意文件路径、SQL、Python 代码或用户级筛选；允许的 ID 正则为 `^[a-z][a-z0-9_-]{2,63}$`，配置只在服务启动时加载，调用参数不能覆盖数据路径。`DatasetRegistry` 在服务启动时加载并执行白名单、路径和配置门控，MCP 调用不能借此传递数据文件路径。
+面向 MCP 的白名单注册表已实现：除两个受控 `register_local_*` 工具外，分析/监控工具只接受已登记 `dataset_id`，不接受 SQL、Python 代码或用户级筛选；允许的 ID 正则为 `^[a-z][a-z0-9_-]{2,63}$`。预注册配置在服务启动时从 registry YAML 加载；两个受控注册工具用于新增 session-scoped `dataset_id`，不能覆盖已有 ID；具体接口为 `register_local_dataset(dataset_id, config_path)` 和以下会话级只读注册接口：
 
-安全输出契约已实现并作为所有 MCP 工具的返回前门控：递归拒绝实体标识、样本行、原始数据或文件路径类字段，抑制样本量小于最小分组阈值的分组；工具返回只包含稳定脱敏编码和聚合指标，不包含实体 ID、原始样本、未脱敏字段、真实路径或低样本量分组。
+```text
+register_local_parquet(
+    dataset_id,
+    parquet_path,
+    entity_column,
+    target_column,
+    segment_column,
+    snapshot_column,
+    feature_columns,
+)
+```
+
+直接 Parquet 注册要求显式确认实体、目标、分层、时间（或明确无时间）和精确特征列清单；`feature_columns` 按完整列名匹配，绝不是前缀扩展。没有 snapshot 时关闭时间验证，仅执行固定随机分层验证，不伪造日期或宣称 OOT。两种运行时注册都只存在于当前 MCP 会话内，不覆盖已有 dataset ID、不修改 registry YAML 或源 Parquet，MCP 重连后需要重新注册。所有路径仍必须通过 `RISKPROBE_ALLOWED_DATA_ROOTS` 白名单和严格 resolve 校验。
+
+### 2.1 五项字段确认门控
+
+直接 Parquet 注册前，Agent 必须先向用户确认五项信息：实体标识列、时间列或“无时间列”、机构/客群分层列、二分类目标列，以及用户明确列出的数值特征列清单。Agent 不得依据列名猜测角色，不得自动补充特征，也不得把前缀匹配结果当作用户确认；确认内容原样作为 `register_local_parquet` 的显式参数传入。
+
+注册校验失败时停止注册和后续分析，只针对返回的错误位置提出定向追问；不得用猜测替换无效映射。一次失败最多重试一次，第二次仍失败就报告限制并停止。成功注册后仍执行不变的七步链路：
+
+```text
+register_local_parquet
+→ inspect_dataset
+→ discover_rules
+→ validate_rules
+→ detect_anomalies
+→ diagnose_anomaly
+→ build_report
+```
+
+若用户确认没有时间列，注册结果必须为 `time_validation_enabled=false`，只做固定随机验证；不得输出或暗示严格 OOT、时间外推或无时间穿越结论。递归拒绝实体标识、样本行、原始数据或文件路径类字段，抑制样本量小于最小分组阈值的分组；工具返回只包含稳定脱敏编码和聚合指标，不包含实体 ID、原始样本、未脱敏字段、真实路径或低样本量分组。
 
 ## 3. 配置、角色列和元数据等级
 
@@ -188,12 +218,23 @@ contribution = abs(current_metric - reference_metric) × current_share
 
 已实现 `DatasetRegistry.from_yaml()`、`get_config(dataset_id)`、`assert_safe_payload` 与 `suppress_small_groups`。注册表由服务启动时加载，只接受白名单 dataset ID；MCP 返回前对字符串值统一生成稳定 opaque token，递归拒绝路径/实体/样本字段，小样本分组按 `min_group_size` 抑制。
 
-### Task 6：本地 MCP 六工具（已实现）
+### Task 6：本地 MCP 十工具（已实现）
 
-本地 stdio FastMCP 服务暴露以下六个同名工具：
+本地 stdio FastMCP 服务暴露以下工具：
 
 ```text
-inspect_dataset(dataset_id)
+register_local_dataset(dataset_id, config_path)
+register_local_parquet(
+  dataset_id,
+  parquet_path,
+  entity_column,
+  target_column,
+  segment_column,
+  snapshot_column,
+  feature_columns,
+)
+inspect_local_parquet_schema(parquet_path)
+preview_local_parquet_features(parquet_path, entity_column, target_column, segment_column, snapshot_column)
 discover_rules(dataset_id, objective, constraints)
 validate_rules(dataset_id, rule_ids, split_config)
 detect_anomalies(reference_run_id, current_dataset_id)
@@ -201,11 +242,11 @@ diagnose_anomaly(alert_ids)
 build_report(run_id, report_type)
 ```
 
-每个工具先经注册表解析和状态机门控，再返回固定安全 JSON 并调用值级隐私检查；执行顺序由 `inspect → discover → validate → detect → diagnose → report` 约束，非法跳步、C/D 元数据和缺少前置运行状态均 fail-closed。`discover_rules` 仅接受 `objective="risk"` 且当前不支持非空 constraints；`validate_rules` 当前不支持非空 split_config，均采用 fail-closed。`build_report` 返回逻辑报告 ID 与聚合报告状态，不返回真实磁盘路径。注册表位置仅可由 `RISKPROBE_REGISTRY` 指向注册表文件，不能借此传递数据文件路径。
+每个工具先经注册表解析和状态机门控，再返回固定安全 JSON 并调用值级隐私检查；执行顺序由 `inspect → discover → validate → detect → diagnose → report` 约束，非法跳步、C/D 元数据和缺少前置运行状态均 fail-closed。`validate_rules` 成功时同时创建当前运行的聚合 reference snapshot，并返回 tokenized `reference_run_id`，Agent 将其传给 `detect_anomalies`；该快照不包含实体明细或真实路径。`discover_rules` 仅接受 `objective="risk"` 且当前不支持非空 constraints；`validate_rules` 当前不支持非空 split_config，均采用 fail-closed。`build_report` 返回逻辑报告 ID 与聚合报告状态，不返回真实磁盘路径。注册表位置仅可由 `RISKPROBE_REGISTRY` 指向注册表文件，不能借此传递数据文件路径。
 
 ### Task 7：Kiro Agent 最小权限（已实现）
 
-workspace Agent 名为 `riskprobe`，只暴露 `@riskprobe`，允许 `mcp` 的 `riskprobe/*`；明确 deny `shell`、`fs_read`、`fs_write`、`web_fetch`、`web_search` 五类内置能力。SOP 为：先 inspect；C/D 停止；规则先 discover 后 validate；异常先 detect 后 diagnose；同一失败最多重试 **1** 次；B 级禁止声称严格 OOT、无穿越或可上线；报告必须列出证据与限制，且不得请求明细或真实路径。
+workspace Agent 名为 `riskprobe`，只暴露 `@riskprobe`，允许 `mcp` 的 `riskprobe/*`；仅允许 `fs_read` 匹配本机配置的 approved Parquet 根目录下的 `*.parquet` 和递归 `**/*.parquet`，明确 deny `shell`、`fs_write`、`web_fetch`、`web_search`。SOP 为：收到新 Parquet 后先调用 `inspect_local_parquet_schema` 展示列名和 dtype；再询问实体、时间或无时间、机构/分群、目标四类角色；调用 `preview_local_parquet_features` 输出数值候选和非数值列；用户二次确认精确建模特征后，才调用 `register_local_parquet`，并传入完全相同的确认清单。无 snapshot 时只做随机验证；然后 inspect；C/D 停止；规则先 discover 后 validate；异常先 detect 后 diagnose；同一失败最多重试 **1** 次；B 级禁止声称严格 OOT、无穿越或可上线；报告必须列出证据与限制，且不得请求明细或真实路径。
 
 ### Task 8：监控 CLI 与端到端评估（已实现）
 
@@ -408,9 +449,122 @@ CLI 对参数错误输出结构化 JSON（`argument_error`）；配置读取失�
 | Plan 2 Task 1：监控模型与参考快照 | **完成且审查通过** | 已具备不含实体明细、可确定性复现、包含特征/分层/规则聚合指标的参考快照 |
 | Plan 2 Task 2：Schema、缺失、PSI、标签、分层与规则衰减检测 | **完成且审查修复通过** | 已实现角色元数据驱动的 Schema/缺失率/PSI/标签率/分层占比/规则 Lift 衰减检测；支持新增/消失分层与最小样本抑制 |
 | Plan 2 Task 3–4：漂移注入、评分与根因 | **完成且审查修复通过** | 已实现六类可复现真值注入、逐场景评分、FDR/FPR 边界和确定性根因排序；当前不提供月份根因 |
-| Plan 2 Task 5–8：注册表、隐私门控、MCP、Kiro Agent 与 CLI | **完成且审查修复通过** | 已实现本地白名单、值级 token 脱敏、MCP 六工具、最小权限 Kiro 配置和监控 CLI；仅本地 stdio，不提供网络服务 |
+| Plan 2 Task 5–8：注册表、隐私门控、MCP、Kiro Agent 与 CLI | **完成且审查修复通过** | 已实现本地白名单、值级 token 脱敏、MCP 十工具、最小权限 Kiro 配置和监控 CLI；仅本地 stdio，不提供网络服务 |
 | Plan 3：公开/公司数据适配与证据 | **通用代码、CLI、虚构示例与运行手册已实现；真实公司执行待完成** | 已可在本地准备用户自行下载的 Home Credit CSV、预检只读公司 Parquet、规划 64 列批次、记录本地基准并仅从完整记录生成内部草稿；尚无真实公司 Parquet、人工基线、三次真实任务或量化提效，故不得称为公司闭环或业务结果已交付 |
 | Kiro/MCP Agent | **本地实现** | 已提供本地 stdio MCP、`@riskprobe` Agent、权限 deny 规则与状态 SOP；不连接外部服务 |
 | 公开 UCI 基准 | **已运行** | 仅按第 11 节的已核验事实介绍：Top 规则为 Stable、数据为 B 级，且不是严格 OOT 或线上收益 |
 
 面试或项目介绍应优先说明“确定性引擎输出证据，Agent 只做受限编排和解释”的架构取舍，并在每个效果数字旁保留数据划分、元数据等级、表现窗口与人工复核边界。
+
+## 13. 受控本地数据集注册（当前已实现）
+
+当用户需要分析尚未写入本地 registry 的脱敏 Parquet 时，可以先调用配置注册工具：
+
+```text
+register_local_dataset(dataset_id, config_path)
+```
+
+如果用户直接提供 Parquet，则调用无需 YAML 的直接注册工具：
+
+```text
+register_local_parquet(
+  dataset_id,
+  parquet_path,
+  entity_column,
+  target_column,
+  segment_column,
+  snapshot_column,
+  feature_columns,
+)
+```
+
+直接注册不猜测角色列：Agent 必须先调用 `inspect_local_parquet_schema`，只向用户展示列名和 dtype（这是用户确认字段所需的 metadata 例外，不包含样本值、实体值或真实路径），再询问实体、目标、分层、时间或明确无时间。随后调用 `preview_local_parquet_features`，展示排除角色后的数值候选特征和被排除的非数值列；用户二次确认精确建模特征清单后，才调用 `register_local_parquet`。五项确认信息（实体、目标、分层、时间或明确无时间、精确特征列清单）必须由用户显式指定；`feature_columns` 使用完整列名匹配，不按前缀扩展，也不自动加入未确认的数值列。Agent 当前会话中的预览状态还会阻止把不属于相同角色预览候选集合的显式特征提交注册。`snapshot_column=null` 时内部仅使用实体列作为兼容 sentinel，强制 `time_validation_enabled=false`，只做固定随机验证，不把实体列当作日期、不修改源 Parquet，也不输出严格 OOT 结论。`register_local_parquet` 必须先完成同一路径/同一角色组合的 preview，并传入用户确认后的非空 `feature_columns`；缺少 preview 或省略特征列表时 fail-closed，不再自动选择数值列。已有 YAML `register_local_dataset` 行为保持兼容。
+
+两种工具都不是任意文件系统权限，也不授予 Shell。它们由 MCP 服务端执行以下门控：
+
+1. `dataset_id` 必须符合白名单格式，且不能覆盖已有注册项；
+2. Parquet（以及配置注册中的 YAML 和配置引用文件）必须位于 `RISKPROBE_ALLOWED_DATA_ROOTS` 指定的绝对目录；
+3. 路径经过 `resolve(strict=true)` 校验，阻止符号链接逃逸；
+4. 配置注册必须满足 `ProjectConfig` 数据契约；直接注册必须找到显式角色列和至少一个数值特征；
+5. 注册只写入当前 MCP 进程内存，不修改 registry YAML、配置文件、Parquet 或运行产物；
+6. 注册成功响应只返回稳定 dataset token、状态和时间验证开关；schema/角色预览工具仅在用户确认流程中返回原始列名与 dtype metadata，不返回样本、实体值或真实路径。
+
+`RISKPROBE_ALLOWED_DATA_ROOTS` 未设置或为空时，运行时注册默认失败。用户应在本机未提交的 MCP 配置中设置允许目录，例如：
+
+```json
+{
+  "mcpServers": {
+    "riskprobe": {
+      "env": {
+        "RISKPROBE_ALLOWED_DATA_ROOTS": "/local/approved/data-root"
+      }
+    }
+  }
+}
+```
+
+运行时注册的标准流程为：
+
+```text
+register_local_parquet（或 register_local_dataset）
+→ inspect_dataset
+→ discover_rules
+→ validate_rules
+→ detect_anomalies
+→ diagnose_anomaly
+→ build_report
+```
+
+MCP 服务重连后，运行时注册会丢失；需要重新注册，或由用户在仓库外维护本地 registry。真实数据、真实配置、允许目录和 registry 路径不得提交到 Git。
+
+## 13.1 三类具体分析报告
+
+直接 Parquet 完成注册后，Agent 必须按以下顺序输出三个具体报告，而不能只报告规则数、告警数或 `available`：
+
+1. **规则发现报告（`discovery_report`）**：包含候选规则总数、一维规则数、二维规则数、过滤/截断前候选数量、训练集 TOP5 和二维 TOP5。发现阶段只使用训练集，按 Train Lift、Train support、规则 ID 排序；每条规则展示已确认特征条件、阈值、support、coverage、bad rate、Lift、Precision、Recall 和 p-value。
+2. **规则验证与稳定性报告（`validation_report`）**：包含四类等级计数、按 Test Lift 排序的总体 TOP5、二维 TOP5 和 Stable TOP5。每条规则展示具体条件、Train/Test 的 support、coverage、bad rate、Lift、Precision、Recall、p-value、Bootstrap Lift CI、调整后 p-value、分群一致性、时间衰减、等级和安全原因码。总体 TOP5 不隐藏非 Stable 规则，Stable TOP5 只在过滤后排序。
+3. **漂移监控与根因诊断报告（`monitoring_report`、`diagnosis_report`）**：包含 reference/current 聚合概况、Schema/Missingness/Distribution/Population/Label/Rule Decay 六类告警计数、逐条告警级别和数值证据，以及每条告警的根因 TOP3、贡献度和数值证据。无告警时必须明确返回六类告警为零和空诊断。
+
+规则发现的 TOP5 使用 Train Lift；验证后的 TOP5 使用 Test Lift。`Stable` 要求调整后 p-value 不超过 `alpha`、Lift 置信区间下界大于 1、样本和切片充分、时间衰减不超过 `max_lift_decay`，并且不满足 Local 条件。默认阈值为 `alpha=0.05`、`max_lift_decay=0.30`、`min_segment_consistency=0.60`、`min_group_size=100`。没有真实时间列时不做时间验证，Stable 不能解释为 OOT 稳定或生产就绪。
+
+报告只返回聚合指标、已确认建模特征及规则数值阈值等受限 metadata；默认会在受限的机构名称字段中展示已确认分层值，显式配置 `privacy.expose_segment_values=false` 时，实体值、原始样本、原始分组值、真实路径和明细行继续禁止输出；即使默认展示机构名，其他明细边界不变。
+
+
+## 13.2 多机构全局优先分析
+
+当 `columns.segment` 表示机构或用户确认的分层维度时，RiskProbe 使用以下顺序：
+
+```text
+按 institution × target 分层切分（无法满足时回退并记录限制）
+→ 全机构合并 Train 发现 Global Rules
+→ Test/Holdout 按机构计算 Support、Coverage、Hit Bad Rate、Lift、CI 可用性
+→ Global Stable / Local / Unstable / Suspicious 分级
+→ 仅对 Local 且 Train/Test 样本充足、标签两类齐全的机构单独发现规则
+→ Global TOP5 与 Institution TOP5 分开
+→ Global Alert / Institution Alert 双层监控与根因 TOP3
+```
+
+机构列只用于切分、验证和监控，不进入建模特征。无时间随机验证现在优先使用 `institution × target` 组合进行固定 70/30 分层；任何组合无法进行 sklearn 分层时，系统回退到 target-only 分层，并在 `metadata_report.json` 的 `limitations` 中记录“回退”限制。时间验证仍保持原有日期组边界和 Holdout 语义。
+
+`validation_report` 的每条总体规则会附 `institution_results`：机构稳定 token、Support、Coverage、Hit Bad Rate、Lift 和正向/非正向方向。`institution_summary` 会说明可用机构数和当前是否形成跨机构比较。Global Stable 的文字含义是满足样本门槛的机构方向总体一致；Local 表示总体效果集中于少数机构，不应直接推广；Unstable 表示时间衰减超过配置阈值；Suspicious 表示统计或样本证据不足。
+
+`institution_rule_report` 是条件式局部发现的聚合结果。它最多处理固定数量的候选机构，避免机构数造成运行时间和多重检验无界增长；小样本、单标签或超过上限的机构只返回 token 和 blocked 原因。完成的机构报告分开提供 Institution TOP5、Train/Test 指标和固定文字解释；机构规则不写入全局候选规则表，不自动升级为 Global Rule，也不自动上线。
+
+`monitoring_report` 将已有告警按 scope 分成 `global_alerts` 和 `institution_alerts`，并给出固定解释：只有机构告警时不能直接称为全局规则失效，同时存在两层告警时应先确认全局变化再定位贡献机构。默认在受限 explainable 字段中展示已确认的真实机构名；显式配置 `privacy.expose_segment_values: false` 时，改为稳定 token 或 tokenized `scope_value`。实体值、样本、路径、原始日志和明细仍禁止输出。Agent 必须按“全局发现 → 机构稳定性 → 条件式机构规则 → Global/Institution 监控与根因”的顺序输出文字解读。
+
+
+补充安全边界：`@riskprobe` Agent 不拥有直接 `fs_read` Parquet 权限，所有数据访问必须经过本地 MCP 的 allowlist、schema/角色确认和只读注册门控。Agent 只能接收 MCP 返回的脱敏聚合结果；这避免通过文件读取绕过实体、样本和特征确认边界。
+
+
+### 13.3 真实分群名的默认展示
+
+机构值现在默认在受限的本地报告和 Agent/MCP explainable 字段中以真实名称展示，满足用户直接识别数据集机构的需要。项目配置无需增加字段即可使用该默认行为；如需收紧展示，可显式配置：
+
+```yaml
+privacy:
+  expose_segment_values: false
+```
+
+默认 `privacy.expose_segment_values` 为 `true`。默认或显式配置为 `true` 时，`risk_report.md` 的 Institution Evidence、Institution Analysis、Institution TOP5，以及 MCP 的 `institution_summary`、`institution_results`、`institution_rule_report` 和机构告警会保留 `institution_token`，并在受限字段中增加 `institution_name` 或真实名称列。配置为 `false` 时继续只输出 `institution_token` 或 tokenized `scope_value`，验证限制文本中的分群值也会转换为机构 token。
+
+该策略只展示已确认分层列中的聚合业务 metadata，不扩大 Agent 权限。实体值、样本行、原始日志、真实文件路径、Parquet 明细读取、Shell、网络访问和自动策略上线仍禁止；MCP 返回前仍执行 `assert_safe_payload`。真实名称不进入实体、样本或规则明细输出，也不建立外部 token 到真实机构名的映射。

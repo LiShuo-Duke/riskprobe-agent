@@ -63,6 +63,7 @@ class SnapshotConfig(StrictModel):
 
 class FeatureFamilyConfig(StrictModel):
     families: Mapping[str, tuple[str, ...]]
+    exact_columns: tuple[str, ...] | None = None
     explicit_catalog: Path | None = None
 
     @field_validator("explicit_catalog", mode="before")
@@ -80,6 +81,11 @@ class FeatureFamilyConfig(StrictModel):
             for name, prefixes in families.items()
         }
 
+    @field_validator("exact_columns", mode="before")
+    @classmethod
+    def convert_exact_column_lists_to_tuples(cls, columns: object) -> object:
+        return tuple(columns) if isinstance(columns, list) else columns
+
     @field_validator("families")
     @classmethod
     def freeze_families(
@@ -88,6 +94,19 @@ class FeatureFamilyConfig(StrictModel):
         if any(not prefix for prefixes in families.values() for prefix in prefixes):
             raise ValueError("feature family prefixes must be non-empty")
         return MappingProxyType(dict(families))
+
+    @field_validator("exact_columns")
+    @classmethod
+    def validate_exact_columns(
+        cls, columns: tuple[str, ...] | None
+    ) -> tuple[str, ...] | None:
+        if columns is None:
+            return None
+        if not columns or any(not column for column in columns):
+            raise ValueError("exact column names must be non-empty")
+        if len(columns) != len(set(columns)):
+            raise ValueError("exact column names must be unique")
+        return columns
 
     @field_serializer("families")
     def serialize_families(self, families: Mapping[str, tuple[str, ...]]) -> dict[str, list[str]]:
@@ -99,6 +118,9 @@ class FeatureFamilyConfig(StrictModel):
         role_columns: Iterable[str],
     ) -> list[str]:
         candidates = sorted(set(columns).difference(role_columns))
+        if self.exact_columns is not None:
+            exact = frozenset(self.exact_columns)
+            return [column for column in candidates if column in exact]
         if self.explicit_catalog is not None:
             return [
                 column
@@ -144,6 +166,10 @@ class ValidationConfig(StrictModel):
     min_group_size: int = Field(default=100, ge=20)
 
 
+class PrivacyConfig(StrictModel):
+    expose_segment_values: bool = True
+
+
 class ProjectConfig(StrictModel):
     dataset: DatasetConfig
     columns: ColumnRoles
@@ -155,6 +181,7 @@ class ProjectConfig(StrictModel):
     metadata_grade_override: Literal["A", "B", "C", "D"] | None = None
     discovery: DiscoveryConfig = DiscoveryConfig()
     validation: ValidationConfig = ValidationConfig()
+    privacy: PrivacyConfig = PrivacyConfig()
 
     @property
     def metadata_grade(self) -> Literal["A", "B", "C", "D"]:

@@ -39,7 +39,9 @@ def redact_segment_value(value: str) -> str:
     return f"segment-{digest}"
 
 
-def redact_limitation(limitation: str) -> str:
+def redact_limitation(limitation: str, *, already_redacted: bool = False) -> str:
+    if already_redacted:
+        return limitation
     prefix = "holdout: " if limitation.startswith("holdout: ") else ""
     body = limitation[len(prefix) :]
     descriptor, separator, value = body.partition(": ")
@@ -63,6 +65,8 @@ def _number(value: float | None) -> str:
 def render_risk_report(
     profile: DatasetProfile,
     evidence_cards: Sequence[EvidenceCard],
+    *,
+    segments_are_redacted: bool = False,
 ) -> str:
     cards = sorted(evidence_cards, key=evidence_sort_key)
     counts = Counter(card.grade for card in cards)
@@ -191,7 +195,10 @@ def render_risk_report(
 
     limitations = sorted(
         {
-            redact_limitation(limitation)
+            redact_limitation(
+                limitation,
+                already_redacted=segments_are_redacted,
+            )
             for card in cards
             for limitation in card.limitations
         }

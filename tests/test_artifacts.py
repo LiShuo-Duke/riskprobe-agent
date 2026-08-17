@@ -270,3 +270,19 @@ def test_reuse_rejects_rehashed_artifact_and_canonical_manifest_rewrite(
 
     with pytest.raises(RuntimeError, match="not complete"):
         store.create("cfg", "data", "0.1.0")
+
+
+def test_incomplete_run_rejects_symlinked_runtime_database(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    context = store.create("cfg", "data", "0.1.0")
+    context.release()
+    external = tmp_path / "external.sqlite3"
+    external.write_bytes(b"untrusted")
+    runtime_path = store.runs_dir / f".{context.run_id}.runtime.sqlite3"
+    runtime_path.symlink_to(external)
+
+    with pytest.raises(RuntimeError, match="secure runtime database"):
+        store.create("cfg", "data", "0.1.0")
+
+    assert runtime_path.is_symlink()
+    assert external.read_bytes() == b"untrusted"

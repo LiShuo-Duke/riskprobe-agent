@@ -1,0 +1,25 @@
+# Copy this block to a trusted project-scoped Codex config.
+# Replace every /ABSOLUTE/PATH placeholder and host-model-version before use.
+
+[mcp_servers.riskprobe]
+command = "/ABSOLUTE/PATH/TO/riskprobe-agent/.venv/bin/python"
+args = [
+  "-m",
+  "riskprobe.mcp_server",
+  "--config",
+  "/ABSOLUTE/PATH/TO/project.yaml",
+  "--runs-dir",
+  "/ABSOLUTE/PATH/TO/LOCAL/RISKPROBE/RUNS",
+  "--state-dir",
+  "/ABSOLUTE/PATH/TO/LOCAL/RISKPROBE/STATE",
+  "--provider-id",
+  "codex",
+  "--provider-version",
+  "host-model-version",
+  "--principal-id",
+  "codex-host",
+  "--role",
+  "analyst",
+  "--max-queries",
+  "16",
+]

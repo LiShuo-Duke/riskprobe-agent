@@ -1,0 +1,17 @@
+{
+  "description": "Fictional local company Parquet schema example; it contains no company asset, path, rule, threshold, or result.",
+  "fields": [
+    {"name": "anonymous_id", "type": "String"},
+    {"name": "cutoff_date", "type": "Date"},
+    {"name": "org_code", "type": "String"},
+    {"name": "bad_label", "type": "Int8"},
+    {"name": "ord_x_cnt_30d", "type": "Int64"},
+    {"name": "ord_x_amt_90d", "type": "Float64"},
+    {"name": "brw_x_pv_30d", "type": "Int64"},
+    {"name": "brw_x_ratio_90d", "type": "Float64"},
+    {"name": "multi_x_active_30d", "type": "Int64"},
+    {"name": "multi_x_share_90d", "type": "Float64"},
+    {"name": "emb_x_score_01", "type": "Float64"},
+    {"name": "emb_x_score_02", "type": "Float64"}
+  ]
+}

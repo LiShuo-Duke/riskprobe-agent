@@ -12,7 +12,7 @@
 
 - 必须先完成 `2026-08-05-riskprobe-core-engine.md`。
 - MCP 不接受任意文件路径、SQL、Python 代码或用户级筛选条件。
-- MCP 输出只能来自固定 Pydantic 模型，不返回 entity ID、样本行、原始日志或低于最小样本量的分组。
+- 所有输入在进入 RiskProbe 前已完成脱敏；MCP 输出只能来自固定 Pydantic 模型，可返回稳定的脱敏 dataset/segment/rule 编码用于聚合比较，但不返回 entity ID、样本行、未脱敏字段、原始日志、文件路径或低于最小样本量的分组。
 - Kiro Agent 只暴露 `@riskprobe`，并 deny `shell`、`fs_read`、`fs_write`、`web_fetch`、`web_search`。
 - 异常检测算法与根因贡献由本地 Python 计算；模型只能总结计算结果。
 - 自动重试最多一次；C/D 元数据等级必须阻断规则结论。

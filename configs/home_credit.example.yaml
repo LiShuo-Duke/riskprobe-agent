@@ -1,0 +1,24 @@
+dataset:
+  id: home_credit_public
+  path: data/public/home_credit.parquet
+  read_only: true
+columns:
+  entity: entity_id
+  snapshot: snapshot_date
+  segment: customer_segment
+  target: target
+target:
+  positive_value: 1
+  positive_meaning: bad_debt
+  performance_window_days: null
+snapshot:
+  meaning: public_relative_reference
+features:
+  families:
+    previous_application: [prev_]
+    installment: [inst_]
+    pos: [pos_]
+    credit_card: [cc_]
+    bureau: [bureau_]
+segment_display_name: customer_segment
+time_validation_enabled: false

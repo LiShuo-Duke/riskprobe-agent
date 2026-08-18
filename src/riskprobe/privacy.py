@@ -6,11 +6,11 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime
 from enum import Enum
 from pathlib import PurePath
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
@@ -27,6 +27,10 @@ _UUID = re.compile(
 )
 _ENTITY_PREFIX = re.compile(
     r"^(?:entity|customer|account|borrower|member|person|user|loan)[_-][A-Za-z0-9_-]*\d{3,}$",
+    re.IGNORECASE,
+)
+_IDENTIFIER_LIKE = re.compile(
+    r"\b(?:entity|sample|customer|account|user|row|record|phone|email|path|file)(?:[_=-]|\s+id\s*=)",
     re.IGNORECASE,
 )
 _LONG_NUMBER = re.compile(r"^\d{8,}$")
@@ -110,6 +114,41 @@ def tokenize_segment(value: object, *, namespace: str = "") -> SegmentToken:
     ).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()[:24]
     return SegmentToken(token=f"segment-{digest}")
+
+
+def stable_token(value: object, *, namespace: str = "value") -> str:
+    """Return a deterministic opaque compatibility token."""
+
+    digest = hashlib.sha256(f"{namespace}:{value!s}".encode()).hexdigest()[:16]
+    return f"tok_{digest}"
+
+
+def redact_payload(payload: object) -> Any:
+    """Recursively replace string values with deterministic opaque tokens."""
+
+    if isinstance(payload, Mapping):
+        return {str(key): redact_payload(value) for key, value in payload.items()}
+    if isinstance(payload, (tuple, list)):
+        return [redact_payload(value) for value in payload]
+    if isinstance(payload, str):
+        return stable_token(payload)
+    return payload
+
+
+def suppress_small_groups(
+    records: Iterable[Mapping[str, Any]], count_key: str, min_group_size: int
+) -> list[dict[str, Any]]:
+    """Keep only aggregate records meeting the shared minimum group threshold."""
+
+    if min_group_size < 1:
+        raise ValueError("min_group_size must be positive")
+    return [
+        dict(record)
+        for record in records
+        if isinstance(record.get(count_key), int)
+        and not isinstance(record[count_key], bool)
+        and record[count_key] >= min_group_size
+    ]
 
 
 def assert_safe_payload(payload: object) -> None:
@@ -284,6 +323,7 @@ def _looks_like_entity(value: str) -> bool:
         _EMAIL.fullmatch(stripped) is not None
         or _UUID.fullmatch(stripped) is not None
         or _ENTITY_PREFIX.fullmatch(stripped) is not None
+        or _IDENTIFIER_LIKE.search(stripped) is not None
         or _LONG_NUMBER.fullmatch(stripped) is not None
     )
 
@@ -318,5 +358,8 @@ __all__ = [
     "UnsafePayloadError",
     "assert_safe_payload",
     "canonical_payload_hash",
+    "redact_payload",
+    "stable_token",
+    "suppress_small_groups",
     "tokenize_segment",
 ]

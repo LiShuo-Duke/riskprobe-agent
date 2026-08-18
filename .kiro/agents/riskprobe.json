@@ -1,0 +1,25 @@
+{
+  "name": "riskprobe",
+  "description": "Run the bounded local RiskProbe Host-decision workflow.",
+  "tools": ["@riskprobe"],
+  "includeMcpJson": true,
+  "includePowers": false,
+  "resources": ["skill://.kiro/skills/riskprobe/SKILL.md"],
+  "permissions": {
+    "rules": [
+      {
+        "capability": "mcp",
+        "match": [
+          "riskprobe/riskprobe_get_decision_context",
+          "riskprobe/riskprobe_submit_decision_proposal"
+        ],
+        "effect": "allow"
+      },
+      {"capability": "shell", "effect": "deny"},
+      {"capability": "fs_read", "effect": "deny"},
+      {"capability": "fs_write", "effect": "deny"},
+      {"capability": "web_fetch", "effect": "deny"},
+      {"capability": "web_search", "effect": "deny"}
+    ]
+  }
+}

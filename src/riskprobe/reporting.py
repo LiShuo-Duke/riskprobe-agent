@@ -6,12 +6,11 @@ import re
 from urllib.parse import unquote, urlsplit
 
 from riskprobe.models import EvidenceCard
+from riskprobe.privacy import stable_token
 from riskprobe.profiling import DatasetProfile
 
 _GRADE_ORDER = {"Stable": 0, "Local": 1, "Unstable": 2, "Suspicious": 3}
-_EMBEDDED_POSIX_PATH = re.compile(
-    r"(?:^|[=:\s|;,])/(?:[^/\s]+/)+[^/\s]+"
-)
+_EMBEDDED_POSIX_PATH = re.compile(r"(?:^|[=:\s|;,])/(?:[^/\s]+/)+[^/\s]+")
 _EMBEDDED_WINDOWS_PATH = re.compile(
     r"(?:^|[=:\s|;,])(?:[A-Za-z]:[\\/](?:[^\\/\s]+[\\/])+[^\\/\s]+|\\\\[^\\/\s]+[\\/][^\s]+)"
 )
@@ -35,18 +34,23 @@ def safe_dataset_id(dataset_id: str) -> str:
 
 
 def redact_segment_value(value: str) -> str:
+    """Return a deterministic redacted segment code."""
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
     return f"segment-{digest}"
 
 
-def redact_limitation(limitation: str, *, already_redacted: bool = False) -> str:
-    if already_redacted:
+def redact_limitation(
+    limitation: str,
+    *,
+    already_redacted: bool = False,
+    expose_segment_values: bool = False,
+) -> str:
+    """Keep public limitations readable while honoring segment display policy."""
+    if already_redacted or expose_segment_values:
         return limitation
-    prefix = "holdout: " if limitation.startswith("holdout: ") else ""
-    body = limitation[len(prefix) :]
-    descriptor, separator, value = body.partition(": ")
-    if separator and descriptor.startswith("single-class ") and descriptor != "single-class time":
-        return f"{prefix}{descriptor}: {redact_segment_value(value)}"
+    match = re.match(r"^((?:holdout:\s*)?single-class [^:]+): (.+)$", limitation)
+    if match:
+        return f"{match.group(1)}: {redact_segment_value(match.group(2))}"
     return limitation
 
 
@@ -65,7 +69,9 @@ def _number(value: float | None) -> str:
 def render_risk_report(
     profile: DatasetProfile,
     evidence_cards: Sequence[EvidenceCard],
+    institution_analysis: dict[str, object] | None = None,
     *,
+    expose_segment_values: bool = True,
     segments_are_redacted: bool = False,
 ) -> str:
     cards = sorted(evidence_cards, key=evidence_sort_key)
@@ -110,19 +116,11 @@ def render_risk_report(
         ]
     )
     if time_validation_enabled:
-        lines.extend(
-            [
-                f"- Snapshot range: {profile.snapshot_min.isoformat()} to "
-                f"{profile.snapshot_max.isoformat()}",
-            ]
+        lines.append(
+            f"- Snapshot range: {profile.snapshot_min.isoformat()} to "
+            f"{profile.snapshot_max.isoformat()}"
         )
-    lines.extend(
-        [
-            "",
-            "## Quality Issues",
-            "",
-        ]
-    )
+    lines.extend(["", "## Quality Issues", ""])
     if profile.issues:
         lines.extend(
             f"- [{issue.severity}] {issue.code}: {_issue_message(issue.code, issue.message)} "
@@ -193,11 +191,160 @@ def render_risk_report(
     if not cards:
         lines.append(f"| {' | '.join(['None'] + ['—' for _ in headers[1:]])} |")
 
+    institution_rows = [
+        (card.rule.rule_id, item)
+        for card in cards
+        for item in card.slices
+        if item.slice_type == "segment"
+    ]
+    if institution_rows:
+        institution_headers = [
+            "Rule ID",
+            "Institution Token",
+            *(["Institution Name"] if expose_segment_values else []),
+            "Support",
+            "Coverage",
+            "Hit Bad Rate",
+            "Lift",
+            "Direction",
+        ]
+        lines.extend(
+            [
+                "",
+                "## Institution Evidence",
+                "",
+                f"| {' | '.join(institution_headers)} |",
+                f"| {' | '.join(['---', '---'] + (['---'] if expose_segment_values else []) + ['---:'] * 4 + ['---'])} |",
+            ]
+        )
+        for rule_id, item in institution_rows:
+            metrics = item.metrics
+            token = stable_token(item.slice_value, namespace="institution")
+            row = [
+                rule_id,
+                token,
+                *([item.slice_value] if expose_segment_values else []),
+                str(metrics.support_count),
+                _number(metrics.coverage),
+                _number(metrics.hit_bad_rate),
+                _number(metrics.lift),
+                "positive" if metrics.lift > 1.0 else "non-positive",
+            ]
+            lines.append(f"| {' | '.join(row)} |")
+
+    if institution_analysis is not None:
+        institution_reports = institution_analysis.get("institution_reports", [])
+        reports = institution_reports if isinstance(institution_reports, list) else []
+        lines.extend(
+            [
+                "",
+                "## Institution Analysis",
+                "",
+                "- 分析顺序：先合并全机构发现总体规则，再按机构验证；仅对 Local 且样本充足的机构进行局部发现。",
+                f"- Eligible institutions: {institution_analysis.get('eligible_institution_count', 0)}",
+                f"- Triggered local discovery: {institution_analysis.get('triggered_institution_count', 0)}",
+                f"- Blocked local discovery: {institution_analysis.get('blocked_institution_count', 0)}",
+                f"- Interpretation: {institution_analysis.get('interpretation', '机构级结果仅用于验证和人工复核。')}",
+            ]
+        )
+        if reports:
+            analysis_headers = [
+                "Institution Token",
+                *(["Institution Name"] if expose_segment_values else []),
+                "Status",
+                "Train Rows",
+                "Test Rows",
+                "Local Rules",
+                "Reason",
+            ]
+            lines.extend(
+                [
+                    "",
+                    f"| {' | '.join(analysis_headers)} |",
+                    f"| {' | '.join(['---'] * len(analysis_headers))} |",
+                ]
+            )
+            for item in reports:
+                if not isinstance(item, dict):
+                    continue
+                row = [
+                    str(item.get("institution_token", "—")),
+                    *(
+                        [str(item.get("institution_name", "—"))]
+                        if expose_segment_values
+                        else []
+                    ),
+                    str(item.get("status", "—")),
+                    str(item.get("train_row_count", "—")),
+                    str(item.get("test_row_count", "—")),
+                    str(item.get("rule_count", "—")),
+                    str(item.get("reason", "—")),
+                ]
+                lines.append(f"| {' | '.join(row)} |")
+
+            top_rows: list[tuple[str, str, dict[str, object]]] = []
+            for item in reports:
+                if not isinstance(item, dict) or item.get("status") != "completed":
+                    continue
+                validation = item.get("validation_report", {})
+                if not isinstance(validation, dict):
+                    continue
+                top_rules = validation.get("top_rules", [])
+                if not isinstance(top_rules, list):
+                    continue
+                token = str(item.get("institution_token", "—"))
+                name = str(item.get("institution_name", "—"))
+                top_rows.extend(
+                    (token, name, rule)
+                    for rule in top_rules[:5]
+                    if isinstance(rule, dict)
+                )
+            if top_rows:
+                top_headers = [
+                    "Institution Token",
+                    *(["Institution Name"] if expose_segment_values else []),
+                    "Rule ID",
+                    "Conditions",
+                    "Grade",
+                    "Test Lift",
+                    "Coverage",
+                    "Interpretation",
+                ]
+                lines.extend(
+                    [
+                        "",
+                        "### Institution TOP5",
+                        "",
+                        f"| {' | '.join(top_headers)} |",
+                        f"| {' | '.join(['---'] * len(top_headers))} |",
+                    ]
+                )
+                for token, name, rule in top_rows:
+                    conditions = rule.get("conditions", [])
+                    condition_text = " AND ".join(
+                        f"{condition.get('feature', 'feature')} {condition.get('operator', '?')} {condition.get('value', '—')}"
+                        for condition in conditions
+                        if isinstance(condition, dict)
+                    )
+                    test = rule.get("test", {})
+                    row = [
+                        token,
+                        *([name] if expose_segment_values else []),
+                        str(rule.get("rule_id", "—")),
+                        condition_text or "—",
+                        str(rule.get("grade", "—")),
+                        _number(test.get("lift") if isinstance(test, dict) else None),
+                        _number(test.get("coverage") if isinstance(test, dict) else None),
+                        str(rule.get("interpretation", "机构规则仅供人工复核")),
+                    ]
+                    lines.append(f"| {' | '.join(row)} |")
+
     limitations = sorted(
         {
             redact_limitation(
                 limitation,
                 already_redacted=segments_are_redacted,
+                expose_segment_values=expose_segment_values,
             )
             for card in cards
             for limitation in card.limitations

@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "riskprobe": {
+      "command": ".venv/bin/python",
+      "args": [
+        "-m",
+        "riskprobe.mcp_server",
+        "--config",
+        "configs/synthetic.example.yaml",
+        "--runs-dir",
+        "runs",
+        "--state-dir",
+        "runs/state",
+        "--provider-id",
+        "kiro",
+        "--provider-version",
+        "gpt5.6sol",
+        "--principal-id",
+        "kiro-host",
+        "--role",
+        "analyst",
+        "--max-queries",
+        "16"
+      ]
+    }
+  }
+}

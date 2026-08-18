@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "riskprobe": {
+      "command": "/ABSOLUTE/PATH/TO/riskprobe-agent/.venv/bin/python",
+      "args": [
+        "-m",
+        "riskprobe.mcp_server",
+        "--config",
+        "/ABSOLUTE/PATH/TO/project.yaml",
+        "--runs-dir",
+        "/ABSOLUTE/PATH/TO/LOCAL/RISKPROBE/RUNS",
+        "--state-dir",
+        "/ABSOLUTE/PATH/TO/LOCAL/RISKPROBE/STATE",
+        "--provider-id",
+        "trae",
+        "--provider-version",
+        "host-model-version",
+        "--principal-id",
+        "trae-host",
+        "--role",
+        "analyst",
+        "--max-queries",
+        "16"
+      ]
+    }
+  }
+}

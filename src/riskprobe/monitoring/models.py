@@ -1,4 +1,4 @@
-"""Strict privacy-safe contracts for aggregate risk diagnostics."""
+"""Strict privacy-safe contracts for aggregate diagnostics and monitoring."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from riskprobe.models import FrozenModel
 from riskprobe.privacy import SegmentToken, assert_safe_payload, canonical_payload_hash
 from riskprobe.profiling import DatasetProfile
 
@@ -245,6 +246,69 @@ class DiagnosticReport(_FrozenModel):
         return self
 
 
+class FeatureReference(FrozenModel):
+    feature: str
+    family: str
+    dtype: str
+    missing_rate: float
+    zero_rate: float
+    quantile_edges: tuple[float, ...]
+    histogram_counts: tuple[int, ...]
+
+
+class RuleReference(FrozenModel):
+    rule_id: str
+    coverage: float
+    bad_rate: float
+    lift: float
+
+
+class ReferenceSnapshot(FrozenModel):
+    """Aggregate reference data without row-level or temporal-bucket content."""
+
+    snapshot_id: str
+    dataset_id: str
+    row_count: int
+    positive_rate: float
+    target_column: str
+    segment_column: str
+    min_group_size: int
+    segment_counts: dict[str, int]
+    features: tuple[FeatureReference, ...]
+    rules: tuple[RuleReference, ...]
+    created_at: str
+
+
+class Alert(FrozenModel):
+    alert_id: str
+    alert_type: Literal[
+        "schema", "missingness", "distribution", "population", "label", "rule_decay"
+    ]
+    severity: Literal["warning", "critical"]
+    scope: Literal["dataset", "institution", "feature", "family", "rule"]
+    scope_value: str
+    metric: str
+    reference_value: float | str | None
+    current_value: float | str | None
+    delta: float | None
+    evidence: dict[str, float | int | str]
+
+
+class RootCause(FrozenModel):
+    dimension: str
+    value: str
+    contribution: float
+    rank: int
+    evidence: dict[str, float | int | str]
+
+
+class Diagnosis(FrozenModel):
+    snapshot_id: str
+    alerts: tuple[Alert, ...]
+    root_causes: tuple[RootCause, ...]
+    created_at: str
+
+
 def finding_sort_key(finding: RiskFinding) -> tuple[object, ...]:
     severity_rank = {
         FindingSeverity.CRITICAL: 0,
@@ -267,10 +331,16 @@ def _date_text(value: date | None) -> str | None:
 
 
 __all__ = [
+    "Alert",
+    "Diagnosis",
     "DiagnosticReport",
+    "FeatureReference",
     "FindingKind",
     "FindingSeverity",
+    "ReferenceSnapshot",
     "RiskFinding",
+    "RootCause",
+    "RuleReference",
     "SafeProfile",
     "finding_sort_key",
 ]

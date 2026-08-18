@@ -13,7 +13,7 @@ def synthetic_config(tmp_path: Path) -> ProjectConfig:
     frame.write_parquet(data_path)
     return ProjectConfig.model_validate(
         {
-            "dataset": {"id": "synthetic_test", "path": data_path},
+            "dataset": {"id": "dataset_31a4d8c9b2f0", "path": data_path},
             "columns": {
                 "entity": "entity_id",
                 "snapshot": "snapshot_date",

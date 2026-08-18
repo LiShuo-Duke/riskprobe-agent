@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://riskprobe.local/schemas/benchmark-record.schema.json",
+  "title": "RiskProbe local BenchmarkRecord",
+  "description": "A locally retained measurement record. It contains aggregate counts and timings only; do not include rules, sample data, real field names, local paths, or credentials.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "task_id",
+    "dataset_id",
+    "measured_at",
+    "code_version",
+    "config_hash",
+    "data_fingerprint",
+    "manual_minutes",
+    "agent_minutes",
+    "stage_timings",
+    "candidate_rule_count",
+    "evidence_passed_count",
+    "reviewed_rule_count",
+    "accepted_rule_count",
+    "anomaly_true_positive_count",
+    "anomaly_false_positive_count",
+    "anomaly_false_negative_count",
+    "root_cause_top3_hit_count",
+    "root_cause_case_count",
+    "baseline_task_id"
+  ],
+  "properties": {
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "dataset_id": {"type": "string"},
+    "measured_at": {"type": "string", "description": "UTC ISO-8601 timestamp recorded at the local run."},
+    "code_version": {"type": "string"},
+    "config_hash": {"type": "string"},
+    "data_fingerprint": {"type": "string", "description": "Local data fingerprint; never a source path."},
+    "manual_minutes": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Measured historical manual baseline. Null means efficiency must not be claimed."
+    },
+    "agent_minutes": {"type": "number", "minimum": 0},
+    "stage_timings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/stageTiming"},
+      "description": "Unique stages are additionally enforced by RiskProbe's local record model."
+    },
+    "candidate_rule_count": {"type": "integer", "minimum": 0},
+    "evidence_passed_count": {"type": "integer", "minimum": 0},
+    "reviewed_rule_count": {"type": "integer", "minimum": 0},
+    "accepted_rule_count": {"type": "integer", "minimum": 0},
+    "anomaly_true_positive_count": {"type": "integer", "minimum": 0},
+    "anomaly_false_positive_count": {"type": "integer", "minimum": 0},
+    "anomaly_false_negative_count": {"type": "integer", "minimum": 0},
+    "root_cause_top3_hit_count": {"type": "integer", "minimum": 0},
+    "root_cause_case_count": {"type": "integer", "minimum": 0},
+    "baseline_task_id": {"type": "string", "description": "Must equal task_id and binds the measured record to its human baseline."},
+    "baseline_fingerprint": {"type": ["string", "null"], "description": "Fingerprint of the immutable human baseline file."}
+  },
+  "$defs": {
+    "stageTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "seconds"],
+      "properties": {
+        "stage": {
+          "type": "string",
+          "enum": ["inspect", "discover", "validate", "monitor", "report"]
+        },
+        "seconds": {"type": "number", "minimum": 0}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "The local BenchmarkRecord validator also requires evidence_passed_count <= candidate_rule_count, accepted_rule_count <= reviewed_rule_count, and root_cause_top3_hit_count <= root_cause_case_count."
+    }
+  ]
+}

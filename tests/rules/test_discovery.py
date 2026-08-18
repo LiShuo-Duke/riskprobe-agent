@@ -255,3 +255,32 @@ def test_discovery_does_not_expand_to_categorical_features() -> None:
     rules = discover_rules(train, ["category"], "target", DiscoveryConfig())
 
     assert rules == []
+
+
+def test_discover_with_metrics_returns_counts_and_train_metrics() -> None:
+    x = [-2.0, -1.0, 1.0, 2.0] * 100
+    y = [-2.0, 1.0, -1.0, 2.0] * 100
+    train = pl.DataFrame(
+        {
+            "x": x,
+            "y": y,
+            "target": [int(left > 0 and right > 0) for left, right in zip(x, y, strict=True)],
+        }
+    )
+    config = DiscoveryConfig(
+        min_support=0.1,
+        max_single_rules=3,
+        beam_width=10,
+        max_pair_rules=2,
+    )
+
+    from riskprobe.rules.discovery import discover_with_metrics
+
+    result = discover_with_metrics(train, ["x", "y"], "target", config)
+
+    assert result.single_candidates_before_cap >= result.single_rules_selected
+    assert result.pair_candidates_before_diversity >= result.pair_rules_selected
+    assert len(result.rules) == result.single_rules_selected + result.pair_rules_selected
+    assert set(result.train_metrics) == {rule.rule_id for rule in result.rules}
+    assert all(metric.lift >= 0 for metric in result.train_metrics.values())
+    assert any(len(rule.conditions) == 2 for rule in result.rules)

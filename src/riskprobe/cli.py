@@ -9,6 +9,7 @@ import click
 import typer
 from typer.core import TyperGroup
 
+from riskprobe import cross_client_cli as _cross_client_cli
 from riskprobe.config import ProjectConfig
 from riskprobe.evals import (
     EvalObservation,
@@ -662,3 +663,7 @@ def rag_query(
             sort_keys=True,
         )
     )
+
+
+_safe_alert_payload = _cross_client_cli._safe_alert_payload
+_cross_client_cli.register_cross_client_commands(app)

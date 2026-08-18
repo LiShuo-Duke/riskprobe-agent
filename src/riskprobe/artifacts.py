@@ -13,6 +13,8 @@ from typing import Any, BinaryIO
 import polars as pl
 from pydantic import BaseModel
 
+from riskprobe.execution.store import ExecutionStore
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
@@ -259,6 +261,58 @@ class RunContext:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
+    def require_binding(
+        self,
+        *,
+        config_fingerprint: str,
+        dataset_id: str | None,
+        time_validation_enabled: bool | None,
+    ) -> None:
+        """Require this context to be a complete run for the supplied public binding."""
+
+        expected = {
+            "config_fingerprint": config_fingerprint,
+            "dataset_id": dataset_id,
+            "time_validation_enabled": time_validation_enabled,
+        }
+        if self._writable or any(
+            self._expected_identity.get(name) != value
+            for name, value in expected.items()
+        ) or not _is_complete_run(
+            self.run_dir,
+            self._expected_identity,
+            self._integrity_anchor,
+        ):
+            raise RuntimeError(f"run {self.run_id} is not complete")
+
+    def read_verified_artifact(self, name: str) -> bytes:
+        """Read one immutable artifact while enforcing its anchored integrity."""
+
+        if name not in _INTEGRITY_ARTIFACTS:
+            raise ValueError("artifact is not readable through the integrity view")
+        self.require_binding(
+            config_fingerprint=str(self._expected_identity["config_fingerprint"]),
+            dataset_id=self._expected_identity["dataset_id"],
+            time_validation_enabled=self._expected_identity["time_validation_enabled"],
+        )
+        try:
+            manifest = json.loads((self.run_dir / "manifest.json").read_bytes())
+            expected_integrity = manifest["artifact_integrity"][name]
+            content = self._target(name).read_bytes()
+        except (KeyError, OSError, TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"run {self.run_id} is not complete") from error
+        actual_integrity = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }
+        if actual_integrity != expected_integrity or not _is_complete_run(
+            self.run_dir,
+            self._expected_identity,
+            self._integrity_anchor,
+        ):
+            raise RuntimeError(f"run {self.run_id} is not complete")
+        return content
+
     def finalize(self) -> None:
         self._ensure_writable()
         if not _is_complete_run(self.run_dir, self._expected_identity):
@@ -277,6 +331,12 @@ class RunContext:
             self._integrity_anchor.unlink(missing_ok=True)
             raise RuntimeError(f"run {self.run_id} is not complete")
         (self.run_dir / ".incomplete").unlink()
+        self._writable = False
+        _release_lock(self._lock_handle)
+        self._lock_handle = None
+
+    def release(self) -> None:
+        """Release the writer lock while intentionally preserving an incomplete run."""
         self._writable = False
         _release_lock(self._lock_handle)
         self._lock_handle = None
@@ -364,8 +424,27 @@ class RunStore:
         try:
             if run_dir.exists():
                 if incomplete.is_file():
-                    shutil.rmtree(run_dir)
-                    integrity_anchor.unlink(missing_ok=True)
+                    runtime_database = ExecutionStore.database_path_for(
+                        self.runs_dir, run_id
+                    )
+                    try:
+                        runtime_database.lstat()
+                    except FileNotFoundError:
+                        shutil.rmtree(run_dir)
+                        integrity_anchor.unlink(missing_ok=True)
+                    else:
+                        if not ExecutionStore.is_secure_database(runtime_database):
+                            raise RuntimeError(
+                                f"run {run_id} does not have a secure runtime database"
+                            )
+                        return RunContext(
+                            run_id,
+                            run_dir,
+                            is_existing=False,
+                            expected_identity=expected_identity,
+                            integrity_anchor=integrity_anchor,
+                            lock_handle=lock_handle,
+                        )
                 elif run_dir.is_dir() and _is_complete_run(
                     run_dir, expected_identity, integrity_anchor
                 ):

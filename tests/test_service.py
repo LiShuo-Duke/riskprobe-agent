@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import json
 import uuid
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from riskprobe.models import Condition, EvidenceCard, RiskRule, RuleMetrics, Sli
 from riskprobe.profiling import DatasetProfile
 from riskprobe.privacy import stable_token
 from riskprobe.reporting import render_risk_report
+from riskprobe.runtime import NodeStatus, RunRuntime
 from riskprobe.service import RiskProbeService
 
 
@@ -168,6 +170,240 @@ def test_inspect_and_discover_return_existing_domain_models(tmp_path: Path) -> N
     assert all(isinstance(rule, RiskRule) for rule in rules)
 
 
+def test_local_handler_reads_inspect_and_discover_from_verified_run_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, PolicyEngine, Principal, Role
+    from riskprobe.registry import DatasetRegistry
+    from riskprobe.tools import (
+        DiscoverRequest,
+        HandlerToolGateway,
+        InspectRequest,
+        LocalRiskProbeToolHandler,
+    )
+
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    context = RiskProbeService(config=config, runs_dir=runs_dir).run()
+    profile_payload = json.loads(
+        (context.run_dir / "data_profile.json").read_text(encoding="utf-8")
+    )
+    expected_rule_ids = tuple(
+        pl.read_parquet(context.run_dir / "candidate_rules.parquet")
+        .get_column("rule_id")
+        .to_list()
+    )
+
+    def reject_recomputation(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("completed run artifacts must be reused")
+
+    monkeypatch.setattr(RiskProbeService, "inspect", reject_recomputation)
+    monkeypatch.setattr(RiskProbeService, "discover", reject_recomputation)
+    handler = LocalRiskProbeToolHandler(
+        run_id=context.run_id,
+        runs_dir=runs_dir,
+        evidence_store=EvidenceStore(tmp_path / "evidence.sqlite3"),
+        run_context=context,
+    )
+    gateway = HandlerToolGateway(
+        registry=DatasetRegistry.from_mapping({config.dataset.id: config}),
+        policy=PolicyEngine(),
+        handler=handler,
+    )
+    principal = Principal(principal_id="artifact-reader", role=Role.OPERATOR)
+
+    inspect = gateway.invoke(
+        principal,
+        InspectRequest(dataset_id=config.dataset.id),
+        Budget(max_queries=1),
+    )
+    discover = gateway.invoke(
+        principal,
+        DiscoverRequest(dataset_id=config.dataset.id),
+        Budget(max_queries=1),
+    )
+
+    assert inspect.model_dump(mode="json") == {
+        "dataset_id": config.dataset.id,
+        "row_count": profile_payload["row_count"],
+        "feature_count": profile_payload["feature_count"],
+        "metadata_grade": profile_payload["metadata_grade"],
+        "issue_codes": sorted(
+            {issue["code"] for issue in profile_payload["issues"]}
+        ),
+    }
+    assert discover.rule_ids == expected_rule_ids
+
+
+def test_local_handler_recommend_uses_verified_profile_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.evidence import EvidenceRecord, EvidenceStore
+    from riskprobe.monitoring.models import FindingKind, FindingSeverity, RiskFinding
+    from riskprobe.policy import Budget, PolicyEngine, Principal, Role
+    from riskprobe.registry import DatasetRegistry
+    from riskprobe.tools import HandlerToolGateway, LocalRiskProbeToolHandler, RecommendRequest
+
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    context = RiskProbeService(config=config, runs_dir=runs_dir).run()
+    store = EvidenceStore(tmp_path / "evidence.sqlite3")
+    finding = RiskFinding(
+        kind=FindingKind.DATA_QUALITY,
+        severity=FindingSeverity.WARNING,
+        code="missing_values",
+        metrics={"affected_count": 10, "affected_rate": 0.05},
+    )
+    finding_id = store.append(
+        EvidenceRecord(
+            run_id=context.run_id,
+            kind="diagnostic.finding",
+            payload={
+                **finding.model_dump(mode="json"),
+                "dataset_id": config.dataset.id,
+            },
+            producer_version="artifact-fast-path-test-v1",
+        )
+    )
+    recomputed = False
+
+    def reject_recomputation(*args: object, **kwargs: object) -> object:
+        nonlocal recomputed
+        del args, kwargs
+        recomputed = True
+        raise AssertionError("completed profile artifact must be reused")
+
+    monkeypatch.setattr(RiskProbeService, "inspect", reject_recomputation)
+    handler = LocalRiskProbeToolHandler(
+        run_id=context.run_id,
+        runs_dir=runs_dir,
+        evidence_store=store,
+        run_context=context,
+    )
+    gateway = HandlerToolGateway(
+        registry=DatasetRegistry.from_mapping({config.dataset.id: config}),
+        policy=PolicyEngine(),
+        handler=handler,
+    )
+
+    response = gateway.invoke(
+        Principal(principal_id="artifact-reader", role=Role.OPERATOR),
+        RecommendRequest(
+            dataset_id=config.dataset.id,
+            evidence_ids=(finding_id,),
+        ),
+        Budget(max_queries=1),
+    )
+
+    assert response.recommendation_ids
+    assert recomputed is False
+
+
+def test_orchestrate_reuses_verified_terminal_result_without_tool_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.agents import SessionStore
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.tools import LocalRiskProbeToolHandler
+
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=runs_dir,
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="cache-reader", role=Role.ANALYST)
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+    session_path = state_dir / f".{first.session_id}.sessions.sqlite3"
+    evidence_path = state_dir / f".{first.session_id}.evidence.sqlite3"
+    result_path = state_dir / f".{first.session_id}.agent-result.json"
+    session_count = len(SessionStore(session_path).replay(first.session_id))
+    evidence_count = len(EvidenceStore(evidence_path).list_run(first.session_id))
+    tool_calls = 0
+
+    def reject_tool_call(*args: object, **kwargs: object) -> object:
+        nonlocal tool_calls
+        del args, kwargs
+        tool_calls += 1
+        raise AssertionError("terminal result reuse must not invoke tools")
+
+    monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject_tool_call)
+    second = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert second == first
+    assert tool_calls == 0
+    assert result_path.is_file()
+    assert result_path.stat().st_mode & 0o777 == 0o600
+    assert len(SessionStore(session_path).replay(first.session_id)) == session_count
+    assert len(EvidenceStore(evidence_path).list_run(first.session_id)) == evidence_count
+
+
+def test_orchestrate_fails_closed_when_terminal_result_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.agents import SessionStore
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.tools import LocalRiskProbeToolHandler
+
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="cache-reader", role=Role.ANALYST)
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+    session_path = state_dir / f".{first.session_id}.sessions.sqlite3"
+    evidence_path = state_dir / f".{first.session_id}.evidence.sqlite3"
+    result_path = state_dir / f".{first.session_id}.agent-result.json"
+    session_count = len(SessionStore(session_path).replay(first.session_id))
+    evidence_count = len(EvidenceStore(evidence_path).list_run(first.session_id))
+    result_path.unlink()
+    tool_calls = 0
+
+    def reject_tool_call(*args: object, **kwargs: object) -> object:
+        nonlocal tool_calls
+        del args, kwargs
+        tool_calls += 1
+        raise AssertionError("incomplete terminal state must not rerun tools")
+
+    monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject_tool_call)
+    with pytest.raises(RuntimeError, match="agent result is unavailable"):
+        service.orchestrate(
+            dataset_id=config.dataset.id,
+            principal=principal,
+            budget=Budget(max_queries=16),
+        )
+
+    assert tool_calls == 0
+    assert not result_path.exists()
+    assert len(SessionStore(session_path).replay(first.session_id)) == session_count
+    assert len(EvidenceStore(evidence_path).list_run(first.session_id)) == evidence_count
+
+
 def test_same_input_produces_byte_for_byte_identical_artifacts(tmp_path: Path) -> None:
     config = _small_config(tmp_path, rows=400)
     first = RiskProbeService(config=config, runs_dir=tmp_path / "runs-a").run()
@@ -193,7 +429,7 @@ def test_service_rejects_tampered_complete_run(tmp_path: Path) -> None:
     assert report.read_text(encoding="utf-8") == "tampered"
 
 
-def test_service_failure_removes_incomplete_run(
+def test_service_failure_preserves_incomplete_run_for_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _small_config(tmp_path)
@@ -206,7 +442,12 @@ def test_service_failure_removes_incomplete_run(
     with pytest.raises(RuntimeError, match="simulated rendering failure"):
         service.run()
 
-    assert [path for path in (tmp_path / "runs").iterdir() if path.is_dir()] == []
+    run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
+    assert len(run_dirs) == 1
+    assert (run_dirs[0] / ".incomplete").is_file()
+    runtime_databases = list((tmp_path / "runs").glob(".*.runtime.sqlite3"))
+    assert len(runtime_databases) == 1
+    assert runtime_databases[0].stat().st_mode & 0o777 == 0o600
     assert list((tmp_path / "runs").glob("*.parquet")) == []
 
 
@@ -380,7 +621,7 @@ def test_artifact_rules_and_slices_have_stable_sorting(
     assert [value for slice_type, value in slices[1:] if slice_type == "segment"] == sorted(
         value for slice_type, value in slices[1:] if slice_type == "segment"
     )
-    assert [value for _, value in slices[1:]] == ["A", "Z"]
+    assert all(value.startswith("segment-") for _, value in slices[1:])
 
 
 def test_report_is_sorted_formatted_and_grade_b_leads_with_limitations() -> None:
@@ -424,7 +665,7 @@ def test_report_is_sorted_formatted_and_grade_b_leads_with_limitations() -> None
     assert "/Users/" not in report
 
 
-def test_outputs_exclude_entity_values_and_paths_but_keep_deidentified_segment_codes(
+def test_outputs_redact_segment_values_and_absolute_input_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _small_config(tmp_path)
@@ -462,8 +703,9 @@ def test_outputs_exclude_entity_values_and_paths_but_keep_deidentified_segment_c
     combined = text_artifacts + b"\n" + logical_parquet
     assert b"private-" not in combined
     assert str(config.dataset.path).encode() not in combined
-    assert b"inst-alpha-deid" in combined
+    assert b"inst-alpha-deid" not in combined
     assert b"inst-beta-deid" not in combined
+    assert b"segment-" in combined
 
 
 def test_holdout_failure_conservatively_downgrades_grade_and_is_reported(
@@ -1114,6 +1356,870 @@ def test_distinct_same_footer_inputs_do_not_reuse_a_completed_run(
     assert second.is_existing is False
 
 
+def test_inspect_and_discover_both_use_stable_input_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path)
+    calls: list[Path] = []
+    real_snapshot = service_module._stable_dataset_snapshot
+
+    @contextmanager
+    def tracked_snapshot(source: Path, *args: object, **kwargs: object):
+        calls.append(source)
+        with real_snapshot(source, *args, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(service_module, "_stable_dataset_snapshot", tracked_snapshot)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    service.inspect()
+    service.discover()
+
+    assert calls == [config.dataset.path, config.dataset.path]
+
+
+def test_code_identity_changes_when_source_content_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "riskprobe"
+    source_root.mkdir()
+    source_file = source_root / "engine.py"
+    source_file.write_text("VERSION = 1\n", encoding="utf-8")
+    monkeypatch.setattr(service_module, "_package_version", lambda: "0.1.0")
+
+    first = service_module._code_identity(source_root)
+    source_file.write_text("VERSION = 2\n", encoding="utf-8")
+    second = service_module._code_identity(source_root)
+
+    assert first.startswith("0.1.0+src-")
+    assert first != second
+
+
+def test_report_failure_preserves_checkpoints_and_resumes_completed_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=100)
+    calls = {"discover": 0, "validate": 0, "render": 0}
+    original_render = service_module.render_risk_report
+
+    def fake_discover(*args: object, **kwargs: object) -> list[RiskRule]:
+        calls["discover"] += 1
+        return [_rule()]
+
+    def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
+        calls["validate"] += 1
+        return [_card()]
+
+    def fail_first_render(*args: object, **kwargs: object) -> str:
+        calls["render"] += 1
+        if calls["render"] == 1:
+            raise RuntimeError("simulated rendering failure")
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+    monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+        service.run()
+
+    run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    assert (run_dir / ".incomplete").is_file()
+    runtime = RunRuntime(tmp_path / "runs", run_dir.name)
+    assert runtime.node_status("discover") is NodeStatus.SUCCEEDED
+    assert runtime.node_status("validate") is NodeStatus.SUCCEEDED
+    assert runtime.node_status("report") is NodeStatus.FAILED
+
+    service.run()
+
+    assert calls == {"discover": 1, "validate": 1, "render": 2}
+    assert runtime.node_status("finalize") is NodeStatus.SUCCEEDED
+    assert not (run_dir / ".incomplete").exists()
+
+
+def test_tampered_rule_checkpoint_invalidates_it_and_downstream_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=100)
+    calls = {"discover": 0, "validate": 0, "render": 0}
+    original_render = service_module.render_risk_report
+
+    def fake_discover(*args: object, **kwargs: object) -> list[RiskRule]:
+        calls["discover"] += 1
+        return [_rule()]
+
+    def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
+        calls["validate"] += 1
+        return [_card()]
+
+    def fail_first_render(*args: object, **kwargs: object) -> str:
+        calls["render"] += 1
+        if calls["render"] == 1:
+            raise RuntimeError("simulated rendering failure")
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+    monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+        service.run()
+
+    run_dir = next(path for path in (tmp_path / "runs").iterdir() if path.is_dir())
+    (run_dir / "candidate_rules.parquet").write_bytes(b"tampered checkpoint")
+
+    service.run()
+
+    assert calls == {"discover": 2, "validate": 2, "render": 2}
+    runtime = RunRuntime(tmp_path / "runs", run_dir.name)
+    invalidated = [
+        event["node_id"]
+        for event in runtime.trace()
+        if event["event_type"] == "node_invalidated"
+    ]
+    assert invalidated == ["discover", "validate", "report"]
+    assert not (run_dir / ".incomplete").exists()
+
+
+def test_missing_evidence_checkpoint_recomputes_validate_and_report_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=100)
+    calls = {"discover": 0, "validate": 0, "render": 0}
+    original_render = service_module.render_risk_report
+
+    def fake_discover(*args: object, **kwargs: object) -> list[RiskRule]:
+        calls["discover"] += 1
+        return [_rule()]
+
+    def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
+        calls["validate"] += 1
+        return [_card()]
+
+    def fail_first_render(*args: object, **kwargs: object) -> str:
+        calls["render"] += 1
+        if calls["render"] == 1:
+            raise RuntimeError("simulated rendering failure")
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+    monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+        service.run()
+
+    run_dir = next(path for path in (tmp_path / "runs").iterdir() if path.is_dir())
+    (run_dir / "evidence_cards.json").unlink()
+
+    service.run()
+
+    assert calls == {"discover": 1, "validate": 2, "render": 2}
+    runtime = RunRuntime(tmp_path / "runs", run_dir.name)
+    invalidated = [
+        event["node_id"]
+        for event in runtime.trace()
+        if event["event_type"] == "node_invalidated"
+    ]
+    assert invalidated == ["validate", "report"]
+
+
+def test_artifact_producing_checkpoints_record_verified_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=100)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr("riskprobe.service.validate_rules", lambda *args, **kwargs: [_card()])
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+    runtime = RunRuntime(tmp_path / "runs", result.run_id)
+
+    expected = {
+        "partition": {"data_profile.json"},
+        "discover": {"candidate_rules.parquet"},
+        "validate": {"evidence_cards.json"},
+        "report": {"metadata_report.json", "risk_report.md"},
+        "finalize": {"manifest.json"},
+    }
+    for node_id, filenames in expected.items():
+        checkpoint = runtime.checkpoint(
+            node_id,
+            input_fingerprint=service_module._node_input_fingerprint(result.run_id, node_id),
+        )
+        assert checkpoint is not None
+        assert {reference.filename for reference in checkpoint.artifact_refs} == filenames
+        assert all(reference.schema_version for reference in checkpoint.artifact_refs)
+
+
+def test_immutable_publish_remains_success_when_runtime_success_recording_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=100)
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    original_succeed = RunRuntime.succeed_node
+    failed = False
+
+    def fail_finalize_once(
+        self: RunRuntime,
+        node_id: str,
+        **kwargs: object,
+    ):
+        nonlocal failed
+        if node_id == "finalize" and not failed:
+            failed = True
+            raise OSError("simulated runtime write failure after publish")
+        return original_succeed(self, node_id, **kwargs)
+
+    monkeypatch.setattr(RunRuntime, "succeed_node", fail_finalize_once)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    published = service.run()
+
+    assert failed is True
+    assert not (published.run_dir / ".incomplete").exists()
+    assert {path.name for path in published.run_dir.iterdir()} == {
+        "manifest.json",
+        "metadata_report.json",
+        "data_profile.json",
+        "candidate_rules.parquet",
+        "evidence_cards.json",
+        "risk_report.md",
+    }
+
+    reused = service.run()
+    runtime = RunRuntime(tmp_path / "runs", published.run_id)
+    assert reused.is_existing is True
+    assert runtime.node_status("finalize") is NodeStatus.SUCCEEDED
+    assert any(event["event_type"] == "run_reconciled" for event in runtime.trace())
+
+
+def test_real_token_shaped_segment_is_redacted_once_across_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(tmp_path, rows=100)
+    real_segment = "segment-deadbeef"
+    token = f"segment-{hashlib.sha256(real_segment.encode()).hexdigest()[:8]}"
+    double_token = f"segment-{hashlib.sha256(token.encode()).hexdigest()[:8]}"
+    card = _card(
+        slices=(
+            SliceMetrics(
+                slice_type="segment",
+                slice_value=real_segment,
+                metrics=_metrics(1.5),
+            ),
+        ),
+        limitations=(f"single-class institution: {real_segment}",),
+    )
+    calls = {"validate": 0, "render": 0}
+    original_render = service_module.render_risk_report
+
+    def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
+        calls["validate"] += 1
+        return [card]
+
+    def fail_first_render(*args: object, **kwargs: object) -> str:
+        calls["render"] += 1
+        if calls["render"] == 1:
+            raise RuntimeError("simulated rendering failure")
+        return original_render(*args, **kwargs)
+
+    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+    monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+        service.run()
+
+    run_dir = next(path for path in (tmp_path / "runs").iterdir() if path.is_dir())
+    first_evidence = (run_dir / "evidence_cards.json").read_bytes()
+    assert real_segment.encode() not in first_evidence
+    assert token.encode() in first_evidence
+
+    service.run()
+
+    final_evidence = (run_dir / "evidence_cards.json").read_bytes()
+    report = (run_dir / "risk_report.md").read_text(encoding="utf-8")
+    assert calls == {"validate": 1, "render": 2}
+    assert final_evidence == first_evidence
+    assert real_segment not in report
+    assert token in report
+    assert double_token not in report
+
+
+def test_local_handler_filters_private_controlled_recommendation_before_persist(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    from riskprobe.agents.decision_contracts import DecisionProposal, DecisionSource
+    from riskprobe.agents.decision_controller import DecisionController
+    from riskprobe.agents.decision_providers import (
+        DecisionProviderMode,
+        _DecisionProviderBinding,
+        _DecisionProviderIdentity,
+        _DecisionProviderRole,
+    )
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, PolicyEngine, Principal, Role
+    from riskprobe.recommendations.policy import applicable_action_codes
+    from riskprobe.registry import DatasetRegistry
+    from riskprobe.tools import HandlerToolGateway, LocalRiskProbeToolHandler
+    from riskprobe.tools.models import (
+        DiscoverResponse,
+        InspectResponse,
+        _ControlledRecommendRequest,
+    )
+
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    service = RiskProbeService(config=config, runs_dir=runs_dir)
+    context = service.run()
+    store = EvidenceStore(tmp_path / "controlled-evidence.sqlite3")
+    diagnosis = service._diagnose_with_store(
+        context.run_id,
+        store,
+        dataset_id=config.dataset.id,
+    )
+    profile = service._profile_from_run(context)
+    rules = service._rules_from_run(context)
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    controller = DecisionController(store, clock=lambda: now)
+    preparation = controller.prepare(
+        session_id=context.run_id,
+        attempt=0,
+        anchor_node_id="a" * 64,
+        diagnosis_evidence_ids=diagnosis.finding_ids,
+        inspect_response=InspectResponse(
+            dataset_id=config.dataset.id,
+            row_count=profile.row_count,
+            feature_count=profile.feature_count,
+            metadata_grade=profile.metadata_grade,
+            issue_codes=profile.issue_codes,
+        ),
+        discover_response=DiscoverResponse(
+            dataset_id=config.dataset.id,
+            rule_ids=tuple(sorted(rule.rule_id for rule in rules)),
+        ),
+        orchestrator_version="orchestrator-v1",
+        planner_version="planner-v1",
+    )
+    selected_action = applicable_action_codes(
+        item.finding for item in preparation.context.findings
+    )[0]
+    primary_provider = _DecisionProviderIdentity(
+        provider_id="test-host",
+        mode=DecisionProviderMode.EXTERNAL_HOST,
+        version="test-host-v1",
+    )
+    provider_binding = _DecisionProviderBinding(
+        primary=primary_provider,
+        fallback=_DecisionProviderIdentity(
+            provider_id="deterministic",
+            mode=DecisionProviderMode.DETERMINISTIC,
+            version="deterministic-decision-provider-v1",
+        ),
+        selected=primary_provider,
+        selected_role=_DecisionProviderRole.PRIMARY,
+    )
+    submission = controller.submit(
+        context_evidence_id=preparation.context_evidence_id,
+        proposal=DecisionProposal(
+            context_id=preparation.context.context_id,
+            diagnosis_evidence_ids=preparation.context.diagnosis_evidence_ids,
+            action_codes=(selected_action,),
+            source=DecisionSource.EXTERNAL_HOST,
+            source_version="test-host-v1",
+        ),
+        provider_binding=provider_binding,
+    )
+    handler = LocalRiskProbeToolHandler(
+        run_id=context.run_id,
+        runs_dir=runs_dir,
+        evidence_store=store,
+        run_context=context,
+        decision_controller=controller,
+    )
+    gateway = HandlerToolGateway(
+        registry=DatasetRegistry.from_mapping({config.dataset.id: config}),
+        policy=PolicyEngine(),
+        handler=handler,
+    )
+
+    response = gateway.invoke(
+        Principal(principal_id="controlled-reader", role=Role.OPERATOR),
+        _ControlledRecommendRequest(
+            dataset_id=config.dataset.id,
+            evidence_ids=diagnosis.finding_ids,
+            decision_result_evidence_id=submission.result_evidence_id,
+        ),
+        Budget(max_queries=1),
+    )
+
+    assert response.recommendation_ids
+    persisted_actions = {
+        store.get(evidence_id).payload["action_code"]  # type: ignore[union-attr]
+        for evidence_id in response.recommendation_ids
+    }
+    assert persisted_actions == {selected_action.value}
+
+
+def test_orchestrate_runtime_provider_config_preserves_v1_run_identity(
+    tmp_path: Path,
+) -> None:
+    from riskprobe.agents.decision_providers import (
+        DecisionProviderConfig,
+        DecisionProviderMode,
+    )
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, Principal, Role
+
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    baseline = RiskProbeService(config=config, runs_dir=runs_dir).run()
+    service = RiskProbeService(
+        config=config,
+        runs_dir=runs_dir,
+        state_dir=tmp_path / "deterministic-state",
+        decision_provider_config=DecisionProviderConfig(
+            mode=DecisionProviderMode.DETERMINISTIC
+        ),
+    )
+
+    result = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=Principal(
+            principal_id="deterministic-runtime-reader",
+            role=Role.ANALYST,
+        ),
+        budget=Budget(max_queries=16),
+    )
+
+    assert result.session_id == baseline.run_id
+    assert result.tool_sequence == (
+        "inspect",
+        "diagnose",
+        "discover",
+        "recommend",
+        "review",
+    )
+    assert {path.name for path in baseline.run_dir.iterdir()} == {
+        "manifest.json",
+        "metadata_report.json",
+        "data_profile.json",
+        "candidate_rules.parquet",
+        "evidence_cards.json",
+        "risk_report.md",
+    }
+    records = EvidenceStore(
+        tmp_path
+        / "deterministic-state"
+        / f".{result.session_id}.evidence.sqlite3"
+    ).list_run(result.session_id)
+    proposal = next(record for record in records if record.kind == "decision.proposal")
+    binding = proposal.payload["provider_binding"]
+    assert binding["selected_role"] == "primary"
+    assert binding["primary"]["mode"] == "deterministic"
+    assert binding["fallback"]["mode"] == "deterministic"
+
+
+def test_orchestrate_uses_strict_injected_external_host_proposal(
+    tmp_path: Path,
+) -> None:
+    from riskprobe.agents.decision_contracts import (
+        DecisionContext,
+        DecisionProposal,
+        DecisionSource,
+    )
+    from riskprobe.agents.decision_providers import (
+        DecisionDisposition,
+        DecisionProviderConfig,
+        DecisionProviderMode,
+        DecisionProviderResolution,
+        DeterministicDecisionProvider,
+    )
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, Principal, Role
+
+    class ExternalHost:
+        mode = DecisionProviderMode.EXTERNAL_HOST
+        provider_id = "service-external-host"
+        version = "service-external-host-v1"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(
+            self,
+            *,
+            context: DecisionContext,
+        ) -> DecisionProviderResolution:
+            assert type(context) is DecisionContext
+            self.calls += 1
+            deterministic = DeterministicDecisionProvider().resolve(
+                context=context
+            ).proposal
+            assert deterministic is not None
+            return DecisionProviderResolution(
+                disposition=DecisionDisposition.PROPOSAL,
+                proposal=DecisionProposal(
+                    context_id=context.context_id,
+                    diagnosis_evidence_ids=context.diagnosis_evidence_ids,
+                    action_codes=deterministic.action_codes,
+                    source=DecisionSource.EXTERNAL_HOST,
+                    source_version=self.version,
+                ),
+            )
+
+    provider = ExternalHost()
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "external-state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+        decision_provider_config=DecisionProviderConfig(
+            mode=DecisionProviderMode.EXTERNAL_HOST,
+            provider_id=provider.provider_id,
+            provider_version=provider.version,
+        ),
+        decision_provider=provider,
+    )
+
+    result = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=Principal(
+            principal_id="external-runtime-reader",
+            role=Role.ANALYST,
+        ),
+        budget=Budget(max_queries=16),
+    )
+
+    assert result.review.approved is True
+    assert provider.calls == 1
+    records = EvidenceStore(
+        state_dir / f".{result.session_id}.evidence.sqlite3"
+    ).list_run(result.session_id)
+    proposal = next(record for record in records if record.kind == "decision.proposal")
+    binding = proposal.payload["provider_binding"]
+    assert binding["selected_role"] == "primary"
+    assert binding["selected"] == {
+        "provider_id": provider.provider_id,
+        "mode": "external_host",
+        "version": provider.version,
+    }
+
+
+@pytest.mark.parametrize("provider_behavior", ("pending", "error"))
+def test_orchestrate_caches_provider_unavailable_without_reinvoking_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_behavior: str,
+) -> None:
+    from riskprobe.agents.contracts import AgentStatus, ReviewReason
+    from riskprobe.agents.decision_providers import (
+        DecisionDisposition,
+        DecisionProviderError,
+        DecisionProviderMode,
+        DecisionProviderResolution,
+        DisabledDecisionProvider,
+    )
+    from riskprobe.agents.sessions import SessionStore
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, Principal, Role
+
+    calls = 0
+
+    def unavailable(
+        self: object,
+        *,
+        context: object,
+    ) -> DecisionProviderResolution:
+        nonlocal calls
+        del self, context
+        calls += 1
+        if provider_behavior == "pending":
+            return DecisionProviderResolution(
+                disposition=DecisionDisposition.PENDING
+            )
+        raise DecisionProviderError("private service provider failure")
+
+    monkeypatch.setattr(
+        DisabledDecisionProvider,
+        "mode",
+        DecisionProviderMode.EXTERNAL_HOST,
+    )
+    monkeypatch.setattr(
+        DisabledDecisionProvider,
+        "provider_id",
+        f"service-{provider_behavior}-host",
+    )
+    monkeypatch.setattr(
+        DisabledDecisionProvider,
+        "version",
+        "service-unavailable-host-v1",
+    )
+    monkeypatch.setattr(DisabledDecisionProvider, "resolve", unavailable)
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    principal = Principal(
+        principal_id="unavailable-cache-reader",
+        role=Role.ANALYST,
+    )
+
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert first.status is AgentStatus.REJECTED
+    assert ReviewReason.TOOL_FAILURE in first.review.reason_codes
+    assert calls == 1
+    result_path = state_dir / f".{first.session_id}.agent-result.json"
+    assert result_path.is_file()
+    evidence_store = EvidenceStore(
+        state_dir / f".{first.session_id}.evidence.sqlite3"
+    )
+    unavailable_record = next(
+        record
+        for record in evidence_store.list_run(first.session_id)
+        if record.kind == "decision.unavailable"
+    )
+    assert unavailable_record.payload["reason"] == f"provider_{provider_behavior}"
+    assert "private service provider failure" not in unavailable_record.model_dump_json()
+    session_nodes = SessionStore(
+        state_dir / f".{first.session_id}.sessions.sqlite3"
+    ).replay(first.session_id)
+    assert not any(
+        node.tool_call is not None and node.tool_call.tool_name == "recommend"
+        for node in session_nodes
+    )
+
+    replay_calls = 0
+
+    def reject_replay(*args: object, **kwargs: object) -> object:
+        nonlocal replay_calls
+        del args, kwargs
+        replay_calls += 1
+        raise AssertionError("cache replay must not invoke provider")
+
+    monkeypatch.setattr(DisabledDecisionProvider, "resolve", reject_replay)
+
+    second = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert second == first
+    assert replay_calls == 0
+
+
+def test_orchestrate_default_fallback_is_sidecar_only_and_cache_skips_decision_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.agents.decision_controller import DecisionController
+    from riskprobe.agents.decision_providers import (
+        DeterministicDecisionProvider,
+        DisabledDecisionProvider,
+    )
+    from riskprobe.agents.sessions import SessionStore
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.tools import LocalRiskProbeToolHandler
+
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=runs_dir,
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="decision-cache-reader", role=Role.ANALYST)
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+    evidence_path = state_dir / f".{first.session_id}.evidence.sqlite3"
+    session_path = state_dir / f".{first.session_id}.sessions.sqlite3"
+    evidence_store = EvidenceStore(evidence_path)
+    records = evidence_store.list_run(first.session_id)
+    assert [record.kind for record in records].count("decision.context") == 1
+    assert [record.kind for record in records].count("decision.proposal") == 1
+    assert [record.kind for record in records].count("decision.result") == 1
+    assert all(
+        EvidenceStore.content_id(record) not in first.evidence_ids
+        for record in records
+        if record.kind.startswith("decision.")
+    )
+    run_dir = runs_dir / first.session_id
+    assert {path.name for path in run_dir.iterdir()} == {
+        "manifest.json",
+        "metadata_report.json",
+        "data_profile.json",
+        "candidate_rules.parquet",
+        "evidence_cards.json",
+        "risk_report.md",
+    }
+    session_count = len(SessionStore(session_path).replay(first.session_id))
+    evidence_count = len(records)
+    calls = {"prepare": 0, "submit": 0, "disabled": 0, "fallback": 0, "tool": 0}
+
+    def reject(name: str):
+        def fail(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            calls[name] += 1
+            raise AssertionError(f"cache hit must not call {name}")
+
+        return fail
+
+    monkeypatch.setattr(DecisionController, "prepare", reject("prepare"))
+    monkeypatch.setattr(DecisionController, "submit", reject("submit"))
+    monkeypatch.setattr(DisabledDecisionProvider, "resolve", reject("disabled"))
+    monkeypatch.setattr(
+        DeterministicDecisionProvider,
+        "resolve",
+        reject("fallback"),
+    )
+    monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject("tool"))
+
+    second = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert second == first
+    assert calls == {"prepare": 0, "submit": 0, "disabled": 0, "fallback": 0, "tool": 0}
+    assert len(SessionStore(session_path).replay(first.session_id)) == session_count
+    assert len(EvidenceStore(evidence_path).list_run(first.session_id)) == evidence_count
+
+
+def test_orchestrate_cache_fails_closed_when_decision_evidence_is_tampered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.tools import LocalRiskProbeToolHandler
+
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="tamper-reader", role=Role.ANALYST)
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+    evidence_path = state_dir / f".{first.session_id}.evidence.sqlite3"
+    with sqlite3.connect(evidence_path) as connection:
+        connection.execute(
+            "UPDATE evidence_records SET kind = ? WHERE kind = ?",
+            ("decision.proposal", "decision.result"),
+        )
+        connection.commit()
+    tool_calls = 0
+
+    def reject_tool_call(*args: object, **kwargs: object) -> object:
+        nonlocal tool_calls
+        del args, kwargs
+        tool_calls += 1
+        raise AssertionError("tampered cache must not invoke tools")
+
+    monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject_tool_call)
+
+    with pytest.raises(RuntimeError, match="^agent result is unavailable$"):
+        service.orchestrate(
+            dataset_id=config.dataset.id,
+            principal=principal,
+            budget=Budget(max_queries=16),
+        )
+
+    assert tool_calls == 0
+
+
+def test_public_recommendation_v1_signatures_remain_exact() -> None:
+    import inspect
+
+    from riskprobe.recommendations import build_recommendations
+    from riskprobe.tools import RecommendRequest, RecommendResponse
+
+    assert set(RecommendRequest.model_fields) == {"dataset_id", "evidence_ids"}
+    assert set(RecommendResponse.model_fields) == {
+        "dataset_id",
+        "recommendation_ids",
+    }
+    assert list(inspect.signature(RiskProbeService.recommend).parameters) == [
+        "self",
+        "run_id",
+        "evidence_ids",
+        "all_current_diagnostics",
+    ]
+    assert list(inspect.signature(build_recommendations).parameters) == [
+        "report",
+        "metadata_grade",
+    ]
+
+
+def test_local_handler_rejects_diagnostics_from_snapshot_outside_bound_run(
+    tmp_path: Path,
+) -> None:
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, PolicyEngine, Principal, Role
+    from riskprobe.registry import DatasetRegistry
+    from riskprobe.tools import (
+        DiagnoseRequest,
+        HandlerToolGateway,
+        LocalRiskProbeToolHandler,
+        ToolContractError,
+    )
+
+    config = _small_config(tmp_path)
+    runs_dir = tmp_path / "runs"
+    context = RiskProbeService(config=config, runs_dir=runs_dir).run()
+    pl.read_parquet(config.dataset.path).head(80).write_parquet(config.dataset.path)
+    store = EvidenceStore(tmp_path / "bound-diagnosis.sqlite3")
+    handler = LocalRiskProbeToolHandler(
+        run_id=context.run_id,
+        runs_dir=runs_dir,
+        evidence_store=store,
+        run_context=context,
+    )
+    gateway = HandlerToolGateway(
+        registry=DatasetRegistry.from_mapping({config.dataset.id: config}),
+        policy=PolicyEngine(),
+        handler=handler,
+    )
+
+    with pytest.raises(ToolContractError, match="^tool handler failed$"):
+        gateway.invoke(
+            Principal(principal_id="snapshot-reader", role=Role.ANALYST),
+            DiagnoseRequest(dataset_id=config.dataset.id),
+            Budget(max_queries=1),
+        )
+
+    assert store.list_run(context.run_id) == ()
 def test_below_b_metadata_grade_blocks_rule_discovery(tmp_path: Path) -> None:
     config = _small_config(tmp_path).model_copy(update={"metadata_grade_override": "C"})
     service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")

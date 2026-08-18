@@ -1,33 +1,38 @@
-import hashlib
+from __future__ import annotations
+
 import json
-import stat
-import time
-from datetime import UTC, datetime
-from importlib.metadata import PackageNotFoundError, version
+from enum import Enum
 from pathlib import Path
-from typing import NoReturn, Sequence
+from typing import TYPE_CHECKING, NoReturn, Sequence
 
 import click
-import polars as pl
 import typer
-
-from riskprobe.adapters.company import preflight_company_dataset
-from riskprobe.adapters.home_credit import HomeCreditPaths, prepare_home_credit
-from riskprobe.benchmarking import BenchmarkRecord, StageTiming, total_agent_minutes
-from riskprobe.features.catalog import FeatureCatalog
-from riskprobe.io.parquet import ParquetDataset
-from riskprobe.models import EvidenceCard, RiskRule, RuleMetrics
-from riskprobe.monitoring.detection import detect_anomalies
-from riskprobe.monitoring.diagnosis import diagnose_alerts
-from riskprobe.monitoring.injection import DetectionScore, DriftScenario, evaluate_alerts, inject_drift
-from riskprobe.monitoring.reference import build_reference_snapshot
-from riskprobe.privacy import assert_safe_payload, stable_token
 from typer.core import TyperGroup
 
+from riskprobe import cross_client_cli as _cross_client_cli
 from riskprobe.config import ProjectConfig
-from riskprobe.resume_evidence import aggregate_benchmarks, render_markdown
+from riskprobe.evals import (
+    EvalObservation,
+    EvalObservationV2,
+    EvalSuite,
+    EvalSuiteV2,
+)
+from riskprobe.policy import Budget, Principal, Role
 from riskprobe.service import RiskProbeService
 from riskprobe.synthetic import generate_behavior_dataset
+
+if TYPE_CHECKING:
+    from riskprobe.agents.decision_providers import DecisionProviderConfig
+
+
+class EvalVersion(str, Enum):
+    V1 = "v1"
+    V2 = "v2"
+
+
+class AgentDecisionProviderMode(str, Enum):
+    DISABLED = "disabled"
+    DETERMINISTIC = "deterministic"
 
 
 class StructuredErrorGroup(TyperGroup):
@@ -78,20 +83,109 @@ def _fail(category: str, message: str) -> NoReturn:
     raise typer.Exit(code=2)
 
 
-def _service(config: Path | None, runs_dir: Path | None) -> RiskProbeService:
-    if config is None or runs_dir is None:
-        _fail("input_error", "Provide both --config and --runs-dir local paths.")
+def _service(
+    config: Path | None,
+    runs_dir: Path | None,
+    state_dir: Path | None = None,
+    decision_provider_config: DecisionProviderConfig | None = None,
+) -> RiskProbeService:
+    if runs_dir is None:
+        _fail("input_error", "Provide a local --runs-dir path.")
+    project_config: ProjectConfig | None = None
+    if config is not None:
+        try:
+            project_config = ProjectConfig.from_yaml(config)
+        except Exception:
+            _fail(
+                "configuration_error",
+                "Check that --config names a readable, valid local YAML configuration.",
+            )
     try:
-        project_config = ProjectConfig.from_yaml(config)
-    except Exception:
-        _fail(
-            "configuration_error",
-            "Check that --config names a readable, valid local YAML configuration.",
+        return RiskProbeService(
+            config=project_config,
+            runs_dir=runs_dir,
+            state_dir=state_dir,
+            decision_provider_config=decision_provider_config,
         )
-    try:
-        return RiskProbeService(config=project_config, runs_dir=runs_dir)
     except Exception:
         _fail("runs_directory_error", "Choose a writable local --runs-dir directory.")
+
+
+def _read_json(path: Path, *, category: str, message: str) -> object:
+    try:
+        encoded = path.read_bytes()
+        if len(encoded) > 16 * 1024 * 1024:
+            raise ValueError
+        return json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_object)
+    except Exception:
+        _fail(category, message)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _observations(
+    path: Path,
+    *,
+    model: type[EvalObservation] | type[EvalObservationV2],
+) -> dict[str, EvalObservation | EvalObservationV2]:
+    payload = _read_json(
+        path,
+        category="evaluation_error",
+        message="Check the frozen local suite and observations JSON, then rerun evaluate.",
+    )
+    if type(payload) is not dict or set(payload) != {"observations"}:
+        _fail(
+            "evaluation_error",
+            "Check the frozen local suite and observations JSON, then rerun evaluate.",
+        )
+    items = payload["observations"]
+    if type(items) is not list:
+        _fail(
+            "evaluation_error",
+            "Check the frozen local suite and observations JSON, then rerun evaluate.",
+        )
+    observations: dict[str, EvalObservation | EvalObservationV2] = {}
+    try:
+        for item in items:
+            observation = model.model_validate_json(
+                json.dumps(
+                    item,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            if observation.case_id in observations:
+                raise ValueError
+            observations[observation.case_id] = observation
+    except Exception:
+        _fail(
+            "evaluation_error",
+            "Check the frozen local suite and observations JSON, then rerun evaluate.",
+        )
+    return observations
+
+
+def _write_report(path: Path, payload: object) -> None:
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ) + "\n"
+        path.write_text(encoded, encoding="utf-8")
+    except Exception:
+        _fail("output_error", "Choose a writable local --output JSON path.")
 
 
 @app.command()
@@ -206,359 +300,192 @@ def run(
     )
 
 
-def _monitoring_inputs(config: ProjectConfig):
-    dataset = ParquetDataset(config.dataset.path)
-    profile = RiskProbeService(config=config, runs_dir=Path(".")).inspect()
-    roles = (config.columns.entity, config.columns.snapshot, config.columns.segment, config.columns.target)
-    features = config.features.select_columns(dataset.schema().names(), roles)
-    frame = dataset.collect([config.columns.segment, config.columns.target, *features])
-    return frame, profile, FeatureCatalog.from_columns(features, config.features.families)
-
-
-def _safe_alert_payload(alert: object, *, expose_segment_values: bool) -> dict[str, object]:
-    payload = alert.model_dump(mode="json")
-    if payload.get("scope") == "institution":
-        scope_value = str(payload["scope_value"])
-        payload["scope_value"] = stable_token(scope_value)
-        if expose_segment_values:
-            payload["institution_name"] = scope_value
-    assert_safe_payload(payload)
-    return payload
-
-
-def _safe_diagnosis_payload(
-    diagnosis: object, *, expose_segment_values: bool
-) -> dict[str, object]:
-    payload = diagnosis.model_dump(mode="json")
-    for cause in payload.get("root_causes", []):
-        if not isinstance(cause, dict):
-            continue
-        value = cause.get("value")
-        if cause.get("dimension") == "institution" and expose_segment_values:
-            cause["institution_name"] = value
-        cause["value"] = (
-            value
-            if cause.get("dimension") == "institution" and expose_segment_values
-            else stable_token(value)
-        )
-    assert_safe_payload(payload)
-    return payload
-
-
-def _write_monitoring_json(output_dir: Path, name: str, payload: object) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / name).write_text(
-        json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-
 @app.command()
-def snapshot(
+def diagnose(
     config: Path = typer.Option(..., help="Local YAML project configuration."),
     runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+    run_id: str | None = typer.Option(
+        None,
+        help="Existing run ID; omit to create or reuse the authoritative local run.",
+    ),
+    state_dir: Path | None = typer.Option(None, help="Optional mutable sidecar directory."),
 ) -> None:
-    """Create an aggregate-only monitoring reference snapshot."""
+    """Persist aggregate diagnostic evidence for one local run."""
+    service = _service(config, runs_dir, state_dir)
+    try:
+        effective_run_id = service.run().run_id if run_id is None else run_id
+        response = service.diagnose(run_id=effective_run_id)
+    except Exception:
+        _fail(
+            "diagnosis_error",
+            "Check the local run and dataset, then rerun diagnose.",
+        )
+    typer.echo(
+        json.dumps(
+            {
+                "command": "diagnose",
+                "finding_count": response.finding_count,
+                "finding_ids": list(response.finding_ids),
+                "run_id": effective_run_id,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command()
+def recommend(
+    config: Path = typer.Option(..., help="Local YAML project configuration."),
+    runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+    run_id: str = typer.Option(..., help="Existing 16-character local run identifier."),
+    evidence_id: list[str] = typer.Option(
+        [],
+        "--evidence-id",
+        help="Diagnostic evidence ID; repeat for multiple findings.",
+    ),
+    all_current_diagnostics: bool = typer.Option(
+        False,
+        "--all-current-diagnostics",
+        help="Run diagnostics now and recommend from exactly that same-run result.",
+    ),
+    state_dir: Path | None = typer.Option(None, help="Optional mutable sidecar directory."),
+) -> None:
+    """Persist evidence-linked, human-gated local recommendations."""
+    if all_current_diagnostics == bool(evidence_id):
+        _fail(
+            "input_error",
+            "Provide either --evidence-id values or --all-current-diagnostics.",
+        )
+    service = _service(config, runs_dir, state_dir)
+    try:
+        if all_current_diagnostics:
+            response = service.recommend(
+                run_id=run_id,
+                evidence_ids=(),
+                all_current_diagnostics=True,
+            )
+        else:
+            response = service.recommend(
+                run_id=run_id,
+                evidence_ids=tuple(evidence_id),
+            )
+    except Exception:
+        _fail(
+            "recommendation_error",
+            "Check the local run and diagnostic evidence, then rerun recommend.",
+        )
+    typer.echo(
+        json.dumps(
+            {
+                "command": "recommend",
+                "recommendation_count": response.recommendation_count,
+                "recommendation_ids": list(response.recommendation_ids),
+                "run_id": run_id,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command()
+def status(
+    config: Path | None = typer.Option(
+        None,
+        help="Optional local YAML configuration; not needed for runtime status.",
+    ),
+    runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+    run_id: str = typer.Option(..., help="Existing 16-character local run identifier."),
+) -> None:
+    """Print a bounded local runtime status."""
     service = _service(config, runs_dir)
     try:
-        context, reference = service.monitoring_snapshot()
+        response = service.status(run_id=run_id)
     except Exception:
-        _fail("snapshot_error", "Check the local configuration and source data, then rerun snapshot.")
-    typer.echo(json.dumps({"command": "snapshot", "reference_run_id": context.run_id, "snapshot_id": reference.snapshot_id}, sort_keys=True))
+        _fail("runtime_error", "Check the local run identifier, then rerun status.")
+    typer.echo(
+        json.dumps(
+            {"command": "status", **response.model_dump(mode="json")},
+            sort_keys=True,
+        )
+    )
 
 
 @app.command()
-def monitor(
-    reference_run_id: str = typer.Option(..., help="Existing monitoring reference run ID."),
-    current_config: Path = typer.Option(..., help="Local YAML configuration for current data."),
-    runs_dir: Path = typer.Option(..., help="Local monitoring runs directory."),
+def trace(
+    config: Path | None = typer.Option(
+        None,
+        help="Optional local YAML configuration; not needed for runtime trace.",
+    ),
+    runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+    run_id: str = typer.Option(..., help="Existing 16-character local run identifier."),
+    node_id: str | None = typer.Option(None, help="Optional public runtime node ID."),
 ) -> None:
-    """Compare a current local dataset to an aggregate reference snapshot."""
+    """Print a redacted local runtime trace."""
+    service = _service(config, runs_dir)
     try:
-        reference = __import__("riskprobe.monitoring.models", fromlist=["ReferenceSnapshot"]).ReferenceSnapshot.model_validate_json(
-            (runs_dir / "monitoring" / reference_run_id / "reference_snapshot.json").read_text(encoding="utf-8")
-        )
-        current = ProjectConfig.from_yaml(current_config)
-        frame, _, catalog = _monitoring_inputs(current)
-        alerts = detect_anomalies(reference, frame, (), catalog)
-        diagnoses = diagnose_alerts(alerts, reference, frame, catalog, top_k=3)
-        output_dir = runs_dir / "monitoring" / reference_run_id / "current"
-        _write_monitoring_json(
-            output_dir,
-            "anomaly_alerts.json",
-            [
-                _safe_alert_payload(
-                    item, expose_segment_values=current.privacy.expose_segment_values
-                )
-                for item in alerts
-            ],
-        )
-        _write_monitoring_json(
-            output_dir,
-            "diagnoses.json",
-            [
-                _safe_diagnosis_payload(
-                    item, expose_segment_values=current.privacy.expose_segment_values
-                )
-                for item in diagnoses
-            ],
-        )
+        response = service.trace(run_id=run_id, node_id=node_id)
     except Exception:
-        _fail("monitor_error", "Check the aggregate reference run and current local configuration.")
-    typer.echo(json.dumps({"alert_count": len(alerts), "command": "monitor"}, sort_keys=True))
+        _fail("runtime_error", "Check the local run identifier, then rerun trace.")
+    typer.echo(
+        json.dumps(
+            {"command": "trace", **response.model_dump(mode="json")},
+            sort_keys=True,
+        )
+    )
 
 
-@app.command("evaluate-drift")
-def evaluate_drift(
+@app.command()
+def agent(
     config: Path = typer.Option(..., help="Local YAML project configuration."),
-    runs_dir: Path = typer.Option(..., help="Local monitoring runs directory."),
-    seed: int = typer.Option(..., help="Deterministic drift injection seed."),
+    runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+    state_dir: Path | None = typer.Option(None, help="Optional mutable sidecar directory."),
+    principal_id: str = typer.Option("local-analyst", help="Public local principal ID."),
+    role: Role = typer.Option(Role.ANALYST, help="Local policy role."),
+    max_queries: int = typer.Option(8, help="Bounded local tool-query budget."),
+    objective: str = typer.Option("comprehensive", help="Allowlisted public objective code."),
+    decision_provider_mode: AgentDecisionProviderMode = typer.Option(
+        AgentDecisionProviderMode.DISABLED,
+        help="Standalone controlled-decision provider mode.",
+    ),
 ) -> None:
-    """Inject six reproducible drift scenarios and report aggregate detection scores."""
-    try:
-        runs_dir = _protected_path(runs_dir)
-        project_config = ProjectConfig.from_yaml(config)
-        frame, profile, catalog = _monitoring_inputs(project_config)
-        metrics = RuleMetrics(
-            support_count=100,
-            coverage=0.10,
-            base_bad_rate=0.10,
-            hit_bad_rate=0.20,
-            non_hit_bad_rate=0.08,
-            lift=2.0,
-            precision=0.20,
-            recall=0.20,
-            p_value=0.01,
-        )
-        baseline_card = EvidenceCard(
-            rule=RiskRule(rule_id="synthetic_monitor_rule", conditions=(), origin="evaluation"),
-            train=metrics,
-            test=metrics,
-            slices=(),
-            lift_ci=(1.5, 2.5),
-            adjusted_p_value=0.01,
-            segment_consistency=1.0,
-            max_time_decay=0.0,
-            grade="Stable",
-        )
-        reference = build_reference_snapshot(frame, profile, (baseline_card,), catalog, project_config)
-        numeric_features = [
-            spec.name
-            for spec in catalog.features
-            if frame.schema[spec.name].is_numeric()
-        ]
-        if not numeric_features:
-            raise ValueError("evaluate-drift requires at least one numeric feature")
-        monitor_feature = numeric_features[0]
-        segment_column = project_config.columns.segment
-        target_column = project_config.columns.target
-        institution = str(frame.get_column(segment_column)[0])
-        scenarios = (
-            DriftScenario(
-                scenario_id="missingness",
-                drift_type="missingness",
-                target=monitor_feature,
-                magnitude=0.60,
-                target_column=target_column,
-                segment_column=segment_column,
-            ),
-            DriftScenario(
-                scenario_id="numeric",
-                drift_type="numeric_shift",
-                target=monitor_feature,
-                magnitude=5.00,
-                target_column=target_column,
-                segment_column=segment_column,
-            ),
-            DriftScenario(
-                scenario_id="population",
-                drift_type="population_shift",
-                target=segment_column,
-                magnitude=0.60,
-                institution=institution,
-                target_column=target_column,
-                segment_column=segment_column,
-            ),
-            DriftScenario(
-                scenario_id="label",
-                drift_type="label_shift",
-                target=target_column,
-                magnitude=1.00,
-                target_column=target_column,
-                segment_column=segment_column,
-            ),
-            DriftScenario(
-                scenario_id="schema",
-                drift_type="schema",
-                target=monitor_feature,
-                magnitude=0.30,
-                target_column=target_column,
-                segment_column=segment_column,
-            ),
-            DriftScenario(
-                scenario_id="rule-decay",
-                drift_type="rule_decay",
-                target=monitor_feature,
-                magnitude=1.00,
-                target_column=target_column,
-                segment_column=segment_column,
-            ),
-        )
-        all_alerts = []
-        truths = []
-        all_diagnoses = []
-        scenario_scores: dict[str, DetectionScore] = {}
-        for offset, scenario in enumerate(scenarios):
-            injected = inject_drift(frame, scenario, seed + offset)
-            current_cards = (baseline_card,)
-            truth = injected.truth
-            if scenario.drift_type == "population_shift":
-                truth = truth.model_copy(update={"expected_scope_value": institution})
-            elif scenario.drift_type == "label_shift":
-                truth = truth.model_copy(update={"expected_scope_value": reference.dataset_id})
-            elif scenario.drift_type == "rule_decay":
-                current_cards = (
-                    baseline_card.model_copy(
-                        update={"test": metrics.model_copy(update={"lift": 1.0})}
-                    ),
-                )
-                truth = truth.model_copy(update={"expected_scope_value": baseline_card.rule.rule_id})
-            alerts = detect_anomalies(reference, injected.frame, current_cards, catalog)
-            diagnoses = diagnose_alerts(alerts, reference, injected.frame, catalog, top_k=3)
-            scenario_scores[scenario.scenario_id] = evaluate_alerts(
-                alerts, (truth,), top_k=3, diagnoses=diagnoses
-            )
-            all_alerts.extend(alerts)
-            truths.append(truth)
-            all_diagnoses.extend(diagnoses)
-        score = DetectionScore(
-            precision=sum(item.precision for item in scenario_scores.values()) / len(scenario_scores),
-            recall=sum(item.recall for item in scenario_scores.values()) / len(scenario_scores),
-            false_positive_rate=None,
-            false_discovery_rate=sum(item.false_discovery_rate for item in scenario_scores.values()) / len(scenario_scores),
-            top_k_root_cause_hit=sum(item.top_k_root_cause_hit for item in scenario_scores.values()) / len(scenario_scores),
-        )
-        output_dir = _protected_path(
-            runs_dir / "monitoring" / f"evaluation-{reference.snapshot_id[:16]}"
-        )
-        _write_monitoring_json(
-            output_dir,
-            "anomaly_alerts.json",
-            [
-                _safe_alert_payload(
-                    item,
-                    expose_segment_values=project_config.privacy.expose_segment_values,
-                )
-                for item in all_alerts
-            ],
-        )
-        _write_monitoring_json(
-            output_dir,
-            "diagnoses.json",
-            [
-                _safe_diagnosis_payload(
-                    item,
-                    expose_segment_values=project_config.privacy.expose_segment_values,
-                )
-                for item in all_diagnoses
-            ],
-        )
-        _write_monitoring_json(
-            output_dir,
-            "drift_evaluation.json",
-            {**score.model_dump(mode="json"), "scenarios": {
-                scenario_id: item.model_dump(mode="json")
-                for scenario_id, item in sorted(scenario_scores.items())
-            }},
-        )
-    except Exception:
-        _fail("evaluation_error", "Check the local configuration and configured numeric features.")
-    typer.echo(json.dumps({"command": "evaluate-drift", **score.model_dump(mode="json")}, sort_keys=True))
-
-
-def _repository_root() -> Path:
-    candidate = Path(__file__).resolve().parents[2]
-    return candidate if (candidate / ".git").exists() else Path.cwd().resolve()
-
-
-def _protected_path(path: Path, *, output: bool = False) -> Path:
-    """Allow only owner-private paths outside the repository checkout."""
-    resolved = path.expanduser().resolve()
-    repo = _repository_root()
-    if resolved == repo or repo in resolved.parents:
-        raise ValueError("benchmark outputs must not be written inside the repository")
-    parent = resolved.parent if output else resolved
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not parent.is_dir() or stat.S_IMODE(parent.stat().st_mode) & 0o077:
-        raise ValueError("benchmark output directory must be owner-private")
-    return resolved
-
-
-def _code_version() -> str:
-    try:
-        return version("riskprobe-agent")
-    except PackageNotFoundError:
-        return "0.1.0"
-
-
-def _file_fingerprint(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-@app.command("prepare-home-credit")
-def prepare_home_credit_command(
-    input_dir: Path = typer.Option(..., help="Directory containing user-downloaded Home Credit CSVs."),
-    output: Path = typer.Option(..., help="Local output Parquet path."),
-) -> None:
-    """Prepare public Home Credit behavior features without reading prediction files."""
-    try:
-        result = prepare_home_credit(HomeCreditPaths.from_directory(input_dir), output)
-    except ValueError as error:
-        _fail("home_credit_input_error", str(error))
-    except (OSError, pl.exceptions.PolarsError):
-        _fail("home_credit_preparation_error", "Check public CSV inputs and writable output path.")
-    typer.echo(
-        json.dumps(
-            {
-                "columns": result.columns,
-                "command": "prepare-home-credit",
-                "feature_families": result.feature_families,
-                "rows": result.rows,
-                "source_table_count": len(result.source_tables),
-            },
-            sort_keys=True,
-        )
+    """Run the deterministic offline comprehensive agent."""
+    from riskprobe.agents.decision_providers import (
+        DecisionProviderConfig,
+        DecisionProviderMode,
     )
 
-
-@app.command("preflight-company")
-def preflight_company(
-    config: Path = typer.Option(..., help="Local company YAML configuration."),
-) -> None:
-    """Print aggregate-only, read-only Parquet readiness information."""
+    service = _service(
+        config,
+        runs_dir,
+        state_dir,
+        decision_provider_config=DecisionProviderConfig(
+            mode=DecisionProviderMode(decision_provider_mode.value)
+        ),
+    )
     try:
-        result = preflight_company_dataset(ProjectConfig.from_yaml(config))
+        result = service.orchestrate(
+            dataset_id=service.config.dataset.id,
+            principal=Principal(principal_id=principal_id, role=role),
+            budget=Budget(max_queries=max_queries),
+            objective=objective,
+        )
     except Exception:
         _fail(
-            "company_preflight_error",
-            "Check the local configuration, role columns, and read-only Parquet schema.",
+            "agent_error",
+            "Check the local configuration, policy identity, and sidecar state, then rerun agent.",
         )
     typer.echo(
         json.dumps(
             {
-                "batch_count": result.batch_count,
-                "command": "preflight-company",
-                "feature_count": result.feature_count,
-                "feature_family_counts": result.feature_family_counts,
-                "label_rate": result.label_rate,
-                "limitations": result.limitations,
-                "metadata_grade": result.metadata_grade,
-                "row_count": result.row_count,
-                "segment_count": result.segment_count,
+                "approved": result.review.approved,
+                "command": "agent",
+                "diagnosis_evidence_ids": list(result.diagnosis_evidence_ids),
+                "evidence_ids": list(result.evidence_ids),
+                "reason_codes": [reason.value for reason in result.review.reason_codes],
+                "retry_count": result.retry_count,
+                "run_id": result.session_id,
+                "status": result.status.value,
+                "tool_sequence": list(result.tool_sequence),
             },
             sort_keys=True,
         )
@@ -566,112 +493,177 @@ def preflight_company(
 
 
 @app.command()
-def benchmark(
-    config: Path = typer.Option(..., help="Local company YAML configuration."),
-    runs_dir: Path = typer.Option(..., help="Ignored local run directory."),
-    baseline_record: Path = typer.Option(..., help="Human-authored local baseline JSON record."),
+def evaluate(
+    eval_version: EvalVersion = typer.Option(..., help="Evaluation schema version."),
+    suite: Path = typer.Option(..., help="Frozen local evaluation suite JSON."),
+    observations: Path = typer.Option(..., help="Local replay observations JSON."),
+    candidate_version: str = typer.Option(..., help="Public candidate version."),
+    output: Path | None = typer.Option(None, help="Optional full report JSON output."),
 ) -> None:
-    """Measure local workflow stages without changing the manual baseline record."""
+    """Replay frozen offline observations without dynamic code loading."""
     try:
-        project_config = ProjectConfig.from_yaml(config)
-        runs_dir = _protected_path(runs_dir)
-        baseline = BenchmarkRecord.model_validate_json(
-            baseline_record.read_text(encoding="utf-8")
-        )
-        service = RiskProbeService(config=project_config, runs_dir=runs_dir)
-        config_hash = service.store.config_fingerprint(project_config)
-        data_fingerprint = _file_fingerprint(project_config.dataset.path)
-        if (
-            baseline.dataset_id != project_config.dataset.id
-            or baseline.config_hash != config_hash
-            or baseline.data_fingerprint != data_fingerprint
-        ):
-            raise ValueError("baseline record identity does not match current dataset and configuration")
-        timings: list[StageTiming] = []
-
-        started = time.perf_counter()
-        service.inspect()
-        timings.append(StageTiming(stage="inspect", seconds=time.perf_counter() - started))
-
-        started = time.perf_counter()
-        service.discover()
-        timings.append(StageTiming(stage="discover", seconds=time.perf_counter() - started))
-
-        started = time.perf_counter()
-        context = service.run()
-        timings.append(StageTiming(stage="validate", seconds=time.perf_counter() - started))
-
-        started = time.perf_counter()
-        service.monitoring_snapshot()
-        timings.append(StageTiming(stage="monitor", seconds=time.perf_counter() - started))
-
-        started = time.perf_counter()
-        (context.run_dir / "risk_report.md").read_bytes()
-        timings.append(StageTiming(stage="report", seconds=time.perf_counter() - started))
-
-        record = baseline.model_copy(
-            update={
-                "agent_minutes": total_agent_minutes(timings),
-                "code_version": _code_version(),
-                "config_hash": config_hash,
-                "data_fingerprint": data_fingerprint,
-                "baseline_fingerprint": _file_fingerprint(baseline_record),
-                "baseline_task_id": baseline.task_id,
-                "dataset_id": project_config.dataset.id,
-                "run_id": context.run_id,
-                "measured_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "stage_timings": tuple(timings),
+        suite_bytes = suite.read_bytes()
+        if len(suite_bytes) > 16 * 1024 * 1024:
+            raise ValueError
+        if eval_version is EvalVersion.V1:
+            frozen_suite = EvalSuite.model_validate_json(suite_bytes)
+            if not frozen_suite.verify_integrity():
+                raise ValueError
+            by_case = _observations(observations, model=EvalObservation)
+            expected = {case.case_id for case in frozen_suite.cases}
+            if set(by_case) != expected:
+                raise ValueError
+            report = RiskProbeService.evaluate_v1(
+                frozen_suite,
+                lambda case, seed: by_case[case.case_id],
+                candidate_version=candidate_version,
+            )
+            summary: dict[str, object] = {
+                "candidate_version": report.candidate_version,
+                "case_count": len(report.case_results),
+                "command": "evaluate",
+                "eval_version": "v1",
+                "passed": report.passed,
+                "report_hash": report.report_hash,
+                "suite_hash": report.suite_hash,
+                "suite_id": report.suite_id,
             }
-        ).validate_consistency()
-        output = context.run_dir / "benchmark_record.json"
-        if output.exists():
-            raise FileExistsError("benchmark record already exists and is immutable")
-        output.write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
-        output.chmod(0o400)
+        else:
+            frozen_suite_v2 = EvalSuiteV2.model_validate_json(suite_bytes)
+            if not frozen_suite_v2.verify_integrity():
+                raise ValueError
+            by_case_v2 = _observations(observations, model=EvalObservationV2)
+            expected_v2 = {case.case_id for case in frozen_suite_v2.cases}
+            if set(by_case_v2) != expected_v2:
+                raise ValueError
+            report = RiskProbeService.evaluate_v2(
+                frozen_suite_v2,
+                lambda case, seed: by_case_v2[case.case_id],
+                candidate_version=candidate_version,
+            )
+            summary = {
+                "candidate_version": report.candidate_version,
+                "case_count": len(report.case_results),
+                "command": "evaluate",
+                "eval_version": "v2",
+                "report_hash": report.report_hash,
+                "suite_hash": report.suite_hash,
+                "suite_id": report.suite_id,
+            }
+    except typer.Exit:
+        raise
     except Exception:
         _fail(
-            "benchmark_error",
-            "Check the local configuration, human baseline record, and ignored runs directory.",
+            "evaluation_error",
+            "Check the frozen local suite and observations JSON, then rerun evaluate.",
         )
-    typer.echo(
-        json.dumps(
-            {
-                "command": "benchmark",
-                "run_id": record.run_id,
-                "stage_count": len(record.stage_timings),
-            },
-            sort_keys=True,
-        )
-    )
+    if output is not None:
+        _write_report(output, report.model_dump(mode="json"))
+    typer.echo(json.dumps(summary, sort_keys=True))
 
 
-@app.command("resume-evidence")
-def resume_evidence(
-    records_dir: Path = typer.Option(..., help="Ignored local directory containing benchmark records."),
-    output: Path = typer.Option(..., help="Ignored internal Markdown output path."),
+@app.command("rag-build")
+def rag_build(
+    config: Path = typer.Option(..., help="Local YAML project configuration."),
+    runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+    run_id: str = typer.Option(..., help="Existing 16-character local run identifier."),
+    root_id: str = typer.Option(..., help="Registered provider-safe root ID."),
+    root: Path = typer.Option(..., help="Manifest-attested provider-safe root."),
+    scope_id: str = typer.Option(..., help="Public local citation scope ID."),
+    state_dir: Path | None = typer.Option(None, help="Optional mutable sidecar directory."),
+    provider_summaries: Path | None = typer.Option(
+        None,
+        help="Optional exact provider-safe aggregate summaries JSON.",
+    ),
 ) -> None:
-    """Create internal resume text only from complete measured benchmark records."""
+    """Build a sealed local citation index from attested content."""
+    service = _service(config, runs_dir, state_dir)
+    summaries: tuple[dict[str, object], ...] = ()
+    if provider_summaries is not None:
+        payload = _read_json(
+            provider_summaries,
+            category="rag_build_error",
+            message="Check the provider-safe manifest and aggregate summaries, then rerun rag-build.",
+        )
+        if (
+            type(payload) is not dict
+            or set(payload) != {"provider_summaries"}
+            or type(payload["provider_summaries"]) is not list
+            or any(type(item) is not dict for item in payload["provider_summaries"])
+        ):
+            _fail(
+                "rag_build_error",
+                "Check the provider-safe manifest and aggregate summaries, then rerun rag-build.",
+            )
+        summaries = tuple(payload["provider_summaries"])
     try:
-        records_dir = _protected_path(records_dir)
-        output = _protected_path(output, output=True)
-        records = [
-            BenchmarkRecord.model_validate_json(path.read_text(encoding="utf-8"))
-            for path in sorted(records_dir.rglob("benchmark_record.json"))
-        ]
-        evidence = aggregate_benchmarks(records)
-        if output.exists():
-            raise FileExistsError("resume evidence output already exists and is immutable")
-        output.write_text(render_markdown(evidence), encoding="utf-8")
-        output.chmod(0o400)
-    except Exception as error:
-        _fail("resume_evidence_error", str(error))
+        result = service.build_local_rag(
+            run_id=run_id,
+            roots={root_id: root},
+            root_id=root_id,
+            scope_id=scope_id,
+            provider_summaries=summaries,
+        )
+    except Exception:
+        _fail(
+            "rag_build_error",
+            "Check the provider-safe manifest and aggregate summaries, then rerun rag-build.",
+        )
     typer.echo(
         json.dumps(
-            {
-                "command": "resume-evidence",
-                "source_run_count": len(evidence.source_run_ids),
-                "task_count": evidence.task_count,
-            },
+            {"command": "rag-build", "run_id": run_id, **result.model_dump(mode="json")},
             sort_keys=True,
         )
     )
+
+
+@app.command("rag-query")
+def rag_query(
+    config: Path | None = typer.Option(
+        None,
+        help="Optional local YAML configuration; not needed for a sealed index query.",
+    ),
+    runs_dir: Path = typer.Option(..., help="Local directory for immutable runs."),
+    run_id: str = typer.Option(..., help="Existing 16-character local run identifier."),
+    root_id: str | None = typer.Option(
+        None,
+        help="Optional legacy provider-safe root ID; use together with --root.",
+    ),
+    root: Path | None = typer.Option(
+        None,
+        help="Optional legacy provider-safe root; use together with --root-id.",
+    ),
+    scope_id: str = typer.Option(..., help="Public local citation scope ID."),
+    query_id: str = typer.Option(..., help="Public local query ID."),
+    query_text: str = typer.Option(..., help="Safe local query text."),
+    limit: int = typer.Option(5, help="Maximum citations, from 1 through 100."),
+    state_dir: Path | None = typer.Option(None, help="Optional mutable sidecar directory."),
+) -> None:
+    """Query a sealed local index without returning source text."""
+    if (root_id is None) != (root is None):
+        _fail("input_error", "Provide both legacy --root-id and --root, or neither.")
+    service = _service(config, runs_dir, state_dir)
+    try:
+        result = service.query_local_rag(
+            run_id=run_id,
+            roots={} if root_id is None or root is None else {root_id: root},
+            scope_id=scope_id,
+            query_id=query_id,
+            query_text=query_text,
+            limit=limit,
+        )
+    except Exception:
+        _fail(
+            "rag_query_error",
+            "Check the local index scope and safe query, then rerun rag-query.",
+        )
+    typer.echo(
+        json.dumps(
+            {"command": "rag-query", "run_id": run_id, **result.model_dump(mode="json")},
+            sort_keys=True,
+        )
+    )
+
+
+_safe_alert_payload = _cross_client_cli._safe_alert_payload
+_cross_client_cli.register_cross_client_commands(app)

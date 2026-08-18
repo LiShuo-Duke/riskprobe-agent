@@ -1,10 +1,12 @@
-"""Startup-loaded dataset ID allowlist for local RiskProbe tools."""
+"""Private configuration registry addressed only by public dataset IDs."""
+
+from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
-from typing import Mapping
 
 import polars as pl
 import yaml
@@ -12,79 +14,117 @@ import yaml
 from riskprobe.config import ProjectConfig
 from riskprobe.io.parquet import ParquetDataset
 
-
 _DATASET_ID = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
+_INVALID_REGISTRY = "dataset registry is invalid"
 
 
 class DatasetNotRegisteredError(ValueError):
-    """Raised when a tool request does not name an allowlisted dataset ID."""
+    """Raised without echoing an untrusted dataset selector."""
 
 
 class DatasetAlreadyRegisteredError(ValueError):
     """Raised when a session registration would replace an existing dataset ID."""
 
 
-def _allowed_roots(roots: tuple[Path, ...]) -> tuple[Path, ...]:
-    if not roots:
-        raise ValueError("allowed local data roots are required")
-    resolved: list[Path] = []
-    for root in roots:
-        try:
-            candidate = Path(root).resolve(strict=True)
-        except (OSError, RuntimeError) as error:
-            raise ValueError("allowed local data roots must be existing directories") from error
-        if not candidate.is_dir():
-            raise ValueError("allowed local data roots must be existing directories")
-        resolved.append(candidate)
-    return tuple(dict.fromkeys(resolved))
+@dataclass(frozen=True, slots=True, repr=False)
+class DatasetHandle:
+    """Internal handle passed to trusted handlers, never serialized as a response."""
+
+    dataset_id: str
+    _config: ProjectConfig = field(repr=False)
+
+    @property
+    def config(self) -> ProjectConfig:
+        return self._config
+
+    def __repr__(self) -> str:
+        return f"DatasetHandle(dataset_id={self.dataset_id!r})"
 
 
-def _resolve_under_roots(path: Path, roots: tuple[Path, ...], label: str) -> Path:
-    try:
-        resolved = Path(path).resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise ValueError(f"{label} must be an existing local file") from error
-    if not any(resolved == root or root in resolved.parents for root in roots):
-        raise ValueError(f"{label} is outside the allowed local data roots")
-    return resolved
+@dataclass(frozen=True, slots=True, repr=False)
+class _RegistryEntry:
+    config: ProjectConfig = field(repr=False)
+    source_path: Path | None = field(default=None, repr=False)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class DatasetRegistry:
-    _configs: Mapping[str, ProjectConfig]
+    """An immutable startup snapshot of allowlisted dataset configurations."""
+
+    _entries: Mapping[str, _RegistryEntry] = field(repr=False)
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "DatasetRegistry":
+    def from_mapping(
+        cls,
+        entries: Mapping[str, ProjectConfig | Path],
+    ) -> DatasetRegistry:
+        if not isinstance(entries, Mapping):
+            raise TypeError("entries must be a mapping")
+        normalized: dict[str, _RegistryEntry] = {}
+        for dataset_id, source in entries.items():
+            if not isinstance(dataset_id, str) or _DATASET_ID.fullmatch(dataset_id) is None:
+                raise ValueError(_INVALID_REGISTRY)
+            if isinstance(source, ProjectConfig):
+                normalized[dataset_id] = _RegistryEntry(config=source)
+                continue
+            if isinstance(source, Path):
+                normalized[dataset_id] = _entry_from_path(source)
+                continue
+            raise ValueError(_INVALID_REGISTRY)
+        return cls(_entries=MappingProxyType(normalized))
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> DatasetRegistry:
+        registry_path = Path(path)
         try:
-            payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as error:
-            raise ValueError("dataset registry must be readable YAML") from error
-        datasets = payload.get("datasets") if isinstance(payload, dict) else None
-        if not isinstance(datasets, dict):
-            raise ValueError("dataset registry must contain a datasets mapping")
-        configs: dict[str, ProjectConfig] = {}
-        registry_root = Path(path).resolve().parent
-        for dataset_id, entry in datasets.items():
-            if not isinstance(dataset_id, str) or not _DATASET_ID.fullmatch(dataset_id):
-                raise ValueError("dataset registry has an invalid dataset ID")
-            if not isinstance(entry, dict) or set(entry) != {"config"} or not isinstance(entry["config"], str):
-                raise ValueError("dataset registry entries require only a config path")
-            config_path = Path(entry["config"])
-            if not config_path.is_absolute():
-                config_path = registry_root / config_path
-            configs[dataset_id] = ProjectConfig.from_yaml(config_path)
-        return cls(_configs=MappingProxyType(configs))
+            payload = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or set(payload) != {"datasets"}:
+                raise ValueError(_INVALID_REGISTRY)
+            datasets = payload["datasets"]
+            if not isinstance(datasets, dict):
+                raise ValueError(_INVALID_REGISTRY)
+            sources: dict[str, Path] = {}
+            for dataset_id, item in datasets.items():
+                if (
+                    not isinstance(dataset_id, str)
+                    or _DATASET_ID.fullmatch(dataset_id) is None
+                    or not isinstance(item, dict)
+                    or set(item) != {"config"}
+                    or not isinstance(item["config"], str)
+                    or not item["config"]
+                ):
+                    raise ValueError(_INVALID_REGISTRY)
+                config_path = Path(item["config"])
+                if not config_path.is_absolute():
+                    config_path = registry_path.resolve().parent / config_path
+                sources[dataset_id] = config_path
+            return cls.from_mapping(sources)
+        except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
+            raise ValueError(_INVALID_REGISTRY) from error
+
+    @property
+    def dataset_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._entries))
+
+    def resolve(self, dataset_id: str) -> DatasetHandle:
+        if not isinstance(dataset_id, str) or _DATASET_ID.fullmatch(dataset_id) is None:
+            raise DatasetNotRegisteredError("dataset ID is not registered")
+        try:
+            entry = self._entries[dataset_id]
+        except KeyError as error:
+            raise DatasetNotRegisteredError("dataset ID is not registered") from error
+        return DatasetHandle(dataset_id=dataset_id, _config=entry.config)
+
+    def get_config(self, dataset_id: str) -> ProjectConfig:
+        return self.resolve(dataset_id).config
 
     def register_local_config(
         self,
         dataset_id: str,
         config_path: Path,
         allowed_roots: tuple[Path, ...],
-    ) -> "DatasetRegistry":
-        if not isinstance(dataset_id, str) or not _DATASET_ID.fullmatch(dataset_id):
-            raise DatasetNotRegisteredError("dataset requests must use a registered dataset ID")
-        if dataset_id in self._configs:
-            raise DatasetAlreadyRegisteredError("dataset ID is already registered")
+    ) -> DatasetRegistry:
+        self._require_new_id(dataset_id)
         roots = _allowed_roots(allowed_roots)
         safe_config_path = _resolve_under_roots(Path(config_path), roots, "config path")
         try:
@@ -110,17 +150,15 @@ class DatasetRegistry:
         }
         if not required_columns.issubset(schema.names()):
             raise ValueError("local dataset schema is incompatible with configured roles")
-
         normalized_config = config.model_copy(
             update={
-                "dataset": config.dataset.model_copy(
-                    update={"path": safe_dataset_path}
-                )
+                "dataset": config.dataset.model_copy(update={"path": safe_dataset_path})
             }
         )
-        configs = dict(self._configs)
-        configs[dataset_id] = normalized_config
-        return DatasetRegistry(_configs=MappingProxyType(configs))
+        return self._with_entry(
+            dataset_id,
+            _RegistryEntry(config=normalized_config, source_path=safe_config_path),
+        )
 
     def register_local_parquet(
         self,
@@ -133,12 +171,8 @@ class DatasetRegistry:
         snapshot_column: str | None,
         feature_columns: list[str] | tuple[str, ...] | None = None,
         allowed_roots: tuple[Path, ...],
-    ) -> "DatasetRegistry":
-        if not isinstance(dataset_id, str) or not _DATASET_ID.fullmatch(dataset_id):
-            raise DatasetNotRegisteredError("dataset requests must use a registered dataset ID")
-        if dataset_id in self._configs:
-            raise DatasetAlreadyRegisteredError("dataset ID is already registered")
-
+    ) -> DatasetRegistry:
+        self._require_new_id(dataset_id)
         role_values = (entity_column, target_column, segment_column)
         if any(not isinstance(column, str) or not column.strip() for column in role_values):
             raise ValueError("entity, target, and segment columns are required")
@@ -149,9 +183,7 @@ class DatasetRegistry:
             not isinstance(snapshot_column, str) or not snapshot_column.strip()
         ):
             raise ValueError("snapshot column must be a non-empty string or null")
-        normalized_snapshot = (
-            snapshot_column.strip() if snapshot_column is not None else None
-        )
+        normalized_snapshot = snapshot_column.strip() if snapshot_column is not None else None
         snapshot_role = normalized_snapshot or normalized_entity
         real_roles = (normalized_entity, normalized_target, normalized_segment)
         if normalized_snapshot is not None:
@@ -184,7 +216,6 @@ class DatasetRegistry:
         schema_names = set(schema.names())
         if not set(role_columns).issubset(schema_names):
             raise ValueError("local dataset schema is incompatible with explicit role columns")
-
         role_names = set(real_roles)
         if explicit_features:
             if not set(normalized_features).issubset(schema_names):
@@ -203,7 +234,6 @@ class DatasetRegistry:
         if not feature_names:
             raise ValueError("local dataset must contain numeric feature columns")
 
-        features = {"families": {"parquet_numeric": feature_names}, "exact_columns": feature_names}
         config = ProjectConfig.model_validate(
             {
                 "dataset": {"id": dataset_id, "path": safe_path},
@@ -213,25 +243,80 @@ class DatasetRegistry:
                     "segment": normalized_segment,
                     "target": normalized_target,
                 },
-                "target": {
-                    "positive_value": 1,
-                    "positive_meaning": "bad_debt",
-                },
+                "target": {"positive_value": 1, "positive_meaning": "bad_debt"},
                 "snapshot": {"meaning": "public_relative_reference"},
-                "features": features,
+                "features": {
+                    "families": {"parquet_numeric": feature_names},
+                    "exact_columns": feature_names,
+                },
                 "segment_display_name": "customer_segment",
                 "time_validation_enabled": normalized_snapshot is not None,
                 "privacy": {"expose_segment_values": True},
             }
         )
-        configs = dict(self._configs)
-        configs[dataset_id] = config
-        return DatasetRegistry(_configs=MappingProxyType(configs))
+        return self._with_entry(dataset_id, _RegistryEntry(config=config))
 
-    def get_config(self, dataset_id: str) -> ProjectConfig:
-        if not isinstance(dataset_id, str) or not _DATASET_ID.fullmatch(dataset_id):
+    def _require_new_id(self, dataset_id: str) -> None:
+        if not isinstance(dataset_id, str) or _DATASET_ID.fullmatch(dataset_id) is None:
             raise DatasetNotRegisteredError("dataset requests must use a registered dataset ID")
+        if dataset_id in self._entries:
+            raise DatasetAlreadyRegisteredError("dataset ID is already registered")
+
+    def _with_entry(self, dataset_id: str, entry: _RegistryEntry) -> DatasetRegistry:
+        entries = dict(self._entries)
+        entries[dataset_id] = entry
+        return DatasetRegistry(_entries=MappingProxyType(entries))
+
+    def __repr__(self) -> str:
+        return f"DatasetRegistry(dataset_ids={self.dataset_ids!r})"
+
+
+def _allowed_roots(roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    if not roots:
+        raise ValueError("allowed local data roots are required")
+    resolved: list[Path] = []
+    for root in roots:
         try:
-            return self._configs[dataset_id]
-        except KeyError as error:
-            raise DatasetNotRegisteredError("dataset ID is not registered") from error
+            candidate = Path(root).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("allowed local data roots must be existing directories") from error
+        if not candidate.is_dir():
+            raise ValueError("allowed local data roots must be existing directories")
+        resolved.append(candidate)
+    return tuple(dict.fromkeys(resolved))
+
+
+def _resolve_under_roots(path: Path, roots: tuple[Path, ...], label: str) -> Path:
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{label} must be an existing local file") from error
+    if not any(resolved == root or root in resolved.parents for root in roots):
+        raise ValueError(f"{label} is outside the allowed local data roots")
+    return resolved
+
+
+def _entry_from_path(path: Path) -> _RegistryEntry:
+    source_path = Path(path).resolve()
+    try:
+        config = ProjectConfig.from_yaml(source_path)
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
+        raise ValueError(_INVALID_REGISTRY) from error
+    dataset_path = config.dataset.path
+    if not dataset_path.is_absolute() and not PureWindowsPath(str(dataset_path)).is_absolute():
+        config = config.model_copy(
+            update={
+                "dataset": config.dataset.model_copy(
+                    update={"path": (source_path.parent / dataset_path).resolve()}
+                )
+            }
+        )
+    return _RegistryEntry(config=config, source_path=source_path)
+
+
+__all__ = [
+    "DatasetAlreadyRegisteredError",
+    "DatasetHandle",
+    "DatasetNotRegisteredError",
+    "DatasetRegistry",
+]

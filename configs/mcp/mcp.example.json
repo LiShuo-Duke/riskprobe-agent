@@ -2,11 +2,26 @@
   "mcpServers": {
     "riskprobe": {
       "command": "/ABSOLUTE/PATH/TO/riskprobe-agent/.venv/bin/python",
-      "args": ["-m", "riskprobe.mcp_server"],
-      "env": {
-        "RISKPROBE_REGISTRY": "/ABSOLUTE/PATH/TO/riskprobe-agent/configs/datasets.example.yaml",
-        "RISKPROBE_ALLOWED_DATA_ROOTS": "/ABSOLUTE/PATH/TO/APPROVED/DATA"
-      }
+      "args": [
+        "-m",
+        "riskprobe.mcp_server",
+        "--config",
+        "/ABSOLUTE/PATH/TO/project.yaml",
+        "--runs-dir",
+        "/ABSOLUTE/PATH/TO/LOCAL/RISKPROBE/RUNS",
+        "--state-dir",
+        "/ABSOLUTE/PATH/TO/LOCAL/RISKPROBE/STATE",
+        "--provider-id",
+        "mcp-host",
+        "--provider-version",
+        "host-model-version",
+        "--principal-id",
+        "local-host",
+        "--role",
+        "analyst",
+        "--max-queries",
+        "16"
+      ]
     }
   }
 }

@@ -2,37 +2,13 @@ import json
 from pathlib import Path
 
 import polars as pl
+import pytest
 from typer.testing import CliRunner
 
-from riskprobe.cli import _safe_alert_payload, app
-from riskprobe.monitoring.models import Alert
-from riskprobe.privacy import stable_token
+from riskprobe.cli import app
 
 
 runner = CliRunner()
-
-
-def test_cli_monitoring_projection_respects_segment_name_authorization() -> None:
-    alert = Alert(
-        alert_id="alert-a",
-        alert_type="population",
-        severity="warning",
-        scope="institution",
-        scope_value="bank_north",
-        metric="share",
-        reference_value=0.2,
-        current_value=0.4,
-        delta=0.2,
-        evidence={},
-    )
-
-    hidden = _safe_alert_payload(alert, expose_segment_values=False)
-    exposed = _safe_alert_payload(alert, expose_segment_values=True)
-
-    assert hidden["scope_value"] == stable_token("bank_north")
-    assert "bank_north" not in str(hidden)
-    assert exposed["scope_value"] == stable_token("bank_north")
-    assert exposed["institution_name"] == "bank_north"
 
 
 def _write_config(path: Path, data_path: Path) -> None:
@@ -123,7 +99,20 @@ def test_command_parsing_lists_all_supported_commands_and_rejects_missing_option
     missing_output = runner.invoke(app, ["synthetic", "--rows", "10", "--seed", "42"])
 
     assert help_result.exit_code == 0
-    for command in ("synthetic", "inspect", "discover", "run"):
+    for command in (
+        "synthetic",
+        "inspect",
+        "discover",
+        "run",
+        "diagnose",
+        "recommend",
+        "status",
+        "trace",
+        "agent",
+        "evaluate",
+        "rag-build",
+        "rag-query",
+    ):
         assert command in help_result.stdout
     assert missing_output.exit_code == 2
 
@@ -255,19 +244,410 @@ def test_unusable_runs_directory_is_a_safe_actionable_error(tmp_path: Path) -> N
     assert str(runs_file) not in result.stdout
 
 
-def test_evaluate_drift_rejects_repository_runs_dir() -> None:
+def test_evaluate_replays_frozen_v1_observations_and_writes_report(tmp_path: Path) -> None:
+    from riskprobe.evals import EvalCase, EvalObservation, EvalSuite
+
+    suite = EvalSuite(
+        suite_id="cli-suite-v1",
+        cases=(
+            EvalCase(
+                case_id="cli-case",
+                objective="comprehensive",
+                expected_tool_sequence=("inspect",),
+                require_diagnosis=False,
+            ),
+        ),
+    )
+    observation = EvalObservation(
+        case_id="cli-case",
+        task_succeeded=True,
+        tool_sequence=("inspect",),
+        evidence_ids=(),
+        diagnosis_evidence_ids=(),
+        policy_violations=0,
+        privacy_violations=0,
+    )
+    suite_path = tmp_path / "suite.json"
+    observations_path = tmp_path / "observations.json"
+    output_path = tmp_path / "report.json"
+    suite_path.write_text(suite.model_dump_json(), encoding="utf-8")
+    observations_path.write_text(
+        json.dumps(
+            {"observations": [observation.model_dump(mode="json")]},
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
     result = runner.invoke(
         app,
         [
-            "evaluate-drift",
-            "--config",
-            "configs/synthetic.example.yaml",
-            "--runs-dir",
-            "runs",
-            "--seed",
-            "42",
+            "evaluate",
+            "--eval-version",
+            "v1",
+            "--suite",
+            str(suite_path),
+            "--observations",
+            str(observations_path),
+            "--candidate-version",
+            "candidate-v1",
+            "--output",
+            str(output_path),
         ],
     )
 
-    assert result.exit_code == 2
-    assert json.loads(result.stdout)["error"] == "evaluation_error"
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    persisted = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["command"] == "evaluate"
+    assert payload["eval_version"] == "v1"
+    assert payload["passed"] is True
+    assert payload["report_hash"] == persisted["report_hash"]
+    assert str(suite_path) not in result.stdout
+    assert str(observations_path) not in result.stdout
+    assert str(output_path) not in result.stdout
+
+
+def test_new_service_commands_emit_safe_json_without_private_inputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from riskprobe.rag import BuildResult, QueryResult
+    from riskprobe.tools import (
+        DiagnoseResponse,
+        RecommendResponse,
+        StatusResponse,
+        TraceEvent,
+        TraceResponse,
+    )
+
+    finding_id = "a" * 64
+    recommendation_id = "b" * 64
+    run_id = "0123456789abcdef"
+
+    class FakeService:
+        config = SimpleNamespace(dataset=SimpleNamespace(id="synthetic-demo"))
+
+        def diagnose(self, *, run_id: str) -> DiagnoseResponse:
+            return DiagnoseResponse(dataset_id="synthetic-demo", finding_ids=(finding_id,))
+
+        def recommend(self, *, run_id: str, evidence_ids: tuple[str, ...]) -> RecommendResponse:
+            assert evidence_ids == (finding_id,)
+            return RecommendResponse(
+                dataset_id="synthetic-demo",
+                recommendation_ids=(recommendation_id,),
+            )
+
+        def status(self, *, run_id: str) -> StatusResponse:
+            return StatusResponse(run_id=run_id, status="succeeded")
+
+        def trace(self, *, run_id: str, node_id: str | None = None) -> TraceResponse:
+            del node_id
+            return TraceResponse(
+                run_id=run_id,
+                events=(
+                    TraceEvent(
+                        sequence=1,
+                        node_id="profile",
+                        event_type="node_succeeded",
+                        status="succeeded",
+                        attempt=1,
+                    ),
+                ),
+            )
+
+        def orchestrate(self, **kwargs: object) -> object:
+            del kwargs
+            return SimpleNamespace(
+                session_id=run_id,
+                status=SimpleNamespace(value="succeeded"),
+                review=SimpleNamespace(approved=True, reason_codes=()),
+                evidence_ids=(finding_id, recommendation_id),
+                diagnosis_evidence_ids=(finding_id,),
+                retry_count=0,
+                tool_sequence=("inspect", "diagnose", "discover", "recommend", "review"),
+            )
+
+        def build_local_rag(self, **kwargs: object) -> BuildResult:
+            del kwargs
+            return BuildResult(
+                scope_id="scope-" + "1" * 24,
+                document_count=1,
+                index_hash="c" * 64,
+            )
+
+        def query_local_rag(self, **kwargs: object) -> QueryResult:
+            del kwargs
+            return QueryResult(scope_id="scope-" + "1" * 24, citations=())
+
+    monkeypatch.setattr("riskprobe.cli._service", lambda *args, **kwargs: FakeService())
+    common = ["--config", str(tmp_path / "private.yaml"), "--runs-dir", str(tmp_path / "runs")]
+    invocations = (
+        ["diagnose", *common, "--run-id", run_id],
+        [
+            "recommend",
+            *common,
+            "--run-id",
+            run_id,
+            "--evidence-id",
+            finding_id,
+        ],
+        ["status", *common, "--run-id", run_id],
+        ["trace", *common, "--run-id", run_id],
+        ["agent", *common],
+        [
+            "rag-build",
+            *common,
+            "--run-id",
+            run_id,
+            "--root-id",
+            "docs-root",
+            "--root",
+            str(tmp_path / "private-root"),
+            "--scope-id",
+            "scope-main",
+        ],
+        [
+            "rag-query",
+            *common,
+            "--run-id",
+            run_id,
+            "--root-id",
+            "docs-root",
+            "--root",
+            str(tmp_path / "private-root"),
+            "--scope-id",
+            "scope-main",
+            "--query-id",
+            "query-main",
+            "--query-text",
+            "private query text",
+        ],
+    )
+
+    for arguments in invocations:
+        result = runner.invoke(app, arguments)
+        assert result.exit_code == 0, (arguments[0], result.stdout, result.exception)
+        payload = json.loads(result.stdout)
+        assert payload["command"] == arguments[0]
+        assert str(tmp_path) not in result.stdout
+        assert "private query text" not in result.stdout
+
+
+def test_state_commands_do_not_require_config_or_query_roots(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from riskprobe.rag import QueryResult
+    from riskprobe.tools import StatusResponse, TraceResponse
+
+    run_id = "0123456789abcdef"
+    calls: list[tuple[object, ...]] = []
+
+    class FakeService:
+        def status(self, *, run_id: str) -> StatusResponse:
+            calls.append(("status", run_id))
+            return StatusResponse(run_id=run_id, status="succeeded")
+
+        def trace(self, *, run_id: str, node_id: str | None = None) -> TraceResponse:
+            calls.append(("trace", run_id, node_id))
+            return TraceResponse(run_id=run_id, events=())
+
+        def query_local_rag(self, **kwargs: object) -> QueryResult:
+            calls.append(("rag-query", kwargs["run_id"], kwargs["roots"]))
+            return QueryResult(scope_id="scope-" + "1" * 24, citations=())
+
+    def fake_service(
+        config: Path | None,
+        runs_dir: Path | None,
+        state_dir: Path | None = None,
+    ) -> FakeService:
+        assert config is None
+        assert runs_dir == tmp_path / "runs"
+        calls.append(("service", state_dir))
+        return FakeService()
+
+    monkeypatch.setattr("riskprobe.cli._service", fake_service)
+    common = ["--runs-dir", str(tmp_path / "runs"), "--run-id", run_id]
+    invocations = (
+        ["status", *common],
+        ["trace", *common],
+        [
+            "rag-query",
+            *common,
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--scope-id",
+            "scope-main",
+            "--query-id",
+            "query-main",
+            "--query-text",
+            "safe query",
+        ],
+    )
+
+    for arguments in invocations:
+        result = runner.invoke(app, arguments)
+        assert result.exit_code == 0, (arguments[0], result.stdout, result.exception)
+
+    assert ("status", run_id) in calls
+    assert ("trace", run_id, None) in calls
+    assert ("rag-query", run_id, {}) in calls
+
+
+def test_diagnose_without_run_id_uses_authoritative_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from riskprobe.tools import DiagnoseResponse
+
+    authoritative_run_id = "0123456789abcdef"
+    finding_id = "a" * 64
+    calls: list[tuple[str, object]] = []
+
+    class FakeService:
+        def run(self) -> object:
+            calls.append(("run", None))
+            return SimpleNamespace(run_id=authoritative_run_id)
+
+        def diagnose(self, *, run_id: str) -> DiagnoseResponse:
+            calls.append(("diagnose", run_id))
+            return DiagnoseResponse(
+                dataset_id="synthetic-demo",
+                finding_ids=(finding_id,),
+            )
+
+    monkeypatch.setattr("riskprobe.cli._service", lambda *args, **kwargs: FakeService())
+    result = runner.invoke(
+        app,
+        [
+            "diagnose",
+            "--config",
+            str(tmp_path / "project.yaml"),
+            "--runs-dir",
+            str(tmp_path / "runs"),
+        ],
+    )
+
+    assert result.exit_code == 0, (result.stdout, result.exception)
+    assert calls == [("run", None), ("diagnose", authoritative_run_id)]
+    payload = json.loads(result.stdout)
+    assert payload["run_id"] == authoritative_run_id
+    assert payload["finding_ids"] == [finding_id]
+
+
+def test_recommend_all_current_diagnostics_is_explicit_and_exclusive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from riskprobe.tools import RecommendResponse
+
+    run_id = "0123456789abcdef"
+    recommendation_id = "b" * 64
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    class FakeService:
+        def recommend(
+            self,
+            *,
+            run_id: str,
+            evidence_ids: tuple[str, ...],
+            all_current_diagnostics: bool = False,
+        ) -> RecommendResponse:
+            assert run_id == "0123456789abcdef"
+            calls.append((evidence_ids, all_current_diagnostics))
+            return RecommendResponse(
+                dataset_id="synthetic-demo",
+                recommendation_ids=(recommendation_id,),
+            )
+
+    monkeypatch.setattr("riskprobe.cli._service", lambda *args, **kwargs: FakeService())
+    common = [
+        "recommend",
+        "--config",
+        str(tmp_path / "project.yaml"),
+        "--runs-dir",
+        str(tmp_path / "runs"),
+        "--run-id",
+        run_id,
+    ]
+
+    success = runner.invoke(app, [*common, "--all-current-diagnostics"])
+    ambiguous = runner.invoke(
+        app,
+        [*common, "--all-current-diagnostics", "--evidence-id", "a" * 64],
+    )
+    missing = runner.invoke(app, common)
+
+    assert success.exit_code == 0, (success.stdout, success.exception)
+    assert calls == [((), True)]
+    assert json.loads(success.stdout)["recommendation_ids"] == [recommendation_id]
+    assert ambiguous.exit_code == 2
+    assert json.loads(ambiguous.stdout)["error"] == "input_error"
+    assert missing.exit_code == 2
+    assert json.loads(missing.stdout)["error"] == "input_error"
+
+
+@pytest.mark.parametrize(
+    ("mode_value", "expected_mode"),
+    (("disabled", "disabled"), ("deterministic", "deterministic")),
+)
+def test_agent_passes_only_standalone_decision_provider_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode_value: str,
+    expected_mode: str,
+) -> None:
+    from types import SimpleNamespace
+
+    captured: dict[str, object] = {}
+
+    class FakeService:
+        config = SimpleNamespace(dataset=SimpleNamespace(id="synthetic-demo"))
+
+        def orchestrate(self, **kwargs: object) -> object:
+            del kwargs
+            return SimpleNamespace(
+                session_id="0123456789abcdef",
+                status=SimpleNamespace(value="succeeded"),
+                review=SimpleNamespace(approved=True, reason_codes=()),
+                evidence_ids=("a" * 64,),
+                diagnosis_evidence_ids=("a" * 64,),
+                retry_count=0,
+                tool_sequence=(
+                    "inspect",
+                    "diagnose",
+                    "discover",
+                    "recommend",
+                    "review",
+                ),
+            )
+
+    def fake_service(*args: object, **kwargs: object) -> FakeService:
+        del args
+        captured.update(kwargs)
+        return FakeService()
+
+    monkeypatch.setattr("riskprobe.cli._service", fake_service)
+    common = [
+        "--config",
+        str(tmp_path / "project.yaml"),
+        "--runs-dir",
+        str(tmp_path / "runs"),
+        "--decision-provider-mode",
+    ]
+
+    result = runner.invoke(app, ["agent", *common, mode_value])
+
+    assert result.exit_code == 0, result.stdout
+    provider_config = captured["decision_provider_config"]
+    assert provider_config.mode.value == expected_mode
+
+    external = runner.invoke(app, ["agent", *common, "external_host"])
+    assert external.exit_code == 2
+    assert json.loads(external.stdout)["error"] == "argument_error"

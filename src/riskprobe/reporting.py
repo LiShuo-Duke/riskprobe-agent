@@ -10,9 +10,7 @@ from riskprobe.privacy import stable_token
 from riskprobe.profiling import DatasetProfile
 
 _GRADE_ORDER = {"Stable": 0, "Local": 1, "Unstable": 2, "Suspicious": 3}
-_EMBEDDED_POSIX_PATH = re.compile(
-    r"(?:^|[=:\s|;,])/(?:[^/\s]+/)+[^/\s]+"
-)
+_EMBEDDED_POSIX_PATH = re.compile(r"(?:^|[=:\s|;,])/(?:[^/\s]+/)+[^/\s]+")
 _EMBEDDED_WINDOWS_PATH = re.compile(
     r"(?:^|[=:\s|;,])(?:[A-Za-z]:[\\/](?:[^\\/\s]+[\\/])+[^\\/\s]+|\\\\[^\\/\s]+[\\/][^\s]+)"
 )
@@ -36,22 +34,23 @@ def safe_dataset_id(dataset_id: str) -> str:
 
 
 def redact_segment_value(value: str) -> str:
-    """Return an already-deidentified segment code unchanged."""
-    return value
+    """Return a deterministic redacted segment code."""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"segment-{digest}"
 
 
 def redact_limitation(
-    limitation: str, *, expose_segment_values: bool = True
+    limitation: str,
+    *,
+    already_redacted: bool = False,
+    expose_segment_values: bool = False,
 ) -> str:
-    """Keep limitations readable while honoring the segment display policy."""
-    if expose_segment_values:
+    """Keep public limitations readable while honoring segment display policy."""
+    if already_redacted or expose_segment_values:
         return limitation
     match = re.match(r"^((?:holdout:\s*)?single-class [^:]+): (.+)$", limitation)
     if match:
-        return (
-            f"{match.group(1)}: "
-            f"{stable_token(match.group(2), namespace='institution')}"
-        )
+        return f"{match.group(1)}: {redact_segment_value(match.group(2))}"
     return limitation
 
 
@@ -73,6 +72,7 @@ def render_risk_report(
     institution_analysis: dict[str, object] | None = None,
     *,
     expose_segment_values: bool = True,
+    segments_are_redacted: bool = False,
 ) -> str:
     cards = sorted(evidence_cards, key=evidence_sort_key)
     counts = Counter(card.grade for card in cards)
@@ -116,19 +116,11 @@ def render_risk_report(
         ]
     )
     if time_validation_enabled:
-        lines.extend(
-            [
-                f"- Snapshot range: {profile.snapshot_min.isoformat()} to "
-                f"{profile.snapshot_max.isoformat()}",
-            ]
+        lines.append(
+            f"- Snapshot range: {profile.snapshot_min.isoformat()} to "
+            f"{profile.snapshot_max.isoformat()}"
         )
-    lines.extend(
-        [
-            "",
-            "## Quality Issues",
-            "",
-        ]
-    )
+    lines.extend(["", "## Quality Issues", ""])
     if profile.issues:
         lines.extend(
             f"- [{issue.severity}] {issue.code}: {_issue_message(issue.code, issue.message)} "
@@ -350,7 +342,9 @@ def render_risk_report(
     limitations = sorted(
         {
             redact_limitation(
-                limitation, expose_segment_values=expose_segment_values
+                limitation,
+                already_redacted=segments_are_redacted,
+                expose_segment_values=expose_segment_values,
             )
             for card in cards
             for limitation in card.limitations

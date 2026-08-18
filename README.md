@@ -79,29 +79,20 @@ feature / family / segment / label / rule / schema
 
 输出贡献度、排名和数值证据，不返回用户实体、样本行或原始明细。
 
-### 6. 只读 Parquet 数据接入
+### 6. 启动时只读数据配置
 
-直接使用本地 Parquet 时，必须经过：
+本地 Parquet、列角色、特征族和隐私策略由 `ProjectConfig` YAML 明确声明。MCP 服务启动时接收配置路径、运行目录和状态目录；两个 MCP 工具都不接受文件路径、任意代码、身份、预算或数据注册参数。源 Parquet 始终只读，运行产物写入用户指定的本地目录。
+
+### 7. 两阶段 Host 决策 MCP
+
+标准本地 stdio MCP 只暴露：
 
 ```text
-schema 预览
-→ 用户确认实体、时间、机构/分群、目标列
-→ 候选特征预览
-→ 用户确认精确特征清单
-→ 只读注册
+riskprobe_get_decision_context
+riskprobe_submit_decision_proposal
 ```
 
-RiskProbe 不根据列名猜测角色，不自动补充未确认特征，也不修改源 Parquet。
-
-### 7. 跨客户端 Agent
-
-核心 MCP 服务使用标准本地 stdio 协议：
-
-- Kiro：原生 Agent + Skill；
-- Codex：MCP 配置 + `AGENTS.md`；
-- Trae：手动 MCP 配置 + 通用 System Prompt；
-- 其他 MCP 客户端：配置同一个 MCP 服务即可；
-- 不支持 MCP 的客户端：仍可使用 Python 包和 CLI。
+第一阶段固定执行 `inspect → diagnose → discover` 并返回聚合决策上下文；Kiro、Codex、Trae 或其他 Host 从 policy allowlist 选择 action code 后提交原样上下文和完整诊断证据。第二阶段固定执行 `recommend → review` 并返回 terminal result。Host 不拥有底层数据工具，不能跳步或自动上线策略。
 
 ### 当前没有实现的功能
 
@@ -123,7 +114,7 @@ RiskProbe 不根据列名猜测角色，不自动补充未确认特征，也不�
 - Pydantic：配置和数据契约；
 - LightGBM、scikit-learn、SciPy、statsmodels：规则发现和统计计算；
 - Typer：CLI；
-- FastMCP：本地 stdio MCP；
+- 官方 MCP Python SDK：本地 stdio 两阶段 Host 决策服务；
 - PyYAML：项目配置。
 
 ## 快速开始
@@ -176,21 +167,22 @@ mkdir -p data/synthetic
 
 ### 3. 使用自己的本地 Parquet
 
-先设置本地数据白名单：
-
-```bash
-mkdir -p "$HOME/riskprobe-data"
-export RISKPROBE_ALLOWED_DATA_ROOTS="$HOME/riskprobe-data"
-```
-
-将 Parquet 放入该目录。RiskProbe 不会上传、修改或返回实体级数据。
+复制公开示例并创建一个不提交到 Git 的本地 `ProjectConfig` YAML，在其中明确填写只读 Parquet 路径、实体/时间/分层/目标角色和特征配置。CLI 使用 `--config` 读取该文件；MCP 则在进程启动时通过 `--config` 接收它。数据路径不会作为 MCP tool 参数暴露，RiskProbe 也不会上传或修改源 Parquet。
 
 ## MCP 和 Agent 使用
 
-RiskProbe MCP 是本地 stdio 服务，不是 HTTP 服务：
+RiskProbe MCP 是本地 stdio 服务，不是 HTTP 服务。启动时必须固定本地配置、运行目录、状态目录和 Host 身份：
 
 ```bash
-./.venv/bin/python -m riskprobe.mcp_server
+./.venv/bin/python -m riskprobe.mcp_server \
+  --config /absolute/path/project.yaml \
+  --runs-dir /absolute/private/riskprobe-runs \
+  --state-dir /absolute/private/riskprobe-state \
+  --provider-id local-host \
+  --provider-version host-model-version \
+  --principal-id local-analyst \
+  --role analyst \
+  --max-queries 16
 ```
 
 配置模板：
@@ -201,23 +193,21 @@ configs/mcp/codex.example.toml     # Codex 配置
 configs/mcp/trae.example.json      # Trae 配置
 ```
 
-将模板中的占位路径替换为用户自己的项目路径和数据目录。标准工作流为：
+将模板中的占位路径替换为用户自己的项目配置和私有运行目录。标准工作流为：
 
 ```text
-inspect_local_parquet_schema
-→ 确认实体 / 时间 / 机构 / 目标角色
-→ preview_local_parquet_features
-→ 确认精确特征列
-→ register_local_parquet
-→ inspect_dataset
-→ discover_rules(objective="risk")
-→ validate_rules
-→ detect_anomalies
-→ diagnose_anomaly
-→ build_report
+riskprobe_get_decision_context(idempotency_key)
+→ Host 基于完整 findings 和 policy allowlist 选择 action_codes
+→ riskprobe_submit_decision_proposal(
+    同一 idempotency_key,
+    原样 context_id,
+    完整 diagnosis_evidence_ids,
+    action_codes
+  )
+→ terminal agent_result
 ```
 
-`discover_rules` 不接受非空 `constraints`，发现阈值来自已注册项目配置。没有真实时间列时只能进行随机 Train/Test 验证，不得称为严格 OOT。
+服务端完整顺序固定为 `inspect → diagnose → discover → recommend → review`。Host 不能调用底层分析函数、传入路径、删减诊断证据或绕过 review。
 
 ### 客户端对照
 
@@ -238,7 +228,7 @@ inspect_local_parquet_schema
 
 ## 隐私和安全边界
 
-- Parquet 只读，并且必须位于 `RISKPROBE_ALLOWED_DATA_ROOTS` 白名单目录；
+- Parquet 只读，路径只由用户在本地 `ProjectConfig` 中声明，并在 MCP 启动时固定；
 - 输出只包含聚合指标，不输出实体值、样本行、原始日志、真实路径或明细行；
 - 工作流不执行 Shell、任意 SQL/Python、网络访问或自动策略上线；
 - 默认在受限聚合字段中展示已确认分层列的真实机构名，并保留 `institution_token`；

@@ -346,3 +346,14 @@ def test_metadata_grade_b_adds_limitation_without_downgrading_stable_card() -> N
 
     assert card.grade == "Stable"
     assert card.limitations == ("label performance window unknown",)
+
+
+def test_validation_cards_expose_binary_rule_ks_metrics() -> None:
+    frame = _frame([("A", "2026-01-01", 80, 20, 20, 80)])
+
+    card = _validate(frame, frame, time_validation_enabled=False)[0]
+
+    assert card.train.hit_good_rate == pytest.approx(0.2)
+    assert card.train.ks_signed == pytest.approx(0.6)
+    assert card.train.ks_stat == pytest.approx(0.6)
+    assert card.test.ks_signed == pytest.approx(0.6)

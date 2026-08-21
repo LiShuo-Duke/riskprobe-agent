@@ -120,3 +120,101 @@ def test_scorecard_transform_is_frozen_and_validates_required_columns() -> None:
     assert len(prediction.probabilities) == 2
     with pytest.raises(ValueError, match="feature columns"):
         model.predict(pl.DataFrame({"other": [1]}))
+
+
+def test_scorecard_records_weight_strategy_without_calibration() -> None:
+    from riskprobe.config import ImbalanceConfig
+    from riskprobe.rules.scorecard import fit_scorecard
+
+    train = pl.DataFrame(
+        {
+            "x": list(range(1, 13)),
+            "target": [0] * 6 + [1] * 6,
+        }
+    )
+    model = fit_scorecard(
+        train,
+        feature_names=("x",),
+        target_col="target",
+        imbalance=ImbalanceConfig(enabled=True, strategy="sample_weight"),
+    )
+
+    assert model.imbalance_strategy == "sample_weight"
+    assert model.calibrated is False
+    assert model.random_seed == 42
+    assert model.class_counts == (6, 6)
+
+
+def test_scorecard_sample_weights_match_train_row_count(
+    monkeypatch,
+) -> None:
+    import riskprobe.rules.scorecard as scorecard_module
+    from riskprobe.config import ImbalanceConfig
+    from riskprobe.rules.scorecard import fit_scorecard
+
+    train = pl.DataFrame(
+        {
+            "x": list(range(1, 13)),
+            "target": [0] * 8 + [1] * 4,
+        }
+    )
+    captured: dict[str, np.ndarray | None] = {}
+    real_logistic_regression = scorecard_module.LogisticRegression
+
+    class SpyLogisticRegression(real_logistic_regression):
+        def fit(self, features, target, **fit_kwargs):
+            weight = fit_kwargs.get("sample_weight")
+            captured["sample_weight"] = (
+                None if weight is None else np.asarray(weight)
+            )
+            return super().fit(features, target, **fit_kwargs)
+
+    monkeypatch.setattr(
+        scorecard_module,
+        "LogisticRegression",
+        SpyLogisticRegression,
+    )
+
+    fit_scorecard(
+        train,
+        feature_names=("x",),
+        target_col="target",
+        imbalance=ImbalanceConfig(enabled=True, strategy="sample_weight"),
+    )
+
+    weights = captured["sample_weight"]
+    assert weights is not None
+    assert weights.shape == (train.height,)
+    np.testing.assert_allclose(
+        weights,
+        np.array([0.75] * 8 + [1.5] * 4),
+    )
+
+
+def test_score_ks_evaluates_frozen_scorecard_without_refitting() -> None:
+    from riskprobe.metrics import compute_score_ks
+    from riskprobe.rules.scorecard import fit_scorecard
+
+    train = pl.DataFrame(
+        {
+            "x": list(range(1, 13)),
+            "target": [0] * 6 + [1] * 6,
+        }
+    )
+    model = fit_scorecard(train, feature_names=("x",), target_col="target")
+    edges = model.binning_models[0].edges
+    coefficients = model.coefficients
+    score_frame = train.select("x")
+    scores = model.predict_proba(score_frame)[:, 1]
+
+    train_result = compute_score_ks(scores, train.get_column("target").to_numpy())
+    reversed_result = compute_score_ks(scores, [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+
+    assert train_result.signed_statistic is not None
+    assert reversed_result.signed_statistic is not None
+    assert np.isclose(
+        reversed_result.signed_statistic,
+        -train_result.signed_statistic,
+    )
+    assert model.binning_models[0].edges == edges
+    assert model.coefficients == coefficients

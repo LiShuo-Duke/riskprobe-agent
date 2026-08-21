@@ -175,6 +175,12 @@ class PrivacyConfig(StrictModel):
     expose_segment_values: bool = True
 
 
+class ImbalanceConfig(StrictModel):
+    enabled: bool = False
+    strategy: Literal["class_weight", "sample_weight"] = "class_weight"
+    weighting: Literal["balanced"] = "balanced"
+
+
 class ProjectConfig(StrictModel):
     dataset: DatasetConfig
     columns: ColumnRoles
@@ -187,6 +193,7 @@ class ProjectConfig(StrictModel):
     discovery: DiscoveryConfig = DiscoveryConfig()
     validation: ValidationConfig = ValidationConfig()
     privacy: PrivacyConfig = PrivacyConfig()
+    imbalance: ImbalanceConfig = ImbalanceConfig()
 
     @property
     def metadata_grade(self) -> Literal["A", "B", "C", "D"]:

@@ -4,7 +4,7 @@
 
 RiskProbe 是一个 **local-first** 的 Python 风控分析工具包，提供确定性规则引擎、CLI 和标准 stdio MCP 服务。它可以被 Kiro、Codex、Trae 以及其他 MCP 客户端调用。
 
-> **当前版本：** `v0.2.0`。RiskProbe 只在本地读取用户明确允许的 Parquet 数据，不上传数据，不暴露实体级明细。v0.2.0 增加了 WOE/IV 规则分箱、规则—评分卡融合、告警到复测闭环，以及有界 Agent 重试和本地 citation 接入。
+> **当前版本：** `v0.3.0`。RiskProbe 只在本地读取用户明确允许的 Parquet 数据，不上传数据，不暴露实体级明细。v0.3.0 增加了类别不平衡训练、规则和连续 score 的 KS 分离度、Train-only 防泄漏边界及评分卡 provenance 记录。
 
 ## RiskProbe 解决什么问题？
 
@@ -37,7 +37,12 @@ RiskProbe 将规则发现、统计验证和监控计算固定在 Python 确定�
 - Benjamini-Hochberg / FDR 校正；
 - Bootstrap Lift 置信区间；
 - 机构或分群一致性；
-- 时间 Lift 衰减。
+- 时间 Lift 衰减；
+- 规则指标 `hit_good_rate`、`ks_signed` 和 `ks_stat`。
+
+对于二值规则，`hit_good_rate` 是命中 good 样本数占全部 good 样本数的比例，`ks_signed = hit_bad_rate - hit_good_rate`，`ks_stat = abs(ks_signed)`。`RuleMetrics.p_value` 继续独立计算双侧 Fisher 精确检验，不由 KS 替代。
+
+连续 score 使用 `compute_score_ks` 计算分离度，支持 `higher_is_bad` 和 `lower_is_bad`。该函数只过滤 score 的 non-finite 值；过滤后出现空类或没有 finite score 时，`statistic`、`signed_statistic` 和 `p_value` 均为 `None`，并返回 limitation `single_class_or_no_finite_scores`。
 
 规则分为：
 
@@ -47,13 +52,15 @@ Stable / Local / Unstable / Suspicious
 
 ### 3. 规则—评分卡融合
 
-v0.2.0 提供 train-only WOE/IV 分箱和冻结边界变换，可将 WOE 特征与 `RiskRule` 命中特征一起训练 LogisticRegression 评分卡，输出：
+v0.3.0 在 v0.2.0 的 train-only WOE/IV 分箱和冻结边界变换基础上，可将 WOE 特征与 `RiskRule` 命中特征一起训练 LogisticRegression 评分卡，输出：
 
 - 坏账概率和 0–1000 风险分；
 - `low / medium / high / critical` 风险等级；
 - 基于特征贡献度的 top reason codes。
 
-评分卡预测不会重新拟合分箱，缺失值使用训练期缺失箱，规则命中特征只由确定性规则表达式计算。
+`imbalance.enabled` 默认是 `false`。启用类别不平衡处理时支持 `class_weight` 和 `sample_weight`；权重只由 Train 的二值 target 派生。Test/Holdout 的规则指标、Lift CI 和分群/时间证据保持真实、未加权。
+
+评分卡预测概率未做 calibration（`calibrated=False`），不会重新拟合分箱，缺失值使用训练期缺失箱，规则命中特征只由确定性规则表达式计算。可用于追溯的 scorecard provenance 包括不平衡策略、固定随机种子、Train class counts 和冻结的 WOE 边界/统计量。
 
 ### 4. 多机构稳定性分析
 
@@ -115,10 +122,9 @@ riskprobe_submit_decision_proposal
 
 ### 当前没有实现的功能
 
-`v0.2.0` 仍不宣称已经实现以下能力：
+`v0.3.0` 仍不宣称已经实现以下能力：
 
 - ADASYN/SMOTE 过采样；
-- KS 检验；
 - 在线模型服务；
 - 数据库连接器；
 - 远程数据上传；
@@ -280,8 +286,6 @@ tests/                     单元、集成和安全边界测试
 
 ## 后续规划
 
-- 在明确数据契约、防泄漏和可复现性后，增加可选的类别不平衡处理策略；
-- 在定义统计解释和输入契约后，补充 KS 等互补检验；
 - 继续完善 Python 打包、CLI 和多客户端适配；
 - 只有在完成认证、租户隔离、审计和数据治理设计后，才考虑远程部署。
 

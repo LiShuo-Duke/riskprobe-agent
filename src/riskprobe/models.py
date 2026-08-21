@@ -37,6 +37,20 @@ class RuleMetrics(FrozenModel):
     precision: float
     recall: float
     p_value: float
+    hit_good_rate: float = 0.0
+    ks_signed: float | None = None
+    ks_stat: float | None = None
+
+
+class ScoreSeparation(FrozenModel):
+    statistic: float | None
+    signed_statistic: float | None
+    p_value: float | None
+    bad_count: int
+    good_count: int
+    excluded_count: int
+    method: Literal["ks_2samp"]
+    limitation: str | None = None
 
 
 class SliceMetrics(FrozenModel):

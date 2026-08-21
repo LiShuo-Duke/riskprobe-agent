@@ -2339,3 +2339,45 @@ def test_orchestrate_with_citations_keeps_rag_outside_agent_result(
         "query_text": "data quality",
         "limit": 3,
     }
+
+
+def test_service_discover_with_metrics_uses_one_snapshot_and_passes_imbalance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.config import ImbalanceConfig
+    from riskprobe.rules.discovery import DiscoveryResult
+
+    config = _small_config(tmp_path, rows=200)
+    config = config.model_copy(
+        update={
+            "imbalance": ImbalanceConfig(
+                enabled=True,
+                strategy="sample_weight",
+            )
+        }
+    )
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+    captured: dict[str, object] = {}
+
+    def fail_direct_dataset() -> object:
+        raise AssertionError("discovery must use the immutable snapshot")
+
+    def fake_discovery(
+        train: pl.DataFrame,
+        feature_names: list[str],
+        target_col: str,
+        discovery_config: object,
+        **kwargs: object,
+    ) -> DiscoveryResult:
+        del train, feature_names, target_col, discovery_config
+        captured["imbalance"] = kwargs.get("imbalance")
+        return DiscoveryResult((), {}, 0, 0, 0, 0)
+
+    monkeypatch.setattr(service, "_dataset", fail_direct_dataset)
+    monkeypatch.setattr(service_module, "discover_with_metrics", fake_discovery)
+
+    result = service.discover_with_metrics()
+
+    assert result == DiscoveryResult((), {}, 0, 0, 0, 0)
+    assert captured["imbalance"] == config.imbalance

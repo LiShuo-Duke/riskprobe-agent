@@ -10,13 +10,21 @@ import polars as pl
 from lightgbm import LGBMClassifier
 from sklearn.tree import DecisionTreeClassifier
 
-from riskprobe.config import DiscoveryConfig
-from riskprobe.metrics import compute_rule_metrics
+from riskprobe.config import DiscoveryConfig, ImbalanceConfig
+from riskprobe.metrics import balanced_sample_weights, compute_rule_metrics
 from riskprobe.models import Condition, RiskRule, RuleMetrics
 from riskprobe.rules.expression import evaluate_rule
 from riskprobe.rules.scorecard import fit_woe_binning
 
 _QUANTILES = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+
+def _imbalance_strategy(imbalance: ImbalanceConfig | None) -> str:
+    if imbalance is not None and type(imbalance) is not ImbalanceConfig:
+        raise TypeError("imbalance must be an ImbalanceConfig or None")
+    if imbalance is None or not imbalance.enabled:
+        return "disabled"
+    return imbalance.strategy
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,15 +86,28 @@ def _tree_thresholds(
     target: np.ndarray[Any, np.dtype[Any]],
     min_samples_leaf: int,
     seed: int,
+    *,
+    imbalance: ImbalanceConfig | None = None,
 ) -> list[float]:
     if values.size < 2 or np.unique(target).size < 2:
         return []
-    classifier = DecisionTreeClassifier(
-        max_depth=2,
-        min_samples_leaf=min_samples_leaf,
-        random_state=seed,
-    )
-    classifier.fit(values.reshape(-1, 1), target)
+    strategy = _imbalance_strategy(imbalance)
+    classifier_kwargs: dict[str, Any] = {
+        "max_depth": 2,
+        "min_samples_leaf": min_samples_leaf,
+        "random_state": seed,
+    }
+    if strategy == "class_weight":
+        classifier_kwargs["class_weight"] = "balanced"
+    classifier = DecisionTreeClassifier(**classifier_kwargs)
+    if strategy == "sample_weight":
+        classifier.fit(
+            values.reshape(-1, 1),
+            target,
+            sample_weight=balanced_sample_weights(target),
+        )
+    else:
+        classifier.fit(values.reshape(-1, 1), target)
     return [
         float(threshold)
         for feature, threshold in zip(
@@ -113,21 +134,34 @@ def _lightgbm_thresholds(
     values: np.ndarray[Any, np.dtype[np.float64]],
     target: np.ndarray[Any, np.dtype[Any]],
     seed: int,
+    *,
+    imbalance: ImbalanceConfig | None = None,
 ) -> list[float]:
     if values.size < 2 or np.unique(target).size < 2:
         return []
-    classifier = LGBMClassifier(
-        n_estimators=30,
-        max_depth=2,
-        num_leaves=4,
-        learning_rate=0.05,
-        deterministic=True,
-        force_col_wise=True,
-        random_state=seed,
-        verbosity=-1,
-        n_jobs=1,
-    )
-    classifier.fit(values.reshape(-1, 1), target)
+    strategy = _imbalance_strategy(imbalance)
+    classifier_kwargs: dict[str, Any] = {
+        "n_estimators": 30,
+        "max_depth": 2,
+        "num_leaves": 4,
+        "learning_rate": 0.05,
+        "deterministic": True,
+        "force_col_wise": True,
+        "random_state": seed,
+        "verbosity": -1,
+        "n_jobs": 1,
+    }
+    if strategy == "class_weight":
+        classifier_kwargs["class_weight"] = "balanced"
+    classifier = LGBMClassifier(**classifier_kwargs)
+    if strategy == "sample_weight":
+        classifier.fit(
+            values.reshape(-1, 1),
+            target,
+            sample_weight=balanced_sample_weights(target),
+        )
+    else:
+        classifier.fit(values.reshape(-1, 1), target)
     thresholds: list[float] = []
     for tree in classifier.booster_.dump_model()["tree_info"]:
         _collect_lightgbm_thresholds(tree["tree_structure"], thresholds)
@@ -139,6 +173,8 @@ def _feature_thresholds(
     feature_name: str,
     target: np.ndarray[Any, np.dtype[Any]],
     config: DiscoveryConfig,
+    *,
+    imbalance: ImbalanceConfig | None = None,
 ) -> list[float]:
     if not train.schema[feature_name].is_numeric():
         return []
@@ -173,10 +209,29 @@ def _feature_thresholds(
         if woe_model is not None and woe_model.iv >= config.woe_min_iv:
             thresholds.extend(woe_model.edges)
     min_samples_leaf, _ = _support_bounds(train.height, config.min_support)
-    thresholds.extend(
-        _tree_thresholds(values, finite_target, min_samples_leaf, config.random_seed)
-    )
-    thresholds.extend(_lightgbm_thresholds(values, finite_target, config.random_seed))
+    if _imbalance_strategy(imbalance) == "disabled":
+        thresholds.extend(
+            _tree_thresholds(values, finite_target, min_samples_leaf, config.random_seed)
+        )
+        thresholds.extend(_lightgbm_thresholds(values, finite_target, config.random_seed))
+    else:
+        thresholds.extend(
+            _tree_thresholds(
+                values,
+                finite_target,
+                min_samples_leaf,
+                config.random_seed,
+                imbalance=imbalance,
+            )
+        )
+        thresholds.extend(
+            _lightgbm_thresholds(
+                values,
+                finite_target,
+                config.random_seed,
+                imbalance=imbalance,
+            )
+        )
     return sorted({threshold for threshold in thresholds if math.isfinite(threshold)})
 
 
@@ -210,10 +265,28 @@ def _single_candidates(
     feature_names: list[str],
     target: np.ndarray[Any, np.dtype[Any]],
     config: DiscoveryConfig,
+    *,
+    imbalance: ImbalanceConfig | None = None,
 ) -> list[_Candidate]:
     candidates: dict[str, _Candidate] = {}
+    strategy = _imbalance_strategy(imbalance)
     for feature_name in sorted(set(feature_names)):
-        for threshold in _feature_thresholds(train, feature_name, target, config):
+        if strategy == "disabled":
+            thresholds = _feature_thresholds(
+                train,
+                feature_name,
+                target,
+                config,
+            )
+        else:
+            thresholds = _feature_thresholds(
+                train,
+                feature_name,
+                target,
+                config,
+                imbalance=imbalance,
+            )
+        for threshold in thresholds:
             for operator in ("<=", ">"):
                 condition = Condition(
                     feature=feature_name,
@@ -315,7 +388,10 @@ def discover_with_metrics(
     feature_names: list[str],
     target_col: str,
     config: DiscoveryConfig,
+    *,
+    imbalance: ImbalanceConfig | None = None,
 ) -> DiscoveryResult:
+    strategy = _imbalance_strategy(imbalance)
     missing_features = sorted(set(feature_names) - set(train.columns))
     if missing_features:
         missing = ", ".join(missing_features)
@@ -329,7 +405,16 @@ def discover_with_metrics(
     if np.unique(target).size < 2 or not np.any(target == 1):
         return DiscoveryResult((), {}, 0, 0, 0, 0)
 
-    singles = _single_candidates(train, feature_names, target, config)
+    if strategy == "disabled":
+        singles = _single_candidates(train, feature_names, target, config)
+    else:
+        singles = _single_candidates(
+            train,
+            feature_names,
+            target,
+            config,
+            imbalance=imbalance,
+        )
     selected_singles = singles[: config.max_single_rules]
     pairs = _pair_candidates(train, target, singles, config)
     selected_pairs = _diverse_pair_selection(pairs, config.max_pair_rules)
@@ -353,5 +438,17 @@ def discover_rules(
     feature_names: list[str],
     target_col: str,
     config: DiscoveryConfig,
+    *,
+    imbalance: ImbalanceConfig | None = None,
 ) -> list[RiskRule]:
-    return list(discover_with_metrics(train, feature_names, target_col, config).rules)
+    if _imbalance_strategy(imbalance) == "disabled":
+        return list(discover_with_metrics(train, feature_names, target_col, config).rules)
+    return list(
+        discover_with_metrics(
+            train,
+            feature_names,
+            target_col,
+            config,
+            imbalance=imbalance,
+        ).rules
+    )

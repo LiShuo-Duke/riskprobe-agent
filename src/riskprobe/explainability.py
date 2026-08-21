@@ -17,10 +17,13 @@ _METRIC_FIELDS = (
     "precision",
     "recall",
     "p_value",
+    "hit_good_rate",
+    "ks_signed",
+    "ks_stat",
 )
 
 
-def _metric_payload(metrics: RuleMetrics) -> dict[str, float | int]:
+def _metric_payload(metrics: RuleMetrics) -> dict[str, float | int | None]:
     return {field: getattr(metrics, field) for field in _METRIC_FIELDS}
 
 

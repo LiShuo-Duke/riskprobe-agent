@@ -1035,6 +1035,14 @@ class RiskProbeService:
                 shuffle=True,
                 seed=self.config.discovery.random_seed,
             )
+        if self.config.imbalance.enabled:
+            return discover_rules(
+                sample,
+                feature_names,
+                self.config.columns.target,
+                self.config.discovery,
+                imbalance=self.config.imbalance,
+            )
         return discover_rules(
             sample,
             feature_names,
@@ -1052,6 +1060,14 @@ class RiskProbeService:
                 n=_DISCOVERY_SAMPLE_LIMIT,
                 shuffle=True,
                 seed=self.config.discovery.random_seed,
+            )
+        if self.config.imbalance.enabled:
+            return discover_with_metrics(
+                sample,
+                feature_names,
+                self.config.columns.target,
+                self.config.discovery,
+                imbalance=self.config.imbalance,
             )
         return discover_with_metrics(
             sample,
@@ -1200,12 +1216,12 @@ class RiskProbeService:
             raise ValueError("metadata grade below B blocks rule conclusions")
 
     def discover_with_metrics(self) -> DiscoveryResult:
-        profile = self.inspect()
-        self._assert_rule_conclusion_allowed(profile)
-        dataset = self._dataset()
-        feature_names = self._feature_names(dataset)
-        train, _, _, _ = self._partitions(dataset, feature_names)
-        return self._discovery_result_from_train(train, feature_names)
+        with self._snapshot_dataset() as dataset:
+            profile = profile_dataset(dataset, self.config)
+            self._assert_rule_conclusion_allowed(profile)
+            feature_names = self._feature_names(dataset)
+            train, _, _, _ = self._partitions(dataset, feature_names)
+            return self._discovery_result_from_train(train, feature_names)
 
     def discover(self) -> list[RiskRule]:
         with self._snapshot_dataset() as dataset:

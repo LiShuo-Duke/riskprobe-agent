@@ -2,10 +2,10 @@ from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
-from scipy.stats import fisher_exact
+from scipy.stats import fisher_exact, ks_2samp
 from statsmodels.stats.multitest import multipletests
 
-from riskprobe.models import RuleMetrics
+from riskprobe.models import RuleMetrics, ScoreSeparation
 
 
 def _validated_arrays(mask: Any, target: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -22,6 +22,50 @@ def _validated_arrays(mask: Any, target: Any) -> tuple[np.ndarray, np.ndarray]:
     return mask_array, target_array
 
 
+_BINARY_TARGET_ERROR = (
+    "target must be a non-empty one-dimensional finite binary target containing 0 and 1"
+)
+
+
+def _validated_binary_target(target: Any) -> np.ndarray:
+    try:
+        target_array = np.asarray(target)
+    except (TypeError, ValueError) as error:
+        raise ValueError(_BINARY_TARGET_ERROR) from error
+    if target_array.ndim != 1 or target_array.size == 0:
+        raise ValueError(_BINARY_TARGET_ERROR)
+    if target_array.dtype.kind not in "iuf":
+        raise ValueError(_BINARY_TARGET_ERROR)
+    if not np.all(np.isfinite(target_array)) or not np.all(
+        (target_array == 0) | (target_array == 1)
+    ):
+        raise ValueError(_BINARY_TARGET_ERROR)
+    if not np.any(target_array == 0) or not np.any(target_array == 1):
+        raise ValueError(_BINARY_TARGET_ERROR)
+    return target_array
+
+
+def balanced_class_weights(target: Any) -> dict[int, float]:
+    target_array = _validated_binary_target(target)
+    sample_count = target_array.size
+    return {
+        class_value: float(
+            sample_count / (2 * int(np.count_nonzero(target_array == class_value)))
+        )
+        for class_value in (0, 1)
+    }
+
+
+def balanced_sample_weights(target: Any) -> np.ndarray:
+    target_array = _validated_binary_target(target)
+    class_weights = balanced_class_weights(target_array)
+    return np.where(
+        target_array == 0,
+        class_weights[0],
+        class_weights[1],
+    )
+
+
 def compute_rule_metrics(mask: Any, target: Any, positive_value: Any) -> RuleMetrics:
     mask_array, target_array = _validated_arrays(mask, target)
     positive = target_array == positive_value
@@ -30,6 +74,7 @@ def compute_rule_metrics(mask: Any, target: Any, positive_value: Any) -> RuleMet
         raise ValueError("target has no positive samples")
 
     sample_count = len(target_array)
+    negative_count = sample_count - positive_count
     support_count = int(np.count_nonzero(mask_array))
     hit_positive = int(np.count_nonzero(mask_array & positive))
     hit_negative = support_count - hit_positive
@@ -40,6 +85,7 @@ def compute_rule_metrics(mask: Any, target: Any, positive_value: Any) -> RuleMet
     coverage = support_count / sample_count
     base_bad_rate = positive_count / sample_count
     hit_bad_rate = hit_positive / support_count if support_count else 0.0
+    hit_good_rate = hit_negative / negative_count if negative_count else 0.0
     non_hit_bad_rate = non_hit_positive / non_hit_count if non_hit_count else 0.0
     lift = hit_bad_rate / base_bad_rate
     precision = hit_bad_rate
@@ -50,6 +96,10 @@ def compute_rule_metrics(mask: Any, target: Any, positive_value: Any) -> RuleMet
             alternative="two-sided",
         ).pvalue
     )
+    ks_signed = (
+        None if negative_count == 0 else float(hit_bad_rate - hit_good_rate)
+    )
+    ks_stat = None if ks_signed is None else float(abs(ks_signed))
 
     return RuleMetrics(
         support_count=support_count,
@@ -61,6 +111,9 @@ def compute_rule_metrics(mask: Any, target: Any, positive_value: Any) -> RuleMet
         precision=precision,
         recall=recall,
         p_value=p_value,
+        hit_good_rate=hit_good_rate,
+        ks_signed=ks_signed,
+        ks_stat=ks_stat,
     )
 
 
@@ -126,3 +179,110 @@ def adjust_pvalues(p_values: Sequence[float]) -> list[float]:
     if np.any((values < 0.0) | (values > 1.0)):
         raise ValueError("p-values must be between 0 and 1")
     return multipletests(values, method="fdr_bh")[1].tolist()
+
+
+_SCORE_KS_LIMITATION = "single_class_or_no_finite_scores"
+
+
+def _validated_score_inputs(
+    scores: Any,
+    target: Any,
+    positive_value: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        score_array = np.asarray(scores, dtype=np.float64)
+        target_array = np.asarray(target)
+    except (TypeError, ValueError) as error:
+        raise ValueError("scores and target must be one-dimensional arrays") from error
+    if score_array.ndim != 1 or target_array.ndim != 1:
+        raise ValueError("scores and target must be one-dimensional")
+    if len(score_array) != len(target_array):
+        raise ValueError("scores and target must have the same length")
+    if len(score_array) == 0:
+        raise ValueError("scores and target must not be empty")
+    try:
+        target_numeric = np.asarray(target_array, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(_BINARY_TARGET_ERROR) from error
+    if (
+        not np.all(np.isfinite(target_numeric))
+        or not np.isin(target_numeric, (0.0, 1.0)).all()
+        or isinstance(positive_value, bool)
+        or positive_value not in (0, 1)
+    ):
+        raise ValueError(_BINARY_TARGET_ERROR)
+    return score_array, target_numeric.astype(np.int8)
+
+
+def _signed_ks_statistic(
+    bad_scores: np.ndarray,
+    good_scores: np.ndarray,
+    direction: str,
+) -> tuple[float, float]:
+    combined = np.unique(np.concatenate((bad_scores, good_scores)))
+    bad_sorted = np.sort(bad_scores)
+    good_sorted = np.sort(good_scores)
+    bad_cdf = np.searchsorted(bad_sorted, combined, side="right") / len(bad_sorted)
+    good_cdf = np.searchsorted(good_sorted, combined, side="right") / len(good_sorted)
+    differences = good_cdf - bad_cdf
+    location = int(np.argmax(np.abs(differences)))
+    statistic = float(np.max(np.abs(differences)))
+    signed = float(differences[location])
+    if direction == "lower_is_bad":
+        signed = -signed
+    return statistic, signed
+
+
+def compute_score_ks(
+    scores: Any,
+    target: Any,
+    *,
+    positive_value: Any = 1,
+    direction: str = "higher_is_bad",
+) -> ScoreSeparation:
+    """Compare frozen continuous scores between bad and good target classes."""
+
+    if direction not in {"higher_is_bad", "lower_is_bad"}:
+        raise ValueError("direction must be higher_is_bad or lower_is_bad")
+    score_array, target_array = _validated_score_inputs(
+        scores,
+        target,
+        positive_value,
+    )
+    finite = np.isfinite(score_array)
+    filtered_scores = score_array[finite]
+    filtered_target = target_array[finite]
+    bad = filtered_target == positive_value
+    bad_scores = filtered_scores[bad]
+    good_scores = filtered_scores[~bad]
+    bad_count = int(bad_scores.size)
+    good_count = int(good_scores.size)
+    excluded_count = int(np.count_nonzero(~finite))
+    if bad_count == 0 or good_count == 0:
+        return ScoreSeparation(
+            statistic=None,
+            signed_statistic=None,
+            p_value=None,
+            bad_count=bad_count,
+            good_count=good_count,
+            excluded_count=excluded_count,
+            method="ks_2samp",
+            limitation=_SCORE_KS_LIMITATION,
+        )
+
+    result = ks_2samp(bad_scores, good_scores, alternative="two-sided")
+    statistic, signed_statistic = _signed_ks_statistic(
+        bad_scores,
+        good_scores,
+        direction,
+    )
+    return ScoreSeparation(
+        statistic=statistic,
+        signed_statistic=signed_statistic,
+        p_value=float(result.pvalue),
+        bad_count=bad_count,
+        good_count=good_count,
+        excluded_count=excluded_count,
+        method="ks_2samp",
+        limitation=None,
+    )

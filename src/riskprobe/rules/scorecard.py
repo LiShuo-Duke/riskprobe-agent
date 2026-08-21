@@ -11,11 +11,21 @@ import numpy as np
 import polars as pl
 from sklearn.linear_model import LogisticRegression
 
+from riskprobe.config import ImbalanceConfig
+from riskprobe.metrics import balanced_sample_weights
 from riskprobe.models import RiskRule
 from riskprobe.rules.expression import evaluate_rule
 
 MonotonicDirection = Literal["none", "increasing", "decreasing", "auto"]
 ResolvedDirection = Literal["none", "increasing", "decreasing"]
+
+
+def _imbalance_strategy(imbalance: ImbalanceConfig | None) -> str:
+    if imbalance is not None and type(imbalance) is not ImbalanceConfig:
+        raise TypeError("imbalance must be an ImbalanceConfig or None")
+    if imbalance is None or not imbalance.enabled:
+        return "disabled"
+    return imbalance.strategy
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +315,10 @@ class ScorecardModel:
     rules: tuple[RiskRule, ...]
     coefficients: tuple[float, ...]
     intercept: float
+    imbalance_strategy: str = "disabled"
+    random_seed: int = 42
+    calibrated: bool = False
+    class_counts: tuple[int, int] = (0, 0)
 
     @property
     def rule_names(self) -> tuple[str, ...]:
@@ -408,6 +422,8 @@ def fit_scorecard(
     min_iv: float = 0.0,
     C: float = 1.0,
     max_iter: int = 1000,
+    imbalance: ImbalanceConfig | None = None,
+    random_seed: int = 42,
 ) -> ScorecardModel:
     """Fit a train-only WOE scorecard with optional deterministic rule features."""
 
@@ -430,6 +446,9 @@ def fit_scorecard(
         raise ValueError("C must be a positive finite number")
     if type(max_iter) is not int or max_iter < 1:
         raise ValueError("max_iter must be a positive integer")
+    if type(random_seed) is not int or random_seed != 42:
+        raise ValueError("random_seed must be 42")
+    imbalance_strategy = _imbalance_strategy(imbalance)
 
     fitted_rules = tuple(rules)
     if any(not isinstance(rule, RiskRule) for rule in fitted_rules):
@@ -466,19 +485,37 @@ def fit_scorecard(
         raise ValueError("no scorecard features remain after IV filtering")
 
     design = _build_scorecard_matrix(frame, binning_models, fitted_rules)
-    estimator = LogisticRegression(
-        C=float(C),
-        max_iter=max_iter,
-        solver="lbfgs",
-    )
-    estimator.fit(design, target)
+    estimator_kwargs: dict[str, object] = {
+        "C": float(C),
+        "max_iter": max_iter,
+        "solver": "lbfgs",
+        "random_state": random_seed,
+    }
+    if imbalance_strategy == "class_weight":
+        estimator_kwargs["class_weight"] = "balanced"
+    estimator = LogisticRegression(**estimator_kwargs)
+    if imbalance_strategy == "sample_weight":
+        estimator.fit(
+            design,
+            target,
+            sample_weight=balanced_sample_weights(target),
+        )
+    else:
+        estimator.fit(design, target)
     coefficients = tuple(float(value) for value in estimator.coef_[0])
+    class_counts = tuple(
+        int(np.count_nonzero(target == class_value)) for class_value in (0, 1)
+    )
     return ScorecardModel(
         feature_names=selected_names,
         binning_models=binning_models,
         rules=fitted_rules,
         coefficients=coefficients,
         intercept=float(estimator.intercept_[0]),
+        imbalance_strategy=imbalance_strategy,
+        random_seed=random_seed,
+        calibrated=False,
+        class_counts=class_counts,
     )
 
 

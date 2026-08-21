@@ -255,3 +255,36 @@ def test_feature_family_exact_columns_rejects_duplicates() -> None:
             families={"numeric": ["age"]},
             exact_columns=["age", "age"],
         )
+
+
+def test_imbalance_config_defaults_off_and_rejects_unsupported_strategy() -> None:
+    from riskprobe.config import ImbalanceConfig
+
+    config = ImbalanceConfig()
+
+    assert config.enabled is False
+    assert config.strategy == "class_weight"
+    assert config.weighting == "balanced"
+    with pytest.raises(ValidationError):
+        ImbalanceConfig.model_validate({"enabled": True, "strategy": "smote"})
+    with pytest.raises(ValidationError):
+        ImbalanceConfig.model_validate({"enabled": True, "unexpected": True})
+
+
+def test_project_config_defaults_to_disabled_imbalance() -> None:
+    config = ProjectConfig.model_validate(
+        {
+            "dataset": {"id": "demo", "path": "/tmp/demo.parquet"},
+            "columns": {
+                "entity": "id",
+                "snapshot": "dt",
+                "segment": "institution",
+                "target": "target",
+            },
+            "target": {"positive_value": 1, "positive_meaning": "bad_debt"},
+            "snapshot": {"meaning": "customer_specified_feature_cutoff"},
+            "features": {"families": {"numeric": ["feature_"]}},
+        }
+    )
+
+    assert config.imbalance.enabled is False

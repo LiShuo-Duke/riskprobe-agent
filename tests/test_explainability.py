@@ -118,6 +118,7 @@ def test_evidence_summary_ranks_by_test_lift_and_preserves_grade() -> None:
     assert set(summary["top_rules"][0]["train"]) == {
         "support_count", "coverage", "base_bad_rate", "hit_bad_rate",
         "non_hit_bad_rate", "lift", "precision", "recall", "p_value",
+        "hit_good_rate", "ks_signed", "ks_stat",
     }
     assert set(summary["top_rules"][0]) >= {
         "lift_ci", "adjusted_p_value", "segment_consistency",

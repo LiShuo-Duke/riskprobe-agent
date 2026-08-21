@@ -1,3 +1,4 @@
+import numpy as np
 import polars as pl
 import pytest
 
@@ -284,3 +285,111 @@ def test_discover_with_metrics_returns_counts_and_train_metrics() -> None:
     assert set(result.train_metrics) == {rule.rule_id for rule in result.rules}
     assert all(metric.lift >= 0 for metric in result.train_metrics.values())
     assert any(len(rule.conditions) == 2 for rule in result.rules)
+
+
+def test_discovery_imbalance_is_default_off_and_train_only() -> None:
+    from riskprobe.config import ImbalanceConfig
+    from riskprobe.rules.discovery import discover_with_metrics
+
+    train = pl.DataFrame(
+        {
+            "feature": [float(value) for value in range(40)],
+            "target": [0] * 20 + [1] * 20,
+        }
+    )
+    config = DiscoveryConfig(
+        min_support=0.1,
+        max_single_rules=10,
+        max_pair_rules=0,
+    )
+
+    baseline = discover_with_metrics(train, ["feature"], "target", config)
+    explicit_off = discover_with_metrics(
+        train,
+        ["feature"],
+        "target",
+        config,
+        imbalance=ImbalanceConfig(),
+    )
+
+    assert baseline == explicit_off
+
+
+def test_discovery_accepts_enabled_class_and_sample_weight_strategies() -> None:
+    from riskprobe.config import ImbalanceConfig
+    from riskprobe.rules.discovery import discover_with_metrics
+
+    train = pl.DataFrame(
+        {
+            "feature": [float(value) for value in range(40)],
+            "target": [0] * 20 + [1] * 20,
+        }
+    )
+    config = DiscoveryConfig(
+        min_support=0.1,
+        max_single_rules=10,
+        max_pair_rules=0,
+    )
+
+    for strategy in ("class_weight", "sample_weight"):
+        result = discover_with_metrics(
+            train,
+            ["feature"],
+            "target",
+            config,
+            imbalance=ImbalanceConfig(enabled=True, strategy=strategy),
+        )
+        assert result.single_candidates_before_cap >= 0
+
+
+def test_discovery_sample_weights_match_the_filtered_train_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import riskprobe.rules.discovery as discovery_module
+    from riskprobe.config import ImbalanceConfig
+    from riskprobe.rules.discovery import discover_with_metrics
+
+    train = pl.DataFrame(
+        {
+            "feature": [float(value) for value in range(40)],
+            "target": [0] * 20 + [1] * 20,
+        }
+    )
+    config = DiscoveryConfig(
+        min_support=0.1,
+        max_single_rules=10,
+        max_pair_rules=0,
+    )
+    captured: list[np.ndarray | None] = []
+    real_tree = discovery_module.DecisionTreeClassifier
+
+    def spy_tree(*args: object, **kwargs: object) -> object:
+        estimator = real_tree(*args, **kwargs)
+        original_fit = estimator.fit
+
+        def fit(
+            features: object,
+            target: object,
+            *fit_args: object,
+            **fit_kwargs: object,
+        ) -> object:
+            weight = fit_kwargs.get("sample_weight")
+            captured.append(None if weight is None else np.asarray(weight))
+            return original_fit(features, target, *fit_args, **fit_kwargs)
+
+        estimator.fit = fit  # type: ignore[method-assign]
+        return estimator
+
+    monkeypatch.setattr(discovery_module, "DecisionTreeClassifier", spy_tree)
+
+    discover_with_metrics(
+        train,
+        ["feature"],
+        "target",
+        config,
+        imbalance=ImbalanceConfig(enabled=True, strategy="sample_weight"),
+    )
+
+    weights = [weight for weight in captured if weight is not None]
+    assert weights
+    assert all(weight.shape == (train.height,) for weight in weights)

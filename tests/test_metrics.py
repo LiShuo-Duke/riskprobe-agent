@@ -200,3 +200,82 @@ def test_adjust_pvalues_rejects_non_finite_values() -> None:
 def test_rule_metrics_rejects_non_boolean_mask_values() -> None:
     with pytest.raises(ValueError, match="^mask must contain only boolean values$"):
         compute_rule_metrics(np.array([True, math.nan]), np.array([1, 0]), positive_value=1)
+
+
+def test_balanced_weights_use_train_class_counts_only() -> None:
+    from riskprobe.metrics import balanced_class_weights, balanced_sample_weights
+
+    target = np.array([0, 0, 0, 1], dtype=np.int8)
+
+    assert balanced_class_weights(target) == {0: 2 / 3, 1: 2.0}
+    np.testing.assert_allclose(
+        balanced_sample_weights(target),
+        np.array([2 / 3, 2 / 3, 2 / 3, 2.0]),
+    )
+
+
+@pytest.mark.parametrize("target", [[], [0, 0], [1, 1], [0, 2], [0, np.nan]])
+def test_balanced_weights_fail_closed_for_invalid_or_single_class_target(target: object) -> None:
+    from riskprobe.metrics import balanced_sample_weights
+
+    with pytest.raises(ValueError, match="binary target"):
+        balanced_sample_weights(np.asarray(target, dtype=object))
+
+
+def test_rule_metrics_expose_bad_good_ks_separation() -> None:
+    metrics = compute_rule_metrics(
+        np.array([True, True, False, False]),
+        np.array([1, 0, 0, 0]),
+        positive_value=1,
+    )
+
+    assert metrics.hit_good_rate == pytest.approx(1 / 3)
+    assert metrics.ks_signed == pytest.approx(1 / 6)
+    assert metrics.ks_stat == pytest.approx(1 / 6)
+    assert metrics.p_value != metrics.ks_stat
+
+
+def test_score_ks_filters_nonfinite_scores_and_preserves_direction() -> None:
+    from riskprobe.metrics import compute_score_ks
+
+    result = compute_score_ks(
+        np.array([0.9, 0.8, np.nan, 0.1, 0.2]),
+        np.array([1, 1, 0, 0, 0]),
+    )
+
+    assert result.statistic == pytest.approx(1.0)
+    assert result.signed_statistic == pytest.approx(1.0)
+    assert result.bad_count == 2
+    assert result.good_count == 2
+    assert result.excluded_count == 1
+    assert result.p_value is not None
+
+
+def test_score_ks_returns_unavailable_for_single_class_after_filtering() -> None:
+    from riskprobe.metrics import compute_score_ks
+
+    result = compute_score_ks([0.1, float("nan")], [1, 1])
+
+    assert result.statistic is None
+    assert result.p_value is None
+    assert result.limitation == "single_class_or_no_finite_scores"
+
+
+def test_score_ks_orients_signed_statistic_for_lower_bad_direction() -> None:
+    from riskprobe.metrics import compute_score_ks
+
+    result = compute_score_ks(
+        [0.1, 0.2, 0.8, 0.9],
+        [1, 1, 0, 0],
+        direction="lower_is_bad",
+    )
+
+    assert result.statistic == pytest.approx(1.0)
+    assert result.signed_statistic == pytest.approx(1.0)
+
+
+def test_score_ks_rejects_non_binary_target() -> None:
+    from riskprobe.metrics import compute_score_ks
+
+    with pytest.raises(ValueError, match="binary target"):
+        compute_score_ks([0.1, 0.2], [0, 2])

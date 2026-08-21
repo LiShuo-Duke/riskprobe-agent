@@ -156,6 +156,11 @@ class DiscoveryConfig(StrictModel):
     beam_width: int = Field(default=20, ge=1)
     max_pair_rules: int = Field(default=50, ge=0)
     random_seed: Literal[42] = 42
+    woe_binning_enabled: bool = False
+    woe_max_bins: int = Field(default=10, ge=2, le=100)
+    woe_min_bin_fraction: float = Field(default=0.05, gt=0, le=1)
+    woe_monotonic: Literal["none", "increasing", "decreasing", "auto"] = "none"
+    woe_min_iv: float = Field(default=0.0, ge=0)
 
 
 class ValidationConfig(StrictModel):

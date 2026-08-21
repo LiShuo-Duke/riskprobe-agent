@@ -2288,3 +2288,54 @@ def test_sparse_institution_target_combination_reports_split_fallback(
     metadata = json.loads((result.run_dir / "metadata_report.json").read_text())
 
     assert any("institution" in limitation.lower() and "fell back" in limitation.lower() for limitation in metadata["limitations"])
+
+
+def test_orchestrate_with_citations_keeps_rag_outside_agent_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object.__new__(RiskProbeService)
+    agent_result = type("AgentResultStub", (), {"session_id": "run-1"})()
+    query_result = object()
+    principal = object()
+    budget = object()
+    calls: dict[str, object] = {}
+
+    def orchestrate(**kwargs: object) -> object:
+        calls["orchestrate"] = kwargs
+        return agent_result
+
+    def query_local_rag(**kwargs: object) -> object:
+        calls["query"] = kwargs
+        return query_result
+
+    monkeypatch.setattr(service, "orchestrate", orchestrate)
+    monkeypatch.setattr(service, "query_local_rag", query_local_rag)
+
+    enriched = service.orchestrate_with_citations(
+        dataset_id="small",
+        principal=principal,
+        budget=budget,
+        objective="comprehensive",
+        roots={"risk": Path("./knowledge")},
+        scope_id="scope-1",
+        query_id="query-1",
+        query_text="data quality",
+        limit=3,
+    )
+
+    assert enriched.agent_result is agent_result
+    assert enriched.citations is query_result
+    assert calls["orchestrate"] == {
+        "dataset_id": "small",
+        "principal": principal,
+        "budget": budget,
+        "objective": "comprehensive",
+    }
+    assert calls["query"] == {
+        "run_id": "run-1",
+        "roots": {"risk": Path("./knowledge")},
+        "scope_id": "scope-1",
+        "query_id": "query-1",
+        "query_text": "data quality",
+        "limit": 3,
+    }

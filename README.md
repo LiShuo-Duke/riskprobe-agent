@@ -4,7 +4,7 @@
 
 RiskProbe 是一个 **local-first** 的 Python 风控分析工具包，提供确定性规则引擎、CLI 和标准 stdio MCP 服务。它可以被 Kiro、Codex、Trae 以及其他 MCP 客户端调用。
 
-> **当前版本：** `v0.1.0` 首个公开版本。RiskProbe 只在本地读取用户明确允许的 Parquet 数据，不上传数据，不暴露实体级明细。
+> **当前版本：** `v0.2.0`。RiskProbe 只在本地读取用户明确允许的 Parquet 数据，不上传数据，不暴露实体级明细。v0.2.0 增加了 WOE/IV 规则分箱、规则—评分卡融合、告警到复测闭环，以及有界 Agent 重试和本地 citation 接入。
 
 ## RiskProbe 解决什么问题？
 
@@ -45,7 +45,17 @@ RiskProbe 将规则发现、统计验证和监控计算固定在 Python 确定�
 Stable / Local / Unstable / Suspicious
 ```
 
-### 3. 多机构稳定性分析
+### 3. 规则—评分卡融合
+
+v0.2.0 提供 train-only WOE/IV 分箱和冻结边界变换，可将 WOE 特征与 `RiskRule` 命中特征一起训练 LogisticRegression 评分卡，输出：
+
+- 坏账概率和 0–1000 风险分；
+- `low / medium / high / critical` 风险等级；
+- 基于特征贡献度的 top reason codes。
+
+评分卡预测不会重新拟合分箱，缺失值使用训练期缺失箱，规则命中特征只由确定性规则表达式计算。
+
+### 4. 多机构稳定性分析
 
 RiskProbe 采用“全局优先”的顺序：
 
@@ -58,7 +68,7 @@ RiskProbe 采用“全局优先”的顺序：
 
 机构内规则只用于稳定性验证和人工复核，不会自动升级为全局规则或上线策略。
 
-### 4. PSI 和聚合漂移监控
+### 5. PSI 和聚合漂移监控
 
 支持检测：
 
@@ -69,7 +79,16 @@ RiskProbe 采用“全局优先”的顺序：
 - Label 正类率变化；
 - Rule Lift 衰减。
 
-### 5. 根因诊断（Root-Cause Diagnosis）
+### 6. 根因诊断与整改复测闭环
+
+监控链路固定为：
+
+```text
+Alert → Diagnosis / RootCause → RiskFinding → Recommendation → before/after retest
+```
+
+`monitor` CLI 额外写出 `recommendations.json`。整改记录是不可变状态，复测按稳定 finding 语义键比较，输出 `verified / remaining / inconclusive`；建议仍需要人工审批，不执行真实数据修改或策略上线。
+
 
 对告警生成聚合根因 TOP3，支持以下维度：
 
@@ -79,11 +98,11 @@ feature / family / segment / label / rule / schema
 
 输出贡献度、排名和数值证据，不返回用户实体、样本行或原始明细。
 
-### 6. 启动时只读数据配置
+### 7. 启动时只读数据配置
 
 本地 Parquet、列角色、特征族和隐私策略由 `ProjectConfig` YAML 明确声明。MCP 服务启动时接收配置路径、运行目录和状态目录；两个 MCP 工具都不接受文件路径、任意代码、身份、预算或数据注册参数。源 Parquet 始终只读，运行产物写入用户指定的本地目录。
 
-### 7. 两阶段 Host 决策 MCP
+### 8. 两阶段 Host 决策 MCP
 
 标准本地 stdio MCP 只暴露：
 
@@ -96,7 +115,7 @@ riskprobe_submit_decision_proposal
 
 ### 当前没有实现的功能
 
-`v0.1.0` 不宣称已经实现以下能力：
+`v0.2.0` 仍不宣称已经实现以下能力：
 
 - ADASYN/SMOTE 过采样；
 - KS 检验；
@@ -208,6 +227,12 @@ riskprobe_get_decision_context(idempotency_key)
 ```
 
 服务端完整顺序固定为 `inspect → diagnose → discover → recommend → review`。Host 不能调用底层分析函数、传入路径、删减诊断证据或绕过 review。
+
+### 有界 Agent 编排与本地知识引用
+
+Agent 使用固定 typed 工具顺序和确定性 Reviewer。仅当审核原因属于 `missing_evidence`、`missing_diagnosis` 或 `evidence_mismatch` 时允许一次受控全量重跑；权限、隐私、工具失败和 Grade-B 生产动作不会自动重试。
+
+本地 RAG 使用 sealed citation index，返回文档 ID、内容 hash、标题和相关性分数等 metadata-only citation。`orchestrate_with_citations` 在 AgentResult 完成后单独查询 citation；知识引用不能替代业务 evidence、改变 action proposal 或绕过 ProposalValidator。
 
 ### 客户端对照
 

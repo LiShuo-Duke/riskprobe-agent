@@ -124,6 +124,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     coordinator = HostDecisionCoordinator(
         provider_id=args.provider_id,
         version=args.provider_version,
+        state_dir=args.state_dir,
     )
     service = RiskProbeService(
         config=config,

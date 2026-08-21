@@ -206,3 +206,50 @@ def test_reviewer_rejects_diagnosis_reference_not_present_in_evidence() -> None:
 
     assert decision.approved is False
     assert ReviewReason.EVIDENCE_MISMATCH in decision.reason_codes
+
+
+def test_planner_repair_is_reason_coded_and_bounded() -> None:
+    planner = Planner(allowed_tools=_TOOL_TYPES)
+    decision = Reviewer().review(
+        _plan(),
+        evidence_ids=(),
+        diagnosis_evidence_ids=(),
+        metadata_grade="A",
+        retry_count=0,
+    )
+
+    repaired = planner.repair(
+        objective="comprehensive",
+        dataset_id="synthetic_demo",
+        decision=decision,
+        retry_count=0,
+    )
+
+    assert repaired == _plan()
+    with pytest.raises(PlanningError, match="repair retry limit exceeded"):
+        planner.repair(
+            objective="comprehensive",
+            dataset_id="synthetic_demo",
+            decision=decision,
+            retry_count=1,
+        )
+
+
+def test_planner_repair_rejects_non_recoverable_review() -> None:
+    planner = Planner(allowed_tools=_TOOL_TYPES)
+    decision = Reviewer().review(
+        _plan(),
+        evidence_ids=(_EVIDENCE_A,),
+        diagnosis_evidence_ids=(_EVIDENCE_A,),
+        metadata_grade="A",
+        permission_denied=True,
+        retry_count=0,
+    )
+
+    with pytest.raises(PlanningError, match="review reason is not repairable"):
+        planner.repair(
+            objective="comprehensive",
+            dataset_id="synthetic_demo",
+            decision=decision,
+            retry_count=0,
+        )

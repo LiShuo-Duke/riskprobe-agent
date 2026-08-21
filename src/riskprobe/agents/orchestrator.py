@@ -38,7 +38,7 @@ from riskprobe.agents.decision_providers import (
     _DecisionProviderRole,
     default_decision_provider,
 )
-from riskprobe.agents.planner import Planner
+from riskprobe.agents.planner import Planner, PlanningError
 from riskprobe.agents.reviewer import Reviewer
 from riskprobe.agents.sessions import (
     SessionNode,
@@ -209,8 +209,18 @@ class AgentOrchestrator:
                 summary = "comprehensive objective approved from aggregate evidence"
                 break
             if final_decision.retry_allowed and retry_count == 0:
-                retry_count = 1
-                continue
+                try:
+                    plan = self._planner.repair(
+                        objective=objective,
+                        dataset_id=dataset_id,
+                        decision=final_decision,
+                        retry_count=retry_count,
+                    )
+                except PlanningError:
+                    pass
+                else:
+                    retry_count = 1
+                    continue
             states.append(AgentState.REJECTED)
             status = AgentStatus.REJECTED
             summary = "comprehensive objective rejected by deterministic review"

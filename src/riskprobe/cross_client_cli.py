@@ -29,6 +29,7 @@ from riskprobe.monitoring.injection import (
 )
 from riskprobe.monitoring.models import ReferenceSnapshot
 from riskprobe.monitoring.reference import build_reference_snapshot
+from riskprobe.monitoring.remediation import build_monitoring_remediation_plan
 from riskprobe.privacy import assert_safe_payload, stable_token
 from riskprobe.resume_evidence import aggregate_benchmarks, render_markdown
 from riskprobe.service import RiskProbeService
@@ -163,6 +164,12 @@ def monitor(
         frame, _, catalog = _monitoring_inputs(current)
         alerts = detect_anomalies(reference, frame, (), catalog)
         diagnoses = diagnose_alerts(alerts, reference, frame, catalog, top_k=3)
+        plan = build_monitoring_remediation_plan(
+            reference,
+            alerts=alerts,
+            diagnoses=diagnoses,
+            metadata_grade=current.metadata_grade,
+        )
         output_dir = runs_dir / "monitoring" / reference_run_id / "current"
         _write_monitoring_json(
             output_dir,
@@ -185,6 +192,11 @@ def monitor(
                 )
                 for item in diagnoses
             ],
+        )
+        _write_monitoring_json(
+            output_dir,
+            "recommendations.json",
+            [item.model_dump(mode="json") for item in plan.recommendations],
         )
     except Exception:
         _fail(

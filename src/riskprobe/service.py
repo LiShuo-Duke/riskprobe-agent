@@ -10,7 +10,7 @@ import shutil
 import stat
 import tempfile
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
 from pathlib import Path
@@ -117,6 +117,14 @@ _STATUS_MAP = {
     "cancelled": "cancelled",
 }
 _SERVICE_PRODUCER_VERSION = "riskprobe-service-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentCitationResult:
+    """Completed agent result with metadata-only local citations kept separate."""
+
+    agent_result: AgentResult
+    citations: QueryResult
 
 
 def _restore_json_tuples(value: object) -> object:
@@ -1704,6 +1712,37 @@ class RiskProbeService:
             )
             result_store.publish(validated)
             return validated
+
+    def orchestrate_with_citations(
+        self,
+        *,
+        dataset_id: str,
+        principal: Principal,
+        budget: Budget,
+        objective: str = "comprehensive",
+        roots: Mapping[str, Path],
+        scope_id: str,
+        query_id: str,
+        query_text: str,
+        limit: int = 5,
+    ) -> AgentCitationResult:
+        """Run the agent first, then attach metadata-only local RAG citations."""
+
+        agent_result = self.orchestrate(
+            dataset_id=dataset_id,
+            principal=principal,
+            budget=budget,
+            objective=objective,
+        )
+        citations = self.query_local_rag(
+            run_id=agent_result.session_id,
+            roots=roots,
+            scope_id=scope_id,
+            query_id=query_id,
+            query_text=query_text,
+            limit=limit,
+        )
+        return AgentCitationResult(agent_result=agent_result, citations=citations)
 
     def build_local_rag(
         self,

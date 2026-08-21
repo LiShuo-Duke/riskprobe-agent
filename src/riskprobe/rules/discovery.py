@@ -14,6 +14,7 @@ from riskprobe.config import DiscoveryConfig
 from riskprobe.metrics import compute_rule_metrics
 from riskprobe.models import Condition, RiskRule, RuleMetrics
 from riskprobe.rules.expression import evaluate_rule
+from riskprobe.rules.scorecard import fit_woe_binning
 
 _QUANTILES = (0.1, 0.25, 0.5, 0.75, 0.9)
 
@@ -155,6 +156,22 @@ def _feature_thresholds(
 
     finite_target = target[finite_mask]
     thresholds = [float(value) for value in np.quantile(values, _QUANTILES)]
+    if config.woe_binning_enabled:
+        try:
+            woe_model = fit_woe_binning(
+                train.select(feature_name).with_columns(
+                    pl.Series("__riskprobe_target__", target)
+                ),
+                feature=feature_name,
+                target_col="__riskprobe_target__",
+                max_bins=config.woe_max_bins,
+                min_bin_fraction=config.woe_min_bin_fraction,
+                monotonic=config.woe_monotonic,
+            )
+        except (TypeError, ValueError):
+            woe_model = None
+        if woe_model is not None and woe_model.iv >= config.woe_min_iv:
+            thresholds.extend(woe_model.edges)
     min_samples_leaf, _ = _support_bounds(train.height, config.min_support)
     thresholds.extend(
         _tree_thresholds(values, finite_target, min_samples_leaf, config.random_seed)

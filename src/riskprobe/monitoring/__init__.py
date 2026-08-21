@@ -19,6 +19,17 @@ from riskprobe.monitoring.models import (
     SafeProfile,
 )
 from riskprobe.monitoring.quality import diagnose_quality
+from riskprobe.monitoring.remediation import (
+    MonitoringRemediationPlan,
+    RemediationRecord,
+    RemediationStatus,
+    RemediationVerification,
+    alert_diagnosis_to_finding,
+    apply_verification,
+    build_monitoring_remediation_plan,
+    create_remediation,
+    verify_remediation,
+)
 from riskprobe.monitoring.reference import build_reference_snapshot
 from riskprobe.monitoring.segments import diagnose_segments
 from riskprobe.monitoring.service import diagnose_dataset
@@ -31,12 +42,20 @@ __all__ = [
     "FeatureReference",
     "FindingKind",
     "FindingSeverity",
+    "MonitoringRemediationPlan",
     "ReferenceSnapshot",
+    "RemediationRecord",
+    "RemediationStatus",
+    "RemediationVerification",
     "RiskFinding",
     "RootCause",
     "RuleReference",
     "SafeProfile",
+    "alert_diagnosis_to_finding",
+    "apply_verification",
+    "build_monitoring_remediation_plan",
     "build_reference_snapshot",
+    "create_remediation",
     "diagnose_dataset",
     "diagnose_drift",
     "diagnose_quality",
@@ -44,4 +63,5 @@ __all__ = [
     "diagnose_time",
     "population_stability_index",
     "quantile_bin_edges",
+    "verify_remediation",
 ]

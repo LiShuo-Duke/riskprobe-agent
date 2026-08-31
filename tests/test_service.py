@@ -22,16 +22,28 @@ from riskprobe.runtime import NodeStatus, RunRuntime
 from riskprobe.service import RiskProbeService
 
 
+_RUN_ARTIFACT_NAMES = {
+    "manifest.json",
+    "metadata_report.json",
+    "data_profile.json",
+    "candidate_rules.parquet",
+    "evidence_cards.json",
+    "risk_report.md",
+    "analysis_summary.json",
+}
+
+
 def _small_config(
     tmp_path: Path,
     *,
     rows: int = 200,
     time_validation_enabled: bool = False,
+    time_validation_mode: str | None = None,
     metadata_grade: str = "B",
     expose_segment_values: bool = False,
 ) -> ProjectConfig:
     snapshots: list[object]
-    if time_validation_enabled:
+    if time_validation_enabled or time_validation_mode in {"strict", "auto"}:
         snapshots = [date(2024, 1, 1) + timedelta(days=index) for index in range(rows)]
     else:
         snapshots = ["not-a-date"] * rows
@@ -65,7 +77,11 @@ def _small_config(
             "target": target,
             "snapshot": {"meaning": "customer_specified_feature_cutoff"},
             "features": {"families": {"feature": ["feature_"]}},
-            "time_validation_enabled": time_validation_enabled,
+            **(
+                {"time_validation_mode": time_validation_mode}
+                if time_validation_mode is not None
+                else {"time_validation_enabled": time_validation_enabled}
+            ),
             "privacy": {"expose_segment_values": expose_segment_values},
             "discovery": {
                 "min_support": 0.05,
@@ -129,18 +145,22 @@ def _card(
     )
 
 
+def _discovery_result(*rules: RiskRule) -> service_module.DiscoveryResult:
+    return service_module.DiscoveryResult(
+        rules=tuple(rules),
+        train_metrics={rule.rule_id: _metrics(2.1) for rule in rules},
+        single_candidates_before_cap=len(rules),
+        single_rules_selected=len(rules),
+        pair_candidates_before_diversity=0,
+        pair_rules_selected=0,
+    )
+
+
 def test_service_run_writes_required_artifacts(tmp_path, synthetic_config) -> None:
     service = RiskProbeService(config=synthetic_config, runs_dir=tmp_path / "runs")
     result = service.run()
     names = {path.name for path in result.run_dir.iterdir()}
-    assert names == {
-        "manifest.json",
-        "metadata_report.json",
-        "data_profile.json",
-        "candidate_rules.parquet",
-        "evidence_cards.json",
-        "risk_report.md",
-    }
+    assert names == _RUN_ARTIFACT_NAMES
     manifest_path = result.run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     assert set(manifest["artifact_integrity"]) == names - {"manifest.json"}
@@ -157,6 +177,129 @@ def test_service_run_writes_required_artifacts(tmp_path, synthetic_config) -> No
         separators=(",", ":"),
         sort_keys=True,
     ) + "\n"
+
+
+def test_enabled_scorecard_writes_aggregate_artifact_and_report_section(
+    tmp_path: Path,
+) -> None:
+    base_config = _small_config(tmp_path, metadata_grade="A")
+    config = ProjectConfig.model_validate(
+        {
+            **base_config.model_dump(mode="python"),
+            "scorecard": {"enabled": True},
+        }
+    )
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    payload = json.loads((result.run_dir / "scorecard.json").read_text())
+    analysis_summary = json.loads(
+        (result.run_dir / "analysis_summary.json").read_text()
+    )
+    manifest = json.loads((result.run_dir / "manifest.json").read_text())
+    report = (result.run_dir / "risk_report.md").read_text()
+    assert "scorecard.json" in manifest["artifacts"]
+    assert "analysis_summary.json" in manifest["artifacts"]
+    assert "scorecard.json" in manifest["artifact_integrity"]
+    assert payload["status"] == "fitted"
+    assert set(payload["partition_summaries"]) == {"train", "test"}
+    assert {stage["name"] for stage in analysis_summary["stages"]} == {
+        "config", "snapshot", "profile", "partition", "discovery", "woe",
+        "scorecard", "validation", "institution_analysis", "report", "finalize",
+        "inspect", "diagnose_quality", "diagnose_feature_drift",
+        "diagnose_population_shift", "diagnose_target_shift", "diagnose_segment_risk",
+        "diagnose_time_stability", "diagnose_rule_evidence", "discover_restore",
+        "decision_context", "recommend", "review", "terminal",
+    }
+    assert analysis_summary["scorecard"]["status"] == "succeeded"
+    assert analysis_summary["scorecard"]["imbalance_strategy"] == "disabled"
+    scorecard = analysis_summary["scorecard"]
+    input_features = {item["value"] for item in scorecard["input_features"]}
+    included_features = {item["value"] for item in scorecard["included_features"]}
+    excluded_features = set(scorecard["excluded_features"])
+    assert included_features.isdisjoint(excluded_features)
+    assert input_features == included_features | excluded_features
+    assert "predictions" not in json.dumps(payload)
+    assert "## 6. 评分卡" in report
+    assert "- Status: `succeeded`" in report
+
+
+def test_scorecard_woe_bins_are_fitted_from_train_only(tmp_path: Path) -> None:
+    base_config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_enabled=True,
+        metadata_grade="A",
+    )
+    config = ProjectConfig.model_validate(
+        {
+            **base_config.model_dump(mode="python"),
+            "scorecard": {"enabled": True},
+        }
+    )
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+    dataset = service._dataset()
+    feature_names = service._feature_names(dataset)
+    train, _, _, _ = service._partitions(dataset, feature_names)
+
+    result = service.run()
+
+    expected = service_module.fit_scorecard(
+        train,
+        feature_names=feature_names,
+        target_col=config.columns.target,
+        max_bins=config.scorecard.max_bins,
+        min_bin_fraction=config.scorecard.min_bin_fraction,
+        smoothing=config.scorecard.smoothing,
+        monotonic=config.scorecard.monotonic,
+        min_iv=config.scorecard.min_iv,
+        C=config.scorecard.C,
+        max_iter=config.scorecard.max_iter,
+        imbalance=config.imbalance,
+        random_seed=config.discovery.random_seed,
+    )
+    payload = json.loads((result.run_dir / "scorecard.json").read_text())
+    edges_by_feature = {
+        item["feature"]: item["edges"] for item in payload["model"]["woe_bins"]
+    }
+
+    assert edges_by_feature == {
+        model.feature: list(model.edges) for model in expected.binning_models
+    }
+
+
+def test_scorecard_keeps_empty_test_partition_aggregate(tmp_path: Path) -> None:
+    base_config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_enabled=True,
+        metadata_grade="A",
+    )
+    frame = pl.read_parquet(base_config.dataset.path).with_columns(
+        pl.lit(date(2024, 1, 1)).alias("snapshot_date")
+    )
+    frame.write_parquet(base_config.dataset.path)
+    config = ProjectConfig.model_validate(
+        {
+            **base_config.model_dump(mode="python"),
+            "scorecard": {"enabled": True},
+        }
+    )
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    payload = json.loads((result.run_dir / "scorecard.json").read_text())
+    assert payload["partition_summaries"]["test"] == {
+        "row_count": 0,
+        "target_rate": None,
+        "bad_probability": {"min": None, "mean": None, "max": None},
+        "risk_score_mean": None,
+        "risk_level_counts": {},
+        "auc": None,
+        "ks": None,
+        "gini": None,
+        "metric_limitation": "empty_partition",
+    }
 
 
 def test_inspect_and_discover_return_existing_domain_models(tmp_path: Path) -> None:
@@ -189,6 +332,9 @@ def test_local_handler_reads_inspect_and_discover_from_verified_run_artifacts(
     context = RiskProbeService(config=config, runs_dir=runs_dir).run()
     profile_payload = json.loads(
         (context.run_dir / "data_profile.json").read_text(encoding="utf-8")
+    )
+    summary_payload = json.loads(
+        (context.run_dir / "analysis_summary.json").read_text(encoding="utf-8")
     )
     expected_rule_ids = tuple(
         pl.read_parquet(context.run_dir / "candidate_rules.parquet")
@@ -234,6 +380,7 @@ def test_local_handler_reads_inspect_and_discover_from_verified_run_artifacts(
         "issue_codes": sorted(
             {issue["code"] for issue in profile_payload["issues"]}
         ),
+        "analysis_summary": summary_payload,
     }
     assert discover.rule_ids == expected_rule_ids
 
@@ -303,6 +450,91 @@ def test_local_handler_recommend_uses_verified_profile_artifact(
     assert recomputed is False
 
 
+def test_orchestrate_empty_diagnosis_skips_real_recommend_and_replays_no_action(
+    synthetic_config: ProjectConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.agents import AgentStatus, SessionStore
+    from riskprobe.evidence import EvidenceStore
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.tools import DiagnoseResponse, LocalRiskProbeToolHandler
+
+    recommend_calls = 0
+    original_recommend = LocalRiskProbeToolHandler._recommend
+
+    def empty_diagnosis(
+        self: RiskProbeService,
+        run_id: str,
+        evidence_store: EvidenceStore,
+        *,
+        dataset_id: str | None = None,
+        run_context: object | None = None,
+    ) -> DiagnoseResponse:
+        del run_id, evidence_store, run_context
+        return DiagnoseResponse(
+            dataset_id=dataset_id or self.config.dataset.id,
+            finding_ids=(),
+        )
+
+    def count_recommend(*args: object, **kwargs: object) -> object:
+        nonlocal recommend_calls
+        recommend_calls += 1
+        return original_recommend(*args, **kwargs)
+
+    monkeypatch.setattr(RiskProbeService, "_diagnose_with_store", empty_diagnosis)
+    monkeypatch.setattr(LocalRiskProbeToolHandler, "_recommend", count_recommend)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=synthetic_config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="no-action-reader", role=Role.ANALYST)
+
+    result = service.orchestrate(
+        dataset_id=synthetic_config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert recommend_calls == 0
+    assert result.status is AgentStatus.SUCCEEDED
+    assert result.review.no_action_required is True
+    assert result.evidence_ids == ()
+    assert result.diagnosis_evidence_ids == ()
+    assert result.tool_sequence == (
+        "inspect",
+        "diagnose",
+        "discover",
+        "recommend",
+        "review",
+    )
+    nodes = SessionStore(
+        state_dir / f".{result.session_id}.sessions.sqlite3"
+    ).replay(result.session_id)
+    tool_nodes = tuple(node for node in nodes if node.tool_call is not None)
+    assert tuple(node.tool_call.tool_name for node in tool_nodes) == result.tool_sequence
+    assert next(
+        node for node in tool_nodes if node.tool_call.tool_name == "recommend"
+    ).redacted_summary == "recommendation evidence count 0"
+    assert not any(node.tool_call.tool_name == "decision" for node in tool_nodes)
+    assert EvidenceStore(
+        state_dir / f".{result.session_id}.evidence.sqlite3"
+    ).list_run(result.session_id) == ()
+
+    def reject_tool_call(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("terminal no-action replay must not invoke tools")
+
+    monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject_tool_call)
+    assert service.orchestrate(
+        dataset_id=synthetic_config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    ) == result
+
+
 def test_orchestrate_reuses_verified_terminal_result_without_tool_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -354,11 +586,75 @@ def test_orchestrate_reuses_verified_terminal_result_without_tool_calls(
     assert len(EvidenceStore(evidence_path).list_run(first.session_id)) == evidence_count
 
 
-def test_orchestrate_fails_closed_when_terminal_result_is_missing(
+def test_orchestrate_reuses_legacy_terminal_result_without_tool_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.tools import LocalRiskProbeToolHandler
+
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="legacy-cache-reader", role=Role.ANALYST)
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+    result_path = state_dir / f".{first.session_id}.agent-result.json"
+    envelope = json.loads(result_path.read_text(encoding="utf-8"))
+    assert envelope["result"]["review"].pop("no_action_required") is False
+    result_json = json.dumps(
+        envelope["result"],
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    envelope["result_sha256"] = hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+    result_path.write_text(
+        json.dumps(
+            envelope,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tool_calls = 0
+
+    def reject_tool_call(*args: object, **kwargs: object) -> object:
+        nonlocal tool_calls
+        del args, kwargs
+        tool_calls += 1
+        raise AssertionError("legacy terminal result reuse must not invoke tools")
+
+    monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject_tool_call)
+
+    second = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert second == first
+    assert second.review.no_action_required is False
+    assert tool_calls == 0
+
+
+def test_orchestrate_recovers_terminal_result_when_result_sidecar_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from riskprobe.agents import SessionStore
+    from riskprobe.agents.results import AgentResultStore
     from riskprobe.evidence import EvidenceStore
     from riskprobe.policy import Budget, Principal, Role
     from riskprobe.tools import LocalRiskProbeToolHandler
@@ -388,20 +684,54 @@ def test_orchestrate_fails_closed_when_terminal_result_is_missing(
         nonlocal tool_calls
         del args, kwargs
         tool_calls += 1
-        raise AssertionError("incomplete terminal state must not rerun tools")
+        raise AssertionError("terminal journal recovery must not rerun tools")
 
     monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject_tool_call)
-    with pytest.raises(RuntimeError, match="agent result is unavailable"):
+    second = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert second == first
+    assert tool_calls == 0
+    assert result_path.stat().st_mode & 0o777 == 0o600
+    assert AgentResultStore(result_path).load() == first
+    assert len(SessionStore(session_path).replay(first.session_id)) == session_count
+    assert len(EvidenceStore(evidence_path).list_run(first.session_id)) == evidence_count
+
+
+def test_orchestrate_recovery_requires_current_principal_capabilities(
+    tmp_path: Path,
+) -> None:
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.service import HostSafeStageError
+
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=Principal(principal_id="authorized-reader", role=Role.ANALYST),
+        budget=Budget(max_queries=16),
+    )
+    result_path = state_dir / f".{first.session_id}.agent-result.json"
+    result_path.unlink()
+
+    with pytest.raises(HostSafeStageError) as caught:
         service.orchestrate(
             dataset_id=config.dataset.id,
-            principal=principal,
+            principal=Principal(principal_id="unauthorized-reader", role=Role.REVIEWER),
             budget=Budget(max_queries=16),
         )
 
-    assert tool_calls == 0
+    assert caught.value.host_failure_code == "agent_orchestration_failed"
+    assert caught.value.report_run_id == first.session_id
     assert not result_path.exists()
-    assert len(SessionStore(session_path).replay(first.session_id)) == session_count
-    assert len(EvidenceStore(evidence_path).list_run(first.session_id)) == evidence_count
 
 
 def test_same_input_produces_byte_for_byte_identical_artifacts(tmp_path: Path) -> None:
@@ -439,8 +769,10 @@ def test_service_failure_preserves_incomplete_run_for_resume(
         raise RuntimeError("simulated rendering failure")
 
     monkeypatch.setattr("riskprobe.service.render_risk_report", fail_report)
-    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+    with pytest.raises(RuntimeError) as caught:
         service.run()
+    assert getattr(caught.value, "host_failure_code", None) == "artifact_runtime_failed"
+    assert "simulated rendering failure" not in str(caught.value)
 
     run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
@@ -451,7 +783,7 @@ def test_service_failure_preserves_incomplete_run_for_resume(
     assert list((tmp_path / "runs").glob("*.parquet")) == []
 
 
-def test_report_shows_real_institution_names_by_default_and_hides_when_disabled() -> None:
+def test_report_always_tokenizes_institution_names() -> None:
     profile = DatasetProfile(
         dataset_id="safe-dataset-id",
         row_count=100,
@@ -464,6 +796,7 @@ def test_report_shows_real_institution_names_by_default_and_hides_when_disabled(
         issues=(),
     )
     institution = "institution-a"
+    token = stable_token(institution, namespace="institution")
     analysis = {
         "eligible_institution_count": 1,
         "triggered_institution_count": 1,
@@ -471,7 +804,7 @@ def test_report_shows_real_institution_names_by_default_and_hides_when_disabled(
         "interpretation": "机构内结果仅供复核。",
         "institution_reports": [
             {
-                "institution_token": stable_token(institution, namespace="institution"),
+                "institution_token": token,
                 "institution_name": institution,
                 "status": "completed",
                 "train_row_count": 60,
@@ -492,18 +825,28 @@ def test_report_shows_real_institution_names_by_default_and_hides_when_disabled(
         limitations=("holdout: single-class institution: institution-a",),
     )
 
-    exposed = render_risk_report(profile, [card], institution_analysis=analysis)
-    hidden = render_risk_report(
+    default_report = render_risk_report(
+        profile,
+        [card],
+        institution_analysis=analysis,
+    )
+    explicitly_hidden_report = render_risk_report(
         profile,
         [card],
         institution_analysis=analysis,
         expose_segment_values=False,
     )
+    legacy_exposed_report = render_risk_report(
+        profile,
+        [card],
+        institution_analysis=analysis,
+        expose_segment_values=True,
+    )
 
-    assert institution in exposed
-    assert stable_token(institution, namespace="institution") in exposed
-    assert institution not in hidden
-    assert stable_token(institution, namespace="institution") in hidden
+    assert default_report == explicitly_hidden_report == legacy_exposed_report
+    for report in (default_report, explicitly_hidden_report, legacy_exposed_report):
+        assert institution not in report
+        assert token in report
 
 
 def test_disabled_time_split_is_stratified_projected_and_read_only(
@@ -514,14 +857,13 @@ def test_disabled_time_split_is_stratified_projected_and_read_only(
     captured: dict[str, object] = {}
 
     def fake_discover(
+        _service: RiskProbeService,
         train: pl.DataFrame,
         feature_names: list[str],
-        target_col: str,
-        config: object,
-    ) -> list[RiskRule]:
-        captured["discovery"] = train
+    ) -> service_module.DiscoveryResult:
+        captured["discovery"] = train.select([*feature_names, "target"])
         captured["feature_names"] = feature_names
-        return [_rule()]
+        return _discovery_result(_rule())
 
     def fake_validate(
         train: pl.DataFrame, test: pl.DataFrame, rules: object, **kwargs: object
@@ -529,7 +871,11 @@ def test_disabled_time_split_is_stratified_projected_and_read_only(
         captured["validation"] = (train, test, kwargs)
         return [_card()]
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        fake_discover,
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
@@ -554,6 +900,124 @@ def test_disabled_time_split_is_stratified_projected_and_read_only(
     assert "时间衰减" not in report
 
 
+def test_auto_time_split_uses_strict_oot_when_every_partition_has_both_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _small_config(
+        tmp_path,
+        rows=100,
+        time_validation_mode="auto",
+        metadata_grade="A",
+    )
+    frame = pl.read_parquet(config.dataset.path).with_columns(
+        pl.Series(
+            "snapshot_date",
+            [
+                date(2024, 1, 1) + timedelta(days=index // 2)
+                for index in range(100)
+            ],
+        )
+    )
+    frame.write_parquet(config.dataset.path)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: service_module.DiscoveryResult(
+            (_rule(),), {"rule-a": _metrics(2.1)}, 1, 1, 0, 0
+        ),
+    )
+
+    def fake_validate(
+        train: pl.DataFrame, test: pl.DataFrame, rules: object, **kwargs: object
+    ) -> list[EvidenceCard]:
+        calls.append({"train": train, "test": test, "kwargs": kwargs})
+        return [_card()]
+
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    data_profile = json.loads((result.run_dir / "data_profile.json").read_text())
+    metadata = json.loads((result.run_dir / "metadata_report.json").read_text())
+    manifest = json.loads((result.run_dir / "manifest.json").read_text())
+    assert len(calls) == 2
+    assert all(call["kwargs"]["time_validation_enabled"] is True for call in calls)  # type: ignore[index]
+    assert data_profile["snapshot_min"] == "2024-01-01"
+    assert data_profile["snapshot_max"] == "2024-02-19"
+    assert metadata["time_validation_mode"] == "auto"
+    assert metadata["time_validation_applied"] is True
+    assert metadata["split_strategy"] == "time_group_split"
+    assert manifest["time_validation_mode"] == "auto"
+    assert manifest["time_validation_applied"] is True
+
+
+@pytest.mark.parametrize("layout", ["one_date", "two_dates", "single_class_partition"])
+def test_auto_time_split_falls_back_to_stratified_non_oot_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    config = _small_config(tmp_path, rows=100, time_validation_mode="auto")
+    frame = pl.read_parquet(config.dataset.path)
+    if layout == "one_date":
+        frame = frame.with_columns(pl.lit(date(2024, 1, 1)).alias("snapshot_date"))
+    elif layout == "two_dates":
+        frame = frame.with_columns(
+            pl.Series(
+                "snapshot_date",
+                [date(2024, 1, 1)] * 70 + [date(2024, 2, 1)] * 30,
+            )
+        )
+    else:
+        frame = frame.with_columns(
+            pl.Series(
+                "snapshot_date",
+                [date(2024, 1, 1)] * 60
+                + [date(2024, 2, 1)] * 20
+                + [date(2024, 3, 1)] * 20,
+            ),
+            pl.Series("target", [index % 2 for index in range(80)] + [0] * 20),
+        )
+    frame.write_parquet(config.dataset.path)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: service_module.DiscoveryResult(
+            (_rule(),), {"rule-a": _metrics(2.1)}, 1, 1, 0, 0
+        ),
+    )
+
+    def fake_validate(
+        train: pl.DataFrame, test: pl.DataFrame, rules: object, **kwargs: object
+    ) -> list[EvidenceCard]:
+        captured["validation"] = (train, test, kwargs)
+        return [_card()]
+
+    monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    train, test, kwargs = captured["validation"]  # type: ignore[misc]
+    data_profile = json.loads((result.run_dir / "data_profile.json").read_text())
+    metadata = json.loads((result.run_dir / "metadata_report.json").read_text())
+    manifest = json.loads((result.run_dir / "manifest.json").read_text())
+    evidence = json.loads((result.run_dir / "evidence_cards.json").read_text())
+    report = (result.run_dir / "risk_report.md").read_text()
+    limitation = "Time split unusable; fixed-seed stratified Train/Test fallback; not strict OOT validation"
+    assert train.columns == ["feature_a", "target", "institution"]
+    assert test.columns == ["feature_a", "target", "institution"]
+    assert (train.height, test.height) == (70, 30)
+    assert kwargs["time_validation_enabled"] is False
+    assert data_profile["snapshot_min"] is None
+    assert data_profile["snapshot_max"] is None
+    assert metadata["time_validation_mode"] == "auto"
+    assert metadata["time_validation_applied"] is False
+    assert metadata["split_strategy"] == "auto_stratified_fallback"
+    assert limitation in metadata["limitations"]
+    assert manifest["time_validation_mode"] == "auto"
+    assert manifest["time_validation_applied"] is False
+    assert "max_time_decay" not in json.dumps(evidence)
+    assert limitation in report
+
+
 def test_enabled_time_split_is_sorted_60_20_20_and_validates_holdout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -565,7 +1029,11 @@ def test_enabled_time_split_is_sorted_60_20_20_and_validates_holdout(
     )
     calls: list[tuple[pl.DataFrame, pl.DataFrame]] = []
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
 
     def fake_validate(
         train: pl.DataFrame, test: pl.DataFrame, rules: object, **kwargs: object
@@ -604,7 +1072,11 @@ def test_artifact_rules_and_slices_have_stable_sorting(
         _card("z-rule", grade="Suspicious", test_lift=1.1, slices=unsorted_slices),
         _card("a-rule", grade="Stable", test_lift=1.8),
     ]
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: rules)
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(*rules),
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", lambda *args, **kwargs: cards)
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
@@ -651,17 +1123,15 @@ def test_report_is_sorted_formatted_and_grade_b_leads_with_limitations() -> None
         _card("a-rule", grade="Stable", test_lift=2.0, limitations=("lim-a",)),
     ]
 
-    report = render_risk_report(profile, cards)
+    report = render_risk_report(profile, cards, time_validation_applied=False)
 
-    assert any("Metadata Grade: B" in line for line in report.splitlines()[:8])
-    assert any(
-        "label performance window unknown" in line for line in report.splitlines()[:12]
-    )
+    assert "## RiskProbe 风险分析报告" in report
+    assert "**Metadata Grade: B**" in report
+    assert "时间切片稳定性：未评估" in report
+    assert "Stable 不代表严格 OOT、生产就绪或自动上线" in report
     assert report.index("a-rule") < report.index("b-rule") < report.index("later")
     assert "0.1235" in report
     assert "2.0000" in report
-    assert "严格 OOT" not in report
-    assert "可上线" not in report
     assert "/Users/" not in report
 
 
@@ -686,7 +1156,11 @@ def test_outputs_redact_segment_values_and_absolute_input_path(
         ),
         limitations=("single-class institution: inst-alpha-deid",),
     )
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", lambda *args, **kwargs: [card])
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
@@ -721,7 +1195,11 @@ def test_holdout_failure_conservatively_downgrades_grade_and_is_reported(
         [_card(grade="Stable", test_lift=2.0)],
         [_card(grade="Suspicious", test_lift=0.5)],
     ]
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr(
         "riskprobe.service.validate_rules", lambda *args, **kwargs: responses.pop(0)
     )
@@ -754,7 +1232,11 @@ def test_time_split_never_places_one_snapshot_in_multiple_partitions(
     )
     frame.write_parquet(config.dataset.path)
     calls: list[tuple[pl.DataFrame, pl.DataFrame]] = []
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
 
     def fake_validate(
         train: pl.DataFrame, test: pl.DataFrame, rules: object, **kwargs: object
@@ -786,7 +1268,11 @@ def test_time_partition_without_positives_produces_auditable_artifacts(
         pl.Series("target", [index % 2 for index in range(60)] + [0] * 40)
     )
     frame.write_parquet(config.dataset.path)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
@@ -806,7 +1292,11 @@ def test_path_like_dataset_id_is_not_written_to_outputs(
     config = config.model_copy(
         update={"dataset": config.dataset.model_copy(update={"id": private_id})}
     )
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
@@ -840,7 +1330,11 @@ def test_run_analyzes_same_snapshot_used_for_fingerprint_after_atomic_replacemen
         "_parquet_metadata_fingerprint",
         replace_source_after_fingerprint,
     )
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
@@ -892,7 +1386,11 @@ def test_empty_holdout_downgrades_each_card_and_reports_limitation(
         )
     )
     frame.write_parquet(config.dataset.path)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr(
         "riskprobe.service.validate_rules", lambda *args, **kwargs: [_card()]
     )
@@ -926,7 +1424,11 @@ def test_single_class_holdout_downgrades_each_card_and_reports_limitation(
         pl.Series("target", [index % 2 for index in range(80)] + [0] * 20),
     )
     frame.write_parquet(config.dataset.path)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr(
         "riskprobe.service.validate_rules", lambda *args, **kwargs: [_card()]
     )
@@ -962,7 +1464,11 @@ def test_holdout_validation_exception_downgrades_each_card_instead_of_failing_ru
             raise response
         return response
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
@@ -984,7 +1490,11 @@ def test_missing_holdout_rule_downgrades_only_missing_card(
         metadata_grade="A",
     )
     responses = [[_card()], []]
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr(
         "riskprobe.service.validate_rules", lambda *args, **kwargs: responses.pop(0)
     )
@@ -1018,7 +1528,11 @@ def test_null_snapshots_are_excluded_and_audited_not_treated_as_holdout(
     )
     frame.write_parquet(config.dataset.path)
     calls: list[tuple[pl.DataFrame, pl.DataFrame]] = []
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
 
     def fake_validate(
         train: pl.DataFrame, test: pl.DataFrame, rules: object, **kwargs: object
@@ -1066,7 +1580,11 @@ def test_file_uri_and_prefixed_path_dataset_ids_are_redacted_everywhere(
     config = config.model_copy(
         update={"dataset": config.dataset.model_copy(update={"id": private_id})}
     )
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
@@ -1185,7 +1703,11 @@ def test_service_recovers_only_unlocked_safe_snapshots_before_run(
     monkeypatch.setattr(
         service_module, "_snapshot_root", lambda: snapshot_root, raising=False
     )
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
 
     with (active / ".lock").open("r+b") as active_lock:
         fcntl.flock(active_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1243,7 +1765,11 @@ def test_snapshot_cleanup_failure_is_reported_and_recovered_later(
             stale_snapshot_dir = snapshot.parent
 
     monkeypatch.setattr(service_module.shutil, "rmtree", real_rmtree)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
     RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
 
     assert not stale_snapshot_dir.exists()
@@ -1347,7 +1873,11 @@ def test_distinct_same_footer_inputs_do_not_reuse_a_completed_run(
         }
     )
     assert footer_fingerprint(first_config.dataset.path) == footer_fingerprint(second_path)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
 
     first = RiskProbeService(config=first_config, runs_dir=tmp_path / "runs").run()
     second = RiskProbeService(config=second_config, runs_dir=tmp_path / "runs").run()
@@ -1370,7 +1900,11 @@ def test_inspect_and_discover_both_use_stable_input_snapshots(
             yield snapshot
 
     monkeypatch.setattr(service_module, "_stable_dataset_snapshot", tracked_snapshot)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
     service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
 
     service.inspect()
@@ -1403,9 +1937,11 @@ def test_report_failure_preserves_checkpoints_and_resumes_completed_nodes(
     calls = {"discover": 0, "validate": 0, "render": 0}
     original_render = service_module.render_risk_report
 
-    def fake_discover(*args: object, **kwargs: object) -> list[RiskRule]:
+    def fake_discover(
+        *_args: object, **_kwargs: object
+    ) -> service_module.DiscoveryResult:
         calls["discover"] += 1
-        return [_rule()]
+        return _discovery_result(_rule())
 
     def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
         calls["validate"] += 1
@@ -1417,12 +1953,16 @@ def test_report_failure_preserves_checkpoints_and_resumes_completed_nodes(
             raise RuntimeError("simulated rendering failure")
         return original_render(*args, **kwargs)
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        fake_discover,
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
     monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
     service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
 
-    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+    with pytest.raises(RuntimeError):
         service.run()
 
     run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
@@ -1448,9 +1988,11 @@ def test_tampered_rule_checkpoint_invalidates_it_and_downstream_nodes(
     calls = {"discover": 0, "validate": 0, "render": 0}
     original_render = service_module.render_risk_report
 
-    def fake_discover(*args: object, **kwargs: object) -> list[RiskRule]:
+    def fake_discover(
+        *_args: object, **_kwargs: object
+    ) -> service_module.DiscoveryResult:
         calls["discover"] += 1
-        return [_rule()]
+        return _discovery_result(_rule())
 
     def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
         calls["validate"] += 1
@@ -1462,12 +2004,16 @@ def test_tampered_rule_checkpoint_invalidates_it_and_downstream_nodes(
             raise RuntimeError("simulated rendering failure")
         return original_render(*args, **kwargs)
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        fake_discover,
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
     monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
     service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
 
-    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+    with pytest.raises(RuntimeError):
         service.run()
 
     run_dir = next(path for path in (tmp_path / "runs").iterdir() if path.is_dir())
@@ -1493,9 +2039,11 @@ def test_missing_evidence_checkpoint_recomputes_validate_and_report_only(
     calls = {"discover": 0, "validate": 0, "render": 0}
     original_render = service_module.render_risk_report
 
-    def fake_discover(*args: object, **kwargs: object) -> list[RiskRule]:
+    def fake_discover(
+        *_args: object, **_kwargs: object
+    ) -> service_module.DiscoveryResult:
         calls["discover"] += 1
-        return [_rule()]
+        return _discovery_result(_rule())
 
     def fake_validate(*args: object, **kwargs: object) -> list[EvidenceCard]:
         calls["validate"] += 1
@@ -1507,12 +2055,16 @@ def test_missing_evidence_checkpoint_recomputes_validate_and_report_only(
             raise RuntimeError("simulated rendering failure")
         return original_render(*args, **kwargs)
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        fake_discover,
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
     monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
     service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
 
-    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+    with pytest.raises(RuntimeError):
         service.run()
 
     run_dir = next(path for path in (tmp_path / "runs").iterdir() if path.is_dir())
@@ -1534,7 +2086,11 @@ def test_artifact_producing_checkpoints_record_verified_refs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _small_config(tmp_path, rows=100)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", lambda *args, **kwargs: [_card()])
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
@@ -1544,7 +2100,11 @@ def test_artifact_producing_checkpoints_record_verified_refs(
         "partition": {"data_profile.json"},
         "discover": {"candidate_rules.parquet"},
         "validate": {"evidence_cards.json"},
-        "report": {"metadata_report.json", "risk_report.md"},
+        "report": {
+            "metadata_report.json",
+            "risk_report.md",
+            "analysis_summary.json",
+        },
         "finalize": {"manifest.json"},
     }
     for node_id, filenames in expected.items():
@@ -1561,7 +2121,11 @@ def test_immutable_publish_remains_success_when_runtime_success_recording_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _small_config(tmp_path, rows=100)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
     original_succeed = RunRuntime.succeed_node
     failed = False
 
@@ -1583,14 +2147,7 @@ def test_immutable_publish_remains_success_when_runtime_success_recording_fails(
 
     assert failed is True
     assert not (published.run_dir / ".incomplete").exists()
-    assert {path.name for path in published.run_dir.iterdir()} == {
-        "manifest.json",
-        "metadata_report.json",
-        "data_profile.json",
-        "candidate_rules.parquet",
-        "evidence_cards.json",
-        "risk_report.md",
-    }
+    assert {path.name for path in published.run_dir.iterdir()} == _RUN_ARTIFACT_NAMES
 
     reused = service.run()
     runtime = RunRuntime(tmp_path / "runs", published.run_id)
@@ -1629,12 +2186,16 @@ def test_real_token_shaped_segment_is_redacted_once_across_resume(
             raise RuntimeError("simulated rendering failure")
         return original_render(*args, **kwargs)
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [_rule()])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(_rule()),
+    )
     monkeypatch.setattr("riskprobe.service.validate_rules", fake_validate)
     monkeypatch.setattr("riskprobe.service.render_risk_report", fail_first_render)
     service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
 
-    with pytest.raises(RuntimeError, match="simulated rendering failure"):
+    with pytest.raises(RuntimeError):
         service.run()
 
     run_dir = next(path for path in (tmp_path / "runs").iterdir() if path.is_dir())
@@ -1809,14 +2370,7 @@ def test_orchestrate_runtime_provider_config_preserves_v1_run_identity(
         "recommend",
         "review",
     )
-    assert {path.name for path in baseline.run_dir.iterdir()} == {
-        "manifest.json",
-        "metadata_report.json",
-        "data_profile.json",
-        "candidate_rules.parquet",
-        "evidence_cards.json",
-        "risk_report.md",
-    }
+    assert {path.name for path in baseline.run_dir.iterdir()} == _RUN_ARTIFACT_NAMES
     records = EvidenceStore(
         tmp_path
         / "deterministic-state"
@@ -2068,14 +2622,7 @@ def test_orchestrate_default_fallback_is_sidecar_only_and_cache_skips_decision_c
         if record.kind.startswith("decision.")
     )
     run_dir = runs_dir / first.session_id
-    assert {path.name for path in run_dir.iterdir()} == {
-        "manifest.json",
-        "metadata_report.json",
-        "data_profile.json",
-        "candidate_rules.parquet",
-        "evidence_cards.json",
-        "risk_report.md",
-    }
+    assert {path.name for path in run_dir.iterdir()} == _RUN_ARTIFACT_NAMES
     session_count = len(SessionStore(session_path).replay(first.session_id))
     evidence_count = len(records)
     calls = {"prepare": 0, "submit": 0, "disabled": 0, "fallback": 0, "tool": 0}
@@ -2147,15 +2694,18 @@ def test_orchestrate_cache_fails_closed_when_decision_evidence_is_tampered(
         tool_calls += 1
         raise AssertionError("tampered cache must not invoke tools")
 
+    from riskprobe.service import HostSafeStageError
+
     monkeypatch.setattr(LocalRiskProbeToolHandler, "handle", reject_tool_call)
 
-    with pytest.raises(RuntimeError, match="^agent result is unavailable$"):
+    with pytest.raises(HostSafeStageError) as caught:
         service.orchestrate(
             dataset_id=config.dataset.id,
             principal=principal,
             budget=Budget(max_queries=16),
         )
 
+    assert caught.value.host_failure_code == "agent_orchestration_failed"
     assert tool_calls == 0
 
 
@@ -2248,11 +2798,19 @@ def test_random_split_preserves_institution_target_combinations(
     config = _small_config(tmp_path, rows=200, time_validation_enabled=False)
     captured: dict[str, pl.DataFrame] = {}
 
-    def fake_discover(train: pl.DataFrame, *args: object, **kwargs: object) -> list[RiskRule]:
+    def fake_discover(
+        _service: RiskProbeService,
+        train: pl.DataFrame,
+        _feature_names: list[str],
+    ) -> service_module.DiscoveryResult:
         captured["train"] = train
-        return [_rule()]
+        return _discovery_result(_rule())
 
-    monkeypatch.setattr("riskprobe.service.discover_rules", fake_discover)
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        fake_discover,
+    )
     def fake_validate(
         train: pl.DataFrame, test: pl.DataFrame, *args: object, **kwargs: object
     ) -> list[EvidenceCard]:
@@ -2282,7 +2840,11 @@ def test_sparse_institution_target_combination_reports_split_fallback(
         .alias("institution")
     )
     frame.write_parquet(config.dataset.path)
-    monkeypatch.setattr("riskprobe.service.discover_rules", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        RiskProbeService,
+        "_discovery_result_from_train",
+        lambda *_args, **_kwargs: _discovery_result(),
+    )
 
     result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
     metadata = json.loads((result.run_dir / "metadata_report.json").read_text())
@@ -2381,3 +2943,241 @@ def test_service_discover_with_metrics_uses_one_snapshot_and_passes_imbalance(
 
     assert result == DiscoveryResult((), {}, 0, 0, 0, 0)
     assert captured["imbalance"] == config.imbalance
+
+
+@pytest.mark.parametrize(
+    ("stage", "code"),
+    (
+        ("profile", "profile_contract_failed"),
+        ("scorecard", "scorecard_failed"),
+        ("analysis", "artifact_runtime_failed"),
+        ("artifact", "artifact_runtime_failed"),
+    ),
+)
+def test_run_projects_stage_failures_without_leaking_the_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    code: str,
+) -> None:
+    sentinel = f"private-{stage}-sentinel"
+    base_config = _small_config(tmp_path, metadata_grade="A")
+    config = (
+        ProjectConfig.model_validate(
+            {**base_config.model_dump(mode="python"), "scorecard": {"enabled": True}}
+        )
+        if stage == "scorecard"
+        else base_config
+    )
+
+    def fail(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError(sentinel)
+
+    target = {
+        "profile": "profile_dataset",
+        "scorecard": "_scorecard_payload",
+        "analysis": "_analysis_summary_payload",
+        "artifact": "_artifact_integrity",
+    }[stage]
+    monkeypatch.setattr(service_module, target, fail)
+
+    with pytest.raises(RuntimeError) as caught:
+        RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+
+    assert getattr(caught.value, "host_failure_code", None) == code
+    assert sentinel not in str(caught.value)
+    assert sentinel not in repr(caught.value)
+
+
+def test_orchestrate_maps_pipeline_failure_to_safe_artifact_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.service import HostSafeStageError
+
+    sentinel = "private-pipeline-sentinel"
+    config = _small_config(tmp_path)
+    service = RiskProbeService(config=config, runs_dir=tmp_path / "runs")
+
+    def fail_pipeline() -> object:
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(service, "run", fail_pipeline)
+
+    with pytest.raises(HostSafeStageError) as caught:
+        service.orchestrate(
+            dataset_id=config.dataset.id,
+            principal=Principal(principal_id="pipeline-reader", role=Role.ANALYST),
+            budget=Budget(max_queries=16),
+        )
+
+    assert caught.value.host_failure_code == "artifact_runtime_failed"
+    assert sentinel not in str(caught.value)
+
+
+def test_orchestrate_recovers_terminal_result_without_rerunning_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.policy import Budget, Principal, Role
+
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="incomplete-reader", role=Role.ANALYST)
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+    result_path = state_dir / f".{first.session_id}.agent-result.json"
+    result_path.unlink()
+    provider_calls = 0
+
+    def reject_provider(*args: object, **kwargs: object) -> object:
+        nonlocal provider_calls
+        del args, kwargs
+        provider_calls += 1
+        raise AssertionError("terminal journal recovery must not rerun the provider")
+
+    monkeypatch.setattr(type(service._decision_provider), "resolve", reject_provider)
+    second = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+
+    assert second == first
+    assert provider_calls == 0
+    assert result_path.is_file()
+
+
+def test_orchestrate_maps_unsafe_session_state_to_safe_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.agents import SessionStore
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.service import HostSafeStageError
+
+    sentinel = "private-session-state-sentinel"
+
+    def fail_state(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(SessionStore, "__init__", fail_state)
+    config = _small_config(tmp_path)
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=tmp_path / "state",
+    )
+
+    with pytest.raises(HostSafeStageError) as caught:
+        service.orchestrate(
+            dataset_id=config.dataset.id,
+            principal=Principal(principal_id="state-reader", role=Role.ANALYST),
+            budget=Budget(max_queries=16),
+        )
+
+    assert caught.value.host_failure_code == "agent_state_unavailable"
+    assert sentinel not in str(caught.value)
+
+
+def test_orchestrate_maps_agent_runner_failure_to_safe_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.agents import AgentOrchestrator
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.service import HostSafeStageError
+
+    sentinel = "private-agent-runner-sentinel"
+
+    def fail_run(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(AgentOrchestrator, "run", fail_run)
+    config = _small_config(tmp_path)
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=tmp_path / "state",
+    )
+
+    with pytest.raises(HostSafeStageError) as caught:
+        service.orchestrate(
+            dataset_id=config.dataset.id,
+            principal=Principal(principal_id="runner-reader", role=Role.ANALYST),
+            budget=Budget(max_queries=16),
+        )
+
+    assert caught.value.host_failure_code == "agent_orchestration_failed"
+    assert sentinel not in str(caught.value)
+
+
+def test_orchestrate_maps_terminal_result_without_session_sidecar_to_safe_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.policy import Budget, Principal, Role
+    from riskprobe.service import HostSafeStageError
+    from riskprobe.tools import LocalRiskProbeToolHandler
+
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+    principal = Principal(principal_id="missing-session-reader", role=Role.ANALYST)
+    first = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=principal,
+        budget=Budget(max_queries=16),
+    )
+    session_path = state_dir / f".{first.session_id}.sessions.sqlite3"
+    session_path.unlink()
+
+    monkeypatch.setattr(
+        LocalRiskProbeToolHandler,
+        "handle",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("incomplete state must not run tools")
+        ),
+    )
+    with pytest.raises(HostSafeStageError) as caught:
+        service.orchestrate(
+            dataset_id=config.dataset.id,
+            principal=principal,
+            budget=Budget(max_queries=16),
+        )
+
+    assert caught.value.host_failure_code == "agent_state_incomplete"
+    assert caught.value.report_run_id == first.session_id
+    assert not session_path.exists()
+
+
+def test_scorecard_summary_reports_configured_imbalance_strategy(tmp_path: Path) -> None:
+    base_config = _small_config(tmp_path, metadata_grade="A")
+    config = ProjectConfig.model_validate(
+        {
+            **base_config.model_dump(mode="python"),
+            "scorecard": {"enabled": True},
+            "imbalance": {"enabled": True, "strategy": "sample_weight"},
+        }
+    )
+
+    result = RiskProbeService(config=config, runs_dir=tmp_path / "runs").run()
+    summary = json.loads((result.run_dir / "analysis_summary.json").read_text())
+
+    assert summary["scorecard"]["imbalance_strategy"] == "sample_weight"

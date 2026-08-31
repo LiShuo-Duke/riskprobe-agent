@@ -20,6 +20,7 @@ def _config_with(
     *,
     performance_window_days: int | None = None,
     time_validation_enabled: bool | None = None,
+    time_validation_mode: str | None = None,
 ) -> ProjectConfig:
     updates: dict[str, object] = {
         "target": config.target.model_copy(
@@ -28,6 +29,8 @@ def _config_with(
     }
     if time_validation_enabled is not None:
         updates["time_validation_enabled"] = time_validation_enabled
+    if time_validation_mode is not None:
+        updates["time_validation_mode"] = time_validation_mode
     return config.model_copy(update=updates)
 
 
@@ -71,6 +74,28 @@ def test_enabled_time_validation_rejects_invalid_snapshot(
 
     with pytest.raises(DataContractError, match="invalid dates"):
         profile_dataset(dataset, synthetic_config)
+
+
+@pytest.mark.parametrize("snapshots", [["2026-01-01", "not-a-date"], [None, None]])
+def test_auto_time_validation_rejects_invalid_or_all_null_snapshots(
+    tmp_path: Path,
+    synthetic_config: ProjectConfig,
+    snapshots: list[object],
+) -> None:
+    dataset = _write_dataset(
+        tmp_path,
+        {
+            "entity_id": ["a", "b"],
+            "snapshot_date": snapshots,
+            "institution": ["A", "B"],
+            "target": [0, 1],
+            "order_cnt_7d": [0, 1],
+        },
+    )
+    config = _config_with(synthetic_config, time_validation_mode="auto")
+
+    with pytest.raises(DataContractError, match="snapshot_date|invalid dates"):
+        profile_dataset(dataset, config)
 
 
 def test_profile_accepts_categorical_snapshots_with_original_nulls(

@@ -17,6 +17,7 @@ from pydantic import (
     model_validator,
 )
 
+from riskprobe.analysis_contracts import AnalysisSummary
 from riskprobe.privacy import assert_safe_payload
 from riskprobe.tools.models import (
     DiagnoseRequest,
@@ -170,6 +171,7 @@ class ReviewDecision(_StrictDTO):
     reason_codes: tuple[ReviewReason, ...] = ()
     evidence_ids: tuple[str, ...] = ()
     retry_allowed: bool = False
+    no_action_required: bool = False
 
     @field_validator("reason_codes")
     @classmethod
@@ -186,6 +188,15 @@ class ReviewDecision(_StrictDTO):
 
     @model_validator(mode="after")
     def validate_decision(self) -> ReviewDecision:
+        if self.no_action_required and (
+            not self.approved
+            or self.reason_codes
+            or self.evidence_ids
+            or self.retry_allowed
+        ):
+            raise ValueError(
+                "no-action review must be approved without reasons, evidence, or retry"
+            )
         if self.approved and (self.reason_codes or self.retry_allowed):
             raise ValueError("approved review cannot contain denial reasons or retry")
         if not self.approved and not self.reason_codes:
@@ -207,6 +218,7 @@ class AgentResult(_StrictDTO):
     state_history: tuple[AgentState, ...]
     leaf_node_id: str
     redacted_summary: str
+    analysis_summary: AnalysisSummary | None = None
 
     @field_validator("session_id")
     @classmethod

@@ -87,9 +87,12 @@ def test_synthetic_then_run(tmp_path: Path) -> None:
     run_payload = json.loads(run.stdout)
     assert run_payload["command"] == "run"
     assert run_payload["metadata_grade"] == "B"
-    assert run_payload["artifact_count"] == 6
     run_dirs = [path for path in (tmp_path / "runs").iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
+    manifest = json.loads(
+        (run_dirs[0] / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert run_payload["artifact_count"] == len(manifest["artifacts"])
     assert (run_dirs[0] / "metadata_report.json").exists()
     assert json.loads((run_dirs[0] / "metadata_report.json").read_text())["metadata_grade"] == "B"
 

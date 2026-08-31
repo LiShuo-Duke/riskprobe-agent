@@ -34,6 +34,7 @@ _IDENTIFIER_LIKE = re.compile(
     re.IGNORECASE,
 )
 _LONG_NUMBER = re.compile(r"^\d{8,}$")
+_SAFE_IDENTIFIER_LIKE_VALUES = frozenset({"sample_weight"})
 
 _FORBIDDEN_KEYS = frozenset(
     {
@@ -58,6 +59,8 @@ _FORBIDDEN_KEYS = frozenset(
         "raw_rows",
         "row",
         "rows",
+        "sample_id",
+        "sample_ids",
         "source_path",
         "target",
         "user_id",
@@ -75,6 +78,7 @@ _SEGMENT_KEYS = frozenset(
     }
 )
 _SAFE_OBJECT_ARRAY_KEYS = frozenset({"findings", "recommendations"})
+_SAFE_OBJECT_ARRAY_SHAPES = frozenset({frozenset({"value", "tokenized"})})
 
 
 class UnsafePayloadError(ValueError):
@@ -319,6 +323,8 @@ def _looks_like_path(value: str) -> bool:
 
 def _looks_like_entity(value: str) -> bool:
     stripped = value.strip()
+    if stripped in _SAFE_IDENTIFIER_LIKE_VALUES:
+        return False
     return (
         _EMAIL.fullmatch(stripped) is not None
         or _UUID.fullmatch(stripped) is not None
@@ -335,6 +341,8 @@ def _looks_like_row_array(value: Sequence[object], *, parent_key: str | None) ->
         return False
     key_sets = [frozenset(item) for item in value if isinstance(item, Mapping)]
     if not key_sets or any(keys != key_sets[0] for keys in key_sets[1:]):
+        return False
+    if key_sets[0] in _SAFE_OBJECT_ARRAY_SHAPES:
         return False
     return all(
         item is None or isinstance(item, (bool, int, float, str))

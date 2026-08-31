@@ -13,6 +13,81 @@ from riskprobe.config import (
 )
 
 
+def _project_config_payload() -> dict[str, object]:
+    return {
+        "dataset": {"id": "demo", "path": "/tmp/demo.parquet"},
+        "columns": {
+            "entity": "id",
+            "snapshot": "dt",
+            "segment": "institution",
+            "target": "target",
+        },
+        "target": {"positive_value": 1, "positive_meaning": "bad_debt"},
+        "snapshot": {"meaning": "customer_specified_feature_cutoff"},
+        "features": {"families": {"numeric": ["feature_"]}},
+    }
+
+
+@pytest.mark.parametrize(
+    ("legacy_enabled", "expected_mode", "requested"),
+    [(True, "strict", True), (False, "disabled", False)],
+)
+def test_legacy_time_validation_boolean_maps_to_mode(
+    legacy_enabled: bool, expected_mode: str, requested: bool
+) -> None:
+    config = ProjectConfig.model_validate(
+        {**_project_config_payload(), "time_validation_enabled": legacy_enabled}
+    )
+
+    assert config.resolved_time_validation_mode == expected_mode
+    assert config.time_validation_requested is requested
+
+
+@pytest.mark.parametrize(
+    ("mode", "requested"),
+    [("strict", True), ("auto", True), ("disabled", False)],
+)
+def test_explicit_time_validation_mode_controls_request(
+    mode: str, requested: bool
+) -> None:
+    config = ProjectConfig.model_validate(
+        {**_project_config_payload(), "time_validation_mode": mode}
+    )
+
+    assert config.resolved_time_validation_mode == mode
+    assert config.time_validation_requested is requested
+
+
+def test_auto_time_validation_mode_is_compatible_with_legacy_enabled_true() -> None:
+    config = ProjectConfig.model_validate(
+        {
+            **_project_config_payload(),
+            "time_validation_enabled": True,
+            "time_validation_mode": "auto",
+        }
+    )
+
+    assert config.resolved_time_validation_mode == "auto"
+    assert config.time_validation_requested is True
+
+
+@pytest.mark.parametrize(
+    ("legacy_enabled", "mode"),
+    [(True, "disabled"), (False, "strict"), (False, "auto")],
+)
+def test_conflicting_legacy_boolean_and_time_validation_mode_is_rejected(
+    legacy_enabled: bool, mode: str
+) -> None:
+    with pytest.raises(ValidationError, match="time_validation"):
+        ProjectConfig.model_validate(
+            {
+                **_project_config_payload(),
+                "time_validation_enabled": legacy_enabled,
+                "time_validation_mode": mode,
+            }
+        )
+
+
 def test_privacy_expose_segment_values_defaults_to_true() -> None:
     config = PrivacyConfig()
 
@@ -236,6 +311,33 @@ def test_feature_family_exact_columns_selects_only_confirmed_columns() -> None:
     ) == ["age"]
 
 
+def test_feature_family_exact_columns_excludes_role_columns() -> None:
+    config = FeatureFamilyConfig.model_validate(
+        {
+            "families": {"numeric": ["age"]},
+            "exact_columns": ["target", "income", "age"],
+        }
+    )
+
+    assert config.select_columns(
+        ["entity", "target", "income", "age"], ["entity", "target"]
+    ) == ["income", "age"]
+
+
+def test_feature_family_exact_columns_rejects_missing_required_columns() -> None:
+    config = FeatureFamilyConfig.model_validate(
+        {
+            "families": {"numeric": ["age"]},
+            "exact_columns": ["age", "income"],
+        }
+    )
+
+    with pytest.raises(
+        ValueError, match="missing required exact feature columns: income"
+    ):
+        config.select_columns(["entity", "age"], ["entity"])
+
+
 def test_feature_family_without_exact_columns_keeps_prefix_selection() -> None:
     config = FeatureFamilyConfig.model_validate({"families": {"numeric": ["age"]}})
     assert config.select_columns(["age", "age_months", "income"], []) == [
@@ -288,3 +390,68 @@ def test_project_config_defaults_to_disabled_imbalance() -> None:
     )
 
     assert config.imbalance.enabled is False
+
+
+def test_scorecard_config_defaults_off_and_rejects_invalid_values() -> None:
+    config = ProjectConfig.model_validate(
+        {
+            "dataset": {"id": "demo", "path": "/tmp/demo.parquet"},
+            "columns": {
+                "entity": "id",
+                "snapshot": "dt",
+                "segment": "institution",
+                "target": "target",
+            },
+            "target": {"positive_value": 1, "positive_meaning": "bad_debt"},
+            "snapshot": {"meaning": "customer_specified_feature_cutoff"},
+            "features": {"families": {"numeric": ["feature_"]}},
+        }
+    )
+
+    assert config.scorecard.enabled is False
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(
+            {
+                **config.model_dump(mode="python"),
+                "scorecard": {"enabled": True, "max_bins": 1},
+            }
+        )
+
+
+def test_xinyongka_example_config_enables_woe_and_scorecard() -> None:
+    config = ProjectConfig.from_yaml(Path("configs/xinyongka.example.yaml"))
+
+    assert config.dataset.id == "xinyongka-credit-risk"
+    assert config.dataset.path == Path("/path/to/xinyongka.parquet")
+    assert config.columns.entity == "ID"
+    assert config.columns.snapshot == "date"
+    assert config.columns.segment == "SEX"
+    assert config.columns.target == "default payment next month"
+    assert config.features.exact_columns == (
+        "LIMIT_BAL",
+        "EDUCATION",
+        "MARRIAGE",
+        "AGE",
+        "PAY_0",
+        "PAY_2",
+        "PAY_3",
+        "PAY_4",
+        "PAY_5",
+        "PAY_6",
+        "BILL_AMT1",
+        "BILL_AMT2",
+        "BILL_AMT3",
+        "BILL_AMT4",
+        "BILL_AMT5",
+        "BILL_AMT6",
+        "PAY_AMT1",
+        "PAY_AMT2",
+        "PAY_AMT3",
+        "PAY_AMT4",
+        "PAY_AMT5",
+        "PAY_AMT6",
+    )
+    assert config.discovery.woe_binning_enabled is True
+    assert config.scorecard.enabled is True
+    assert config.resolved_time_validation_mode == "auto"
+    assert config.time_validation_requested is True

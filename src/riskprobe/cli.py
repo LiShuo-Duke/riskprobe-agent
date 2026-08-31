@@ -281,6 +281,10 @@ def run(
     service = _service(config, runs_dir)
     try:
         context = service.run()
+        verified = service._verified_run_context(context)
+        manifest = json.loads(
+            (verified.run_dir / "manifest.json").read_text(encoding="utf-8")
+        )
     except Exception:
         _fail(
             "run_error",
@@ -289,7 +293,7 @@ def run(
     typer.echo(
         json.dumps(
             {
-                "artifact_count": 6,
+                "artifact_count": len(manifest["artifacts"]),
                 "command": "run",
                 "metadata_grade": service.config.metadata_grade,
                 "reused": context.is_existing,

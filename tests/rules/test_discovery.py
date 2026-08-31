@@ -1,10 +1,12 @@
+from types import SimpleNamespace
+
 import numpy as np
 import polars as pl
 import pytest
 
 from riskprobe.config import DiscoveryConfig
-from riskprobe.models import RiskRule
-from riskprobe.rules.discovery import discover_rules
+from riskprobe.models import Condition, RiskRule
+from riskprobe.rules.discovery import _make_rule, discover_rules
 from riskprobe.rules.expression import evaluate_rule
 from riskprobe.synthetic import generate_behavior_dataset
 
@@ -17,6 +19,33 @@ def _expressions(rules: list[RiskRule]) -> list[tuple[tuple[str, str, object], .
         )
         for rule in rules
     ]
+
+
+@pytest.mark.parametrize(
+    ("digest_prefix", "expected_rule_id"),
+    [
+        ("123456789012", "rule-123456789012"),
+        ("12ab567890cd", "12ab567890cd"),
+    ],
+)
+def test_make_rule_prefixes_only_numeric_digest_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    digest_prefix: str,
+    expected_rule_id: str,
+) -> None:
+    monkeypatch.setattr(
+        "riskprobe.rules.discovery.hashlib.sha256",
+        lambda _payload: SimpleNamespace(
+            hexdigest=lambda: f"{digest_prefix}{'f' * 52}"
+        ),
+    )
+
+    rule, _ = _make_rule(
+        (Condition(feature="feature", operator=">", value=1),),
+        "discovery",
+    )
+
+    assert rule.rule_id == expected_rule_id
 
 
 def test_discovery_finds_cancel_rate_signal_deterministically() -> None:

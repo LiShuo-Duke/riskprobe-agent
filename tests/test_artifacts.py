@@ -15,7 +15,9 @@ _ARTIFACTS = (
     "candidate_rules.parquet",
     "evidence_cards.json",
     "risk_report.md",
+    "analysis_summary.json",
 )
+_LEGACY_ARTIFACTS = _ARTIFACTS[:-1]
 
 
 def _canonical_json(payload: object) -> str:
@@ -34,33 +36,39 @@ def _write_complete_run(
     config: object = "cfg",
     data_fingerprint: str = "data",
     code_version: str = "0.1.0",
+    artifacts: tuple[str, ...] = _ARTIFACTS,
+    legacy_manifest: bool = False,
 ) -> None:
-    for name in _ARTIFACTS[1:]:
+    for name in artifacts[1:]:
         context.write_text(name, f"content for {name}\n")
     integrity = {}
-    for name in _ARTIFACTS[1:]:
+    for name in artifacts[1:]:
         content = (context.run_dir / name).read_bytes()
         integrity[name] = {
             "sha256": hashlib.sha256(content).hexdigest(),
             "size": len(content),
         }
-    context.write_text(
-        "manifest.json",
-        _canonical_json(
+    manifest = {
+        "artifact_integrity": integrity,
+        "artifacts": list(artifacts),
+        "code_version": code_version,
+        "config_fingerprint": hashlib.sha256(
+            _canonical_json(config).encode("utf-8")
+        ).hexdigest(),
+        "data_fingerprint": data_fingerprint,
+        "dataset_id": None,
+        "run_id": context.run_id,
+        "time_validation_enabled": None,
+    }
+    if not legacy_manifest:
+        manifest.update(
             {
-                "artifact_integrity": integrity,
-                "artifacts": list(_ARTIFACTS),
-                "code_version": code_version,
-                "config_fingerprint": hashlib.sha256(
-                    _canonical_json(config).encode("utf-8")
-                ).hexdigest(),
-                "data_fingerprint": data_fingerprint,
-                "dataset_id": None,
-                "run_id": context.run_id,
-                "time_validation_enabled": None,
+                "schema_version": "riskprobe.manifest.v1",
+                "time_validation_mode": None,
+                "time_validation_applied": None,
             }
-        ),
-    )
+        )
+    context.write_text("manifest.json", _canonical_json(manifest))
 
 
 def test_same_inputs_produce_same_run_id(tmp_path) -> None:
@@ -286,3 +294,44 @@ def test_incomplete_run_rejects_symlinked_runtime_database(tmp_path: Path) -> No
 
     assert runtime_path.is_symlink()
     assert external.read_bytes() == b"untrusted"
+
+
+def test_real_v03_legacy_complete_run_remains_reusable(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "runs")
+    first = store.create("cfg", "data", "0.1.0")
+    _write_complete_run(
+        first,
+        artifacts=_LEGACY_ARTIFACTS,
+        legacy_manifest=True,
+    )
+    first.finalize()
+
+    reused = store.create("cfg", "data", "0.1.0")
+    opened = store.open_verified(first.run_id)
+
+    assert reused.is_existing is True
+    assert opened.is_existing is True
+    assert {path.name for path in reused.run_dir.iterdir()} == set(_LEGACY_ARTIFACTS)
+
+
+@pytest.mark.parametrize(
+    ("artifacts", "legacy_manifest"),
+    [
+        (_LEGACY_ARTIFACTS, False),
+        (_ARTIFACTS, True),
+    ],
+)
+def test_manifest_schema_cannot_claim_the_other_artifact_set(
+    tmp_path: Path,
+    artifacts: tuple[str, ...],
+    legacy_manifest: bool,
+) -> None:
+    context = RunStore(tmp_path / "runs").create("cfg", "data", "0.1.0")
+    _write_complete_run(
+        context,
+        artifacts=artifacts,
+        legacy_manifest=legacy_manifest,
+    )
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        context.finalize()

@@ -48,6 +48,7 @@ class Reviewer:
         permission_denied: bool = False,
         unsafe_payload_detected: bool = False,
         tool_failed: bool = False,
+        no_action_required: bool = False,
         retry_count: int = 0,
     ) -> ReviewDecision:
         if not isinstance(plan, ExecutionPlan):
@@ -61,7 +62,7 @@ class Reviewer:
         diagnosis = tuple(sorted(set(diagnosis_evidence_ids)))
         claims = tuple(sorted(set(claimed_evidence_ids)))
         reasons: list[ReviewReason] = []
-        if not evidence:
+        if not no_action_required and not evidence:
             reasons.append(ReviewReason.MISSING_EVIDENCE)
         if permission_denied:
             reasons.append(ReviewReason.PERMISSION_DENIED)
@@ -71,7 +72,7 @@ class Reviewer:
             reasons.append(ReviewReason.GRADE_B_PRODUCTION_ACTION)
         if retry_count > 1:
             reasons.append(ReviewReason.RETRY_LIMIT_EXCEEDED)
-        if not diagnosis:
+        if not no_action_required and not diagnosis:
             reasons.append(ReviewReason.MISSING_DIAGNOSIS)
         if (diagnosis and not set(diagnosis).issubset(evidence)) or (
             claims and not set(claims).issubset(evidence)
@@ -90,8 +91,9 @@ class Reviewer:
         return ReviewDecision(
             approved=approved,
             reason_codes=normalized_reasons,
-            evidence_ids=evidence,
+            evidence_ids=() if no_action_required and approved else evidence,
             retry_allowed=retry_allowed,
+            no_action_required=no_action_required and approved,
         )
 
     def _payloads_are_safe(self, payloads: Sequence[object]) -> bool:

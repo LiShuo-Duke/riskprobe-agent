@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -13,6 +14,7 @@ from riskprobe.agents.decision_contracts import (
     default_decision_policy,
 )
 from riskprobe.monitoring.models import FindingKind, FindingSeverity, RiskFinding
+from riskprobe.privacy import canonical_payload_hash
 from riskprobe.recommendations.policy import ActionCode
 
 
@@ -299,3 +301,36 @@ def test_controlled_decision_and_policy_symbols_are_publicly_exported() -> None:
     }
     for name, symbol in expected_recommendation_symbols.items():
         assert getattr(recommendations_api, name) is symbol
+
+
+def test_decision_context_accepts_legacy_hash_without_analysis_summary() -> None:
+    context = _context()
+    legacy_payload = context.model_dump(
+        mode="json", exclude={"context_id", "analysis_summary"}
+    )
+    legacy_context_id = canonical_payload_hash(legacy_payload)
+
+    restored = DecisionContext.model_validate_json(
+        json.dumps(
+            {**legacy_payload, "context_id": legacy_context_id},
+            sort_keys=True,
+        )
+    )
+
+    assert restored.context_id == legacy_context_id
+    assert restored.analysis_summary is None
+
+
+def test_decision_context_rejects_noncanonical_legacy_hash() -> None:
+    context = _context()
+    legacy_payload = context.model_dump(
+        mode="json", exclude={"context_id", "analysis_summary"}
+    )
+
+    with pytest.raises(ValidationError, match="canonical payload"):
+        DecisionContext.model_validate_json(
+            json.dumps(
+                {**legacy_payload, "context_id": "0" * 64},
+                sort_keys=True,
+            )
+        )

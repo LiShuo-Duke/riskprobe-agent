@@ -67,6 +67,7 @@ class RecordingHandler:
                 run_id="run-001",
                 reused=False,
                 metadata_grade="A",
+                artifact_count=0,
             )
         if isinstance(request, StatusRequest):
             return StatusResponse(run_id=request.run_id, status="succeeded")

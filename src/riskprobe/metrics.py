@@ -1,8 +1,10 @@
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 from scipy.stats import fisher_exact, ks_2samp
+from sklearn.metrics import roc_auc_score
 from statsmodels.stats.multitest import multipletests
 
 from riskprobe.models import RuleMetrics, ScoreSeparation
@@ -285,4 +287,55 @@ def compute_score_ks(
         excluded_count=excluded_count,
         method="ks_2samp",
         limitation=None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreAUC:
+    """Aggregate ROC AUC and derived Gini for one frozen score partition."""
+
+    auc: float | None
+    gini: float | None
+    bad_count: int
+    good_count: int
+    excluded_count: int
+    limitation: str | None = None
+
+
+def compute_score_auc(
+    scores: Any,
+    target: Any,
+    *,
+    positive_value: Any = 1,
+) -> ScoreAUC:
+    """Compute aggregate ROC AUC and Gini without exposing row-level scores."""
+
+    score_array, target_array = _validated_score_inputs(
+        scores,
+        target,
+        positive_value,
+    )
+    finite = np.isfinite(score_array)
+    filtered_scores = score_array[finite]
+    filtered_target = target_array[finite]
+    bad = filtered_target == positive_value
+    bad_count = int(np.count_nonzero(bad))
+    good_count = int(filtered_target.size - bad_count)
+    excluded_count = int(np.count_nonzero(~finite))
+    if bad_count == 0 or good_count == 0:
+        return ScoreAUC(
+            auc=None,
+            gini=None,
+            bad_count=bad_count,
+            good_count=good_count,
+            excluded_count=excluded_count,
+            limitation=_SCORE_KS_LIMITATION,
+        )
+    auc = float(roc_auc_score(filtered_target, filtered_scores))
+    return ScoreAUC(
+        auc=auc,
+        gini=float(2.0 * auc - 1.0),
+        bad_count=bad_count,
+        good_count=good_count,
+        excluded_count=excluded_count,
     )

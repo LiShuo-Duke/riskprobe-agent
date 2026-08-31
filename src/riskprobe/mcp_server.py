@@ -18,11 +18,14 @@ from riskprobe.host_decision import (
     HostDecisionContext,
     HostDecisionCoordinator,
     HostDecisionError,
-    HostDecisionOutcome,
+    HostDecisionFailure,
+    HostDecisionNoActionOutcome,
+    _LegacyHostDecisionNoActionOutcome,
 )
 from riskprobe.policy import Budget, Principal, Role
 from riskprobe.recommendations.policy import ActionCode
 from riskprobe.service import RiskProbeService
+from riskprobe.terminal_reports import TerminalReportError
 
 
 def create_mcp_server(
@@ -39,6 +42,10 @@ def create_mcp_server(
         raise TypeError("service must be a RiskProbeService")
     if type(coordinator) is not HostDecisionCoordinator:
         raise TypeError("coordinator must be a HostDecisionCoordinator")
+    if coordinator._store.directory is None:
+        raise ValueError("coordinator state_dir is required")
+    if coordinator._store.directory.resolve() != service.state_dir.expanduser().resolve():
+        raise ValueError("service and coordinator state_dir must match")
     if type(principal) is not Principal:
         raise TypeError("principal must be a Principal")
     if not isinstance(dataset_id, str):
@@ -54,13 +61,33 @@ def create_mcp_server(
         ),
     )
 
+    def _report_failure(idempotency_key: str) -> HostDecisionFailure | None:
+        try:
+            subject = coordinator.report_subject(idempotency_key=idempotency_key)
+        except Exception:
+            return HostDecisionFailure(error_code="session_state_unavailable")
+        if subject is None:
+            return None
+        try:
+            service.ensure_terminal_report(subject)
+        except TerminalReportError:
+            return HostDecisionFailure(error_code="agent_orchestration_failed")
+        except Exception:
+            return HostDecisionFailure(error_code="agent_orchestration_failed")
+        return None
+
     @server.tool()
     def riskprobe_get_decision_context(
         idempotency_key: str,
-    ) -> HostDecisionContext:
-        """Run the fixed pipeline through discovery and return bounded decision context."""
+    ) -> (
+        HostDecisionContext
+        | HostDecisionNoActionOutcome
+        | _LegacyHostDecisionNoActionOutcome
+        | HostDecisionFailure
+    ):
+        """Run the fixed pipeline against the startup configuration."""
 
-        return coordinator.get_context(
+        result = coordinator.get_context(
             idempotency_key=idempotency_key,
             runner=lambda: service.orchestrate(
                 dataset_id=dataset_id,
@@ -68,6 +95,8 @@ def create_mcp_server(
                 budget=Budget(max_queries=max_queries),
             ),
         )
+        report_failure = _report_failure(idempotency_key)
+        return report_failure if report_failure is not None else result
 
     @server.tool()
     def riskprobe_submit_decision_proposal(
@@ -75,9 +104,13 @@ def create_mcp_server(
         context_id: str,
         diagnosis_evidence_ids: list[str],
         action_codes: list[str],
-    ) -> HostDecisionOutcome:
+    ) -> dict[str, object]:
         """Submit one bounded Host proposal and return the validated terminal result."""
 
+        failure = coordinator.get_failure(idempotency_key=idempotency_key)
+        if failure is not None:
+            report_failure = _report_failure(idempotency_key)
+            return (report_failure or failure).model_dump(mode="json")
         try:
             proposal = DecisionProposal(
                 context_id=context_id,
@@ -88,10 +121,21 @@ def create_mcp_server(
             )
         except Exception as error:
             raise HostDecisionError("host decision is unavailable") from error
-        return coordinator.submit_proposal(
-            idempotency_key=idempotency_key,
-            proposal=proposal,
-        )
+        try:
+            outcome = coordinator.submit_proposal(
+                idempotency_key=idempotency_key,
+                proposal=proposal,
+            )
+        except HostDecisionError:
+            failure = coordinator.get_failure(idempotency_key=idempotency_key)
+            if failure is None:
+                return HostDecisionFailure(
+                    error_code="session_state_unavailable"
+                ).model_dump(mode="json")
+            report_failure = _report_failure(idempotency_key)
+            return (report_failure or failure).model_dump(mode="json")
+        report_failure = _report_failure(idempotency_key)
+        return (report_failure or outcome).model_dump(mode="json")
 
     return server
 

@@ -66,6 +66,7 @@ def _make_rule(conditions: tuple[Condition, ...], origin: str) -> tuple[RiskRule
     ordered_conditions = tuple(sorted(conditions, key=_condition_key))
     expression = _canonical_expression(ordered_conditions)
     rule_id = hashlib.sha256(expression.encode("utf-8")).hexdigest()[:12]
+    rule_id = f"rule-{rule_id}" if rule_id.isdigit() else rule_id
     return (
         RiskRule(rule_id=rule_id, conditions=ordered_conditions, origin=origin),
         expression,

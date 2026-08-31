@@ -5,7 +5,14 @@ from typing import Literal
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -117,10 +124,16 @@ class FeatureFamilyConfig(StrictModel):
         columns: Iterable[str],
         role_columns: Iterable[str],
     ) -> list[str]:
-        candidates = sorted(set(columns).difference(role_columns))
+        available = set(columns)
+        roles = set(role_columns)
         if self.exact_columns is not None:
-            exact = frozenset(self.exact_columns)
-            return [column for column in candidates if column in exact]
+            missing = [column for column in self.exact_columns if column not in available]
+            if missing:
+                raise ValueError(
+                    "missing required exact feature columns: " + ", ".join(missing)
+                )
+            return [column for column in self.exact_columns if column not in roles]
+        candidates = sorted(available.difference(roles))
         if self.explicit_catalog is not None:
             return [
                 column
@@ -181,6 +194,17 @@ class ImbalanceConfig(StrictModel):
     weighting: Literal["balanced"] = "balanced"
 
 
+class ScorecardConfig(StrictModel):
+    enabled: bool = False
+    max_bins: int = Field(default=10, ge=2, le=100)
+    min_bin_fraction: float = Field(default=0.05, gt=0, le=1)
+    smoothing: float = Field(default=0.5, gt=0, le=100)
+    monotonic: Literal["none", "increasing", "decreasing", "auto"] = "auto"
+    min_iv: float = Field(default=0.0, ge=0)
+    C: float = Field(default=1.0, gt=0)
+    max_iter: int = Field(default=1000, ge=1)
+
+
 class ProjectConfig(StrictModel):
     dataset: DatasetConfig
     columns: ColumnRoles
@@ -189,11 +213,36 @@ class ProjectConfig(StrictModel):
     features: FeatureFamilyConfig
     segment_display_name: Literal["institution", "customer_segment"] = "institution"
     time_validation_enabled: bool = True
+    time_validation_mode: Literal["strict", "auto", "disabled"] | None = None
     metadata_grade_override: Literal["A", "B", "C", "D"] | None = None
     discovery: DiscoveryConfig = DiscoveryConfig()
     validation: ValidationConfig = ValidationConfig()
     privacy: PrivacyConfig = PrivacyConfig()
     imbalance: ImbalanceConfig = ImbalanceConfig()
+    scorecard: ScorecardConfig = ScorecardConfig()
+
+    @property
+    def resolved_time_validation_mode(self) -> Literal["strict", "auto", "disabled"]:
+        if self.time_validation_mode is not None:
+            return self.time_validation_mode
+        return "strict" if self.time_validation_enabled else "disabled"
+
+    @property
+    def time_validation_requested(self) -> bool:
+        return self.resolved_time_validation_mode in {"strict", "auto"}
+
+    @model_validator(mode="after")
+    def reject_conflicting_time_validation_settings(self) -> "ProjectConfig":
+        if (
+            self.time_validation_mode is not None
+            and "time_validation_enabled" in self.model_fields_set
+            and self.time_validation_enabled
+            != (self.resolved_time_validation_mode != "disabled")
+        ):
+            raise ValueError(
+                "time_validation_mode conflicts with time_validation_enabled"
+            )
+        return self
 
     @property
     def metadata_grade(self) -> Literal["A", "B", "C", "D"]:

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,11 @@ from riskprobe.tools import (
 )
 
 _RUN_ID = "0123456789abcdef"
+_FAKE_ARTIFACTS = (
+    "data_profile.json",
+    "candidate_rules.parquet",
+    "analysis_summary.json",
+)
 
 
 def _profile(dataset_id: str) -> SafeProfile:
@@ -135,7 +141,22 @@ def _install_local_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
             )
 
         def run(self) -> SimpleNamespace:
-            return SimpleNamespace(run_id=_RUN_ID, is_existing=False)
+            run_dir = self.runs_dir / _RUN_ID
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"artifacts": _FAKE_ARTIFACTS}),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(
+                run_id=_RUN_ID,
+                is_existing=False,
+                run_dir=run_dir,
+            )
+
+        def _verified_run_context(self, context: SimpleNamespace) -> SimpleNamespace:
+            assert context.run_id == _RUN_ID
+            assert context.run_dir == self.runs_dir / _RUN_ID
+            return context
 
     class FakeRuntime:
         def __init__(self, runs_dir: Path, run_id: str) -> None:
@@ -222,6 +243,7 @@ def test_local_handler_covers_all_contracts_with_closed_evidence_and_safe_lookup
     assert inspect.metadata_grade == "B"
     assert discover.rule_ids == ("rule-1",)
     assert run.run_id == _RUN_ID
+    assert run.artifact_count == len(_FAKE_ARTIFACTS)
     assert status.status == "succeeded"
     assert trace.events[0].model_dump(mode="json") == {
         "sequence": 1,

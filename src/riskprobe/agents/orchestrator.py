@@ -8,12 +8,19 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
+from riskprobe.analysis_contracts import (
+    AnalysisSummary,
+    StageName,
+    StageStatus,
+    StageSummary,
+)
 from riskprobe.agents.contracts import (
     AgentResult,
     AgentState,
     AgentStatus,
     ExecutionPlan,
     ReviewDecision,
+    ReviewReason,
 )
 from riskprobe.agents.decision_contracts import (
     DecisionContext,
@@ -180,6 +187,7 @@ class AgentOrchestrator:
         final_decision: ReviewDecision | None = None
         final_evidence: tuple[str, ...] = ()
         final_diagnosis: tuple[str, ...] = ()
+        final_analysis_summary: AnalysisSummary | None = None
 
         while True:
             if retry_count:
@@ -203,6 +211,7 @@ class AgentOrchestrator:
             final_decision = outcome.decision
             final_evidence = outcome.evidence_ids
             final_diagnosis = outcome.diagnosis_evidence_ids
+            final_analysis_summary = outcome.analysis_summary
             if final_decision.approved:
                 states.append(AgentState.COMPLETED)
                 status = AgentStatus.SUCCEEDED
@@ -226,18 +235,29 @@ class AgentOrchestrator:
             summary = "comprehensive objective rejected by deterministic review"
             break
 
+        final_nodes = self._sessions.replay(
+            root.session_id,
+            leaf_node_id=leaf.node_id,
+        )
+        final_attempt = _session_attempts(final_nodes)[-1]
+        actual_tool_sequence = tuple(
+            _node_tool_name(node)
+            for node in final_attempt
+            if _node_tool_name(node) != _DECISION_AUDIT_TOOL
+        )
         return AgentResult(
             session_id=root.session_id,
             status=status,
             plan=plan,
             review=final_decision,
-            tool_sequence=plan.tool_sequence,
+            tool_sequence=actual_tool_sequence,
             evidence_ids=final_evidence,
             diagnosis_evidence_ids=final_diagnosis,
             retry_count=retry_count,
             state_history=tuple(states),
             leaf_node_id=leaf.node_id,
             redacted_summary=summary,
+            analysis_summary=final_analysis_summary,
         )
 
     execute = run
@@ -250,6 +270,7 @@ class AgentOrchestrator:
         dataset_id: str,
         session_id: str,
         metadata_grade: str,
+        analysis_summary: AnalysisSummary | None = None,
     ) -> AgentResult:
         """Revalidate a persisted terminal result against deterministic sidecars."""
 
@@ -284,7 +305,6 @@ class AgentOrchestrator:
             if (
                 result.session_id != session_id
                 or result.plan != expected_plan
-                or result.tool_sequence != expected_plan.tool_sequence
                 or result.review.evidence_ids != result.evidence_ids
                 or result.review.retry_allowed
                 or result.state_history != tuple(expected_states)
@@ -346,6 +366,9 @@ class AgentOrchestrator:
             decision_evidence_ids: set[str] = set()
             final_diagnosis_ids: tuple[str, ...] = ()
             final_recommendation_ids: tuple[str, ...] = ()
+            final_inspect_succeeded = False
+            final_diagnose_succeeded = False
+            final_discover_succeeded = False
             for attempt_index, attempt in enumerate(attempts):
                 names = tuple(_node_tool_name(node) for node in attempt)
                 public_names = tuple(
@@ -369,6 +392,8 @@ class AgentOrchestrator:
                 diagnosis_ids: tuple[str, ...] = ()
                 recommendation_ids: set[str] = set()
                 discover_node: SessionNode | None = None
+                inspect_succeeded = False
+                diagnose_succeeded = False
                 discover_succeeded = False
                 audit_count = 0
                 audit_outcome: (
@@ -377,6 +402,7 @@ class AgentOrchestrator:
                 permission_denied = False
                 unsafe_payload_detected = False
                 tool_failed = False
+                explicit_empty_diagnosis = False
 
                 for node_index, node in enumerate(attempt[:-1]):
                     name = names[node_index]
@@ -483,6 +509,7 @@ class AgentOrchestrator:
                             raise ValueError(
                                 "terminal inspection evidence is invalid"
                             )
+                        inspect_succeeded = True
                     elif name == "diagnose":
                         if summary != (
                             f"diagnosis evidence count {len(node.evidence_ids)}"
@@ -491,7 +518,9 @@ class AgentOrchestrator:
                                 "terminal diagnosis summary is invalid"
                             )
                         diagnosis_ids = node.evidence_ids
+                        explicit_empty_diagnosis = diagnosis_ids == ()
                         business_evidence = set(diagnosis_ids)
+                        diagnose_succeeded = True
                     elif name == "discover":
                         discover_node = node
                         discover_succeeded = (
@@ -562,6 +591,13 @@ class AgentOrchestrator:
                 review_diagnosis = set(diagnosis_ids).intersection(
                     attempt_evidence
                 )
+                no_action_required = (
+                    explicit_empty_diagnosis
+                    and not diagnosis_ids
+                    and not tool_failed
+                    and not permission_denied
+                    and not unsafe_payload_detected
+                )
                 expected_review = self._reviewer.review(
                     expected_plan,
                     evidence_ids=tuple(sorted(attempt_evidence)),
@@ -572,6 +608,7 @@ class AgentOrchestrator:
                     permission_denied=permission_denied,
                     unsafe_payload_detected=unsafe_payload_detected,
                     tool_failed=tool_failed,
+                    no_action_required=no_action_required,
                     retry_count=attempt_index,
                 )
                 expected_review_arguments = {
@@ -612,6 +649,7 @@ class AgentOrchestrator:
                 else:
                     if (
                         review.node_id != result.leaf_node_id
+                        or public_names != result.tool_sequence
                         or expected_review != result.review
                         or review.evidence_ids != result.evidence_ids
                     ):
@@ -620,6 +658,9 @@ class AgentOrchestrator:
                     final_recommendation_ids = tuple(
                         sorted(recommendation_ids)
                     )
+                    final_inspect_succeeded = inspect_succeeded
+                    final_diagnose_succeeded = diagnose_succeeded
+                    final_discover_succeeded = discover_succeeded
 
             if (
                 result.status is AgentStatus.SUCCEEDED
@@ -649,9 +690,122 @@ class AgentOrchestrator:
             )
             if unsafe or failed or resolved_ids != set(result.evidence_ids):
                 raise ValueError("terminal evidence binding is invalid")
+            if result.analysis_summary is not None and result.analysis_summary != (
+                _agent_analysis_summary(
+                    analysis_summary,
+                    inspect_succeeded=final_inspect_succeeded,
+                    diagnose_succeeded=final_diagnose_succeeded,
+                    discover_succeeded=final_discover_succeeded,
+                )
+            ):
+                raise ValueError("terminal analysis summary binding is invalid")
             return result
         except Exception as error:
             raise RuntimeError("agent result is unavailable") from error
+
+    def recover_terminal_result(
+        self,
+        *,
+        objective: str,
+        dataset_id: str,
+        session_id: str,
+        metadata_grade: str,
+        analysis_summary: AnalysisSummary | None = None,
+    ) -> AgentResult | None:
+        """Project and revalidate a complete terminal journal without rerunning tools."""
+        try:
+            nodes = self._sessions.replay(session_id)
+            if not nodes or nodes[-1].tool_call is None or _node_tool_name(nodes[-1]) != "review":
+                return None
+            attempts = _session_attempts(nodes)
+            if not attempts or not attempts[-1]:
+                return None
+            review = attempts[-1][-1]
+            actual_tool_sequence = tuple(
+                _node_tool_name(node)
+                for node in attempts[-1]
+                if _node_tool_name(node) != _DECISION_AUDIT_TOOL
+            )
+            arguments = dict(review.tool_call.arguments)
+            reason_codes = tuple(
+                ReviewReason(value) for value in arguments.get("reason_codes", ())
+            )
+            approved = arguments.get("approved") is True
+            retry_count = len(attempts) - 1
+            diagnosis_ids: tuple[str, ...] = ()
+            for node in reversed(attempts[-1][:-1]):
+                if _node_tool_name(node) == "diagnose":
+                    diagnosis_ids = node.evidence_ids
+                    break
+            inspect_succeeded = any(
+                _node_tool_name(node) == "inspect"
+                and node.redacted_summary == "inspection aggregates recorded"
+                for node in attempts[-1][:-1]
+            )
+            diagnose_succeeded = any(
+                _node_tool_name(node) == "diagnose"
+                and node.redacted_summary
+                == f"diagnosis evidence count {len(node.evidence_ids)}"
+                for node in attempts[-1][:-1]
+            )
+            discover_succeeded = any(
+                _node_tool_name(node) == "discover"
+                and _DISCOVER_SUCCESS_SUMMARY.fullmatch(node.redacted_summary)
+                is not None
+                for node in attempts[-1][:-1]
+            )
+            decision = ReviewDecision(
+                approved=approved,
+                reason_codes=reason_codes,
+                evidence_ids=review.evidence_ids,
+                retry_allowed=False,
+                no_action_required=(approved and not reason_codes and not review.evidence_ids),
+            )
+            result = AgentResult(
+                session_id=session_id,
+                status=AgentStatus.SUCCEEDED if approved else AgentStatus.REJECTED,
+                plan=self._planner.plan(objective=objective, dataset_id=dataset_id),
+                review=decision,
+                tool_sequence=actual_tool_sequence,
+                evidence_ids=review.evidence_ids,
+                diagnosis_evidence_ids=diagnosis_ids,
+                retry_count=retry_count,
+                state_history=(
+                    AgentState.PLANNING,
+                    AgentState.EXECUTING,
+                    AgentState.COLLECTING_EVIDENCE,
+                    AgentState.REVIEWING,
+                    *( (
+                        AgentState.RETRYING,
+                        AgentState.EXECUTING,
+                        AgentState.COLLECTING_EVIDENCE,
+                        AgentState.REVIEWING,
+                    ) if retry_count else () ),
+                    AgentState.COMPLETED if approved else AgentState.REJECTED,
+                ),
+                leaf_node_id=nodes[-1].node_id,
+                redacted_summary=(
+                    "comprehensive objective approved from aggregate evidence"
+                    if approved
+                    else "comprehensive objective rejected by deterministic review"
+                ),
+                analysis_summary=_agent_analysis_summary(
+                    analysis_summary,
+                    inspect_succeeded=inspect_succeeded,
+                    diagnose_succeeded=diagnose_succeeded,
+                    discover_succeeded=discover_succeeded,
+                ),
+            )
+            return self.validate_terminal_result(
+                result,
+                objective=objective,
+                dataset_id=dataset_id,
+                session_id=session_id,
+                metadata_grade=metadata_grade,
+                analysis_summary=analysis_summary,
+            )
+        except Exception:
+            return None
 
     def _execute_once(
         self,
@@ -672,7 +826,12 @@ class AgentOrchestrator:
         payloads: list[object] = []
         metadata_grade: str = "A"
         inspect_response: InspectResponse | None = None
+        analysis_summary: AnalysisSummary | None = None
+        inspect_succeeded = False
+        diagnose_succeeded = False
+        discover_succeeded = False
         decision_submission: DecisionSubmission | None = None
+        explicit_empty_diagnosis = False
         permission_denied = False
         unsafe_payload = False
         tool_failed = False
@@ -686,7 +845,17 @@ class AgentOrchestrator:
                 decision_submission,
             )
             try:
-                response = self._gateway.invoke(principal, request, budget)
+                if (
+                    isinstance(request, RecommendRequest)
+                    and explicit_empty_diagnosis
+                    and not diagnosis_evidence
+                ):
+                    response = RecommendResponse(
+                        dataset_id=request.dataset_id,
+                        recommendation_ids=(),
+                    )
+                else:
+                    response = self._gateway.invoke(principal, request, budget)
             except PermissionError:
                 permission_denied = True
                 leaf = self._append_tool_node(
@@ -728,8 +897,12 @@ class AgentOrchestrator:
             try:
                 if isinstance(response, DiagnoseResponse):
                     finding_ids = _validated_sha_ids(response.finding_ids)
+                    explicit_empty_diagnosis = finding_ids == ()
                     diagnosis_evidence.update(finding_ids)
                     evidence.update(finding_ids)
+                    diagnose_succeeded = True
+                elif isinstance(response, DiscoverResponse):
+                    discover_succeeded = True
                 elif isinstance(response, RecommendResponse):
                     recommendation_ids = _validated_sha_ids(
                         response.recommendation_ids
@@ -748,6 +921,8 @@ class AgentOrchestrator:
 
             if isinstance(response, InspectResponse):
                 inspect_response = response
+                analysis_summary = response.analysis_summary
+                inspect_succeeded = True
                 metadata_grade = response.metadata_grade
             leaf = self._append_tool_node(
                 leaf,
@@ -810,6 +985,17 @@ class AgentOrchestrator:
                         tool_failed = True
                         break
                 except Exception:
+                    try:
+                        outcome = self._decision_controller.record_unavailable(
+                            context_evidence_id=preparation.context_evidence_id,
+                            reason=_DecisionUnavailableReason.SUBMISSION_ERROR,
+                            provider_binding=provider_binding,
+                        )
+                        leaf = self._append_decision_node(leaf, outcome)
+                    except Exception:
+                        raise RuntimeError(
+                            "decision submission audit is unavailable"
+                        ) from None
                     tool_failed = True
                     break
 
@@ -832,6 +1018,13 @@ class AgentOrchestrator:
         review_diagnosis = diagnosis_evidence.intersection(resolved_ids)
         unsafe_payload = unsafe_payload or resolver_unsafe
         tool_failed = tool_failed or resolver_failed
+        no_action_required = (
+            explicit_empty_diagnosis
+            and not diagnosis_evidence
+            and not tool_failed
+            and not permission_denied
+            and not unsafe_payload
+        )
         decision = self._reviewer.review(
             plan,
             evidence_ids=tuple(sorted(resolved_ids)),
@@ -842,6 +1035,7 @@ class AgentOrchestrator:
             permission_denied=permission_denied,
             unsafe_payload_detected=unsafe_payload,
             tool_failed=tool_failed,
+            no_action_required=no_action_required,
             retry_count=retry_count,
         )
         review_call = SessionToolCall(
@@ -870,6 +1064,12 @@ class AgentOrchestrator:
             diagnosis_evidence_ids=tuple(sorted(review_diagnosis)),
             evidence_ids=tuple(sorted(resolved_ids)),
             leaf=leaf,
+            analysis_summary=_agent_analysis_summary(
+                analysis_summary,
+                inspect_succeeded=inspect_succeeded,
+                diagnose_succeeded=diagnose_succeeded,
+                discover_succeeded=discover_succeeded,
+            ),
         )
 
     @staticmethod
@@ -1273,7 +1473,13 @@ class _DecisionProviderUnavailable(RuntimeError):
 
 
 class _AttemptOutcome:
-    __slots__ = ("decision", "diagnosis_evidence_ids", "evidence_ids", "leaf")
+    __slots__ = (
+        "analysis_summary",
+        "decision",
+        "diagnosis_evidence_ids",
+        "evidence_ids",
+        "leaf",
+    )
 
     def __init__(
         self,
@@ -1282,7 +1488,9 @@ class _AttemptOutcome:
         diagnosis_evidence_ids: tuple[str, ...],
         evidence_ids: tuple[str, ...],
         leaf: SessionNode,
+        analysis_summary: AnalysisSummary | None,
     ) -> None:
+        self.analysis_summary = analysis_summary
         self.decision = decision
         self.diagnosis_evidence_ids = diagnosis_evidence_ids
         self.evidence_ids = evidence_ids
@@ -1295,6 +1503,93 @@ class _InvalidResolvedEvidence(ValueError):
 
 class _UnsafeResolvedEvidence(ValueError):
     pass
+
+
+def _agent_analysis_summary(
+    summary: AnalysisSummary | None,
+    *,
+    inspect_succeeded: bool,
+    diagnose_succeeded: bool,
+    discover_succeeded: bool,
+) -> AnalysisSummary | None:
+    if summary is None:
+        return None
+    updates = {stage.name: stage for stage in summary.stages}
+
+    def succeeded(name: StageName) -> StageSummary:
+        return StageSummary(
+            name=name,
+            status=StageStatus.SUCCEEDED,
+            enabled=True,
+            output_available=True,
+        )
+
+    if inspect_succeeded:
+        updates[StageName.INSPECT] = succeeded(StageName.INSPECT)
+    if diagnose_succeeded:
+        for name in (
+            StageName.DIAGNOSE_QUALITY,
+            StageName.DIAGNOSE_SEGMENT_RISK,
+        ):
+            if updates[name].status is StageStatus.NOT_RUN:
+                updates[name] = succeeded(name)
+        has_reference = (
+            summary.profile is not None and summary.profile.row_count >= 2
+        )
+        for name in (
+            StageName.DIAGNOSE_FEATURE_DRIFT,
+            StageName.DIAGNOSE_POPULATION_SHIFT,
+            StageName.DIAGNOSE_TARGET_SHIFT,
+        ):
+            if updates[name].status is StageStatus.NOT_RUN:
+                updates[name] = (
+                    succeeded(name)
+                    if has_reference
+                    else StageSummary(
+                        name=name,
+                        status=StageStatus.UNAVAILABLE,
+                        enabled=True,
+                        output_available=False,
+                        reason_code="insufficient_drift_reference",
+                    )
+                )
+        time_stage = StageName.DIAGNOSE_TIME_STABILITY
+        if updates[time_stage].status is StageStatus.NOT_RUN:
+            partition = summary.partition
+            if partition is not None and partition.applied_time_validation:
+                updates[time_stage] = succeeded(time_stage)
+            elif partition is not None and partition.mode == "disabled":
+                updates[time_stage] = StageSummary(
+                    name=time_stage,
+                    status=StageStatus.SKIPPED,
+                    enabled=False,
+                    output_available=False,
+                    reason_code="time_validation_disabled",
+                )
+            else:
+                updates[time_stage] = StageSummary(
+                    name=time_stage,
+                    status=StageStatus.UNAVAILABLE,
+                    enabled=True,
+                    output_available=False,
+                    reason_code="time_validation_unavailable",
+                )
+        rule_stage = StageName.DIAGNOSE_RULE_EVIDENCE
+        if updates[rule_stage].status is StageStatus.NOT_RUN:
+            updates[rule_stage] = StageSummary(
+                name=rule_stage,
+                status=StageStatus.NOT_RUN,
+                enabled=False,
+                output_available=False,
+                reason_code="rule_evidence_not_run",
+            )
+    if discover_succeeded:
+        updates[StageName.DISCOVER_RESTORE] = succeeded(
+            StageName.DISCOVER_RESTORE
+        )
+    payload = summary.model_dump(mode="python")
+    payload["stages"] = tuple(updates[name] for name in StageName)
+    return AnalysisSummary.model_validate(payload)
 
 
 def _provider_identity(provider: object) -> _DecisionProviderIdentity:

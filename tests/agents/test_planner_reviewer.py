@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from riskprobe.agents.contracts import (
     ExecutionPlan,
     PlanStep,
+    ReviewDecision,
     ReviewReason,
 )
 from riskprobe.agents.planner import Planner, PlanningError
@@ -111,6 +112,78 @@ def test_reviewer_approves_complete_safe_diagnosis_evidence() -> None:
     assert decision.approved is True
     assert decision.reason_codes == ()
     assert decision.retry_allowed is False
+
+
+def test_reviewer_approves_clean_no_action_terminal() -> None:
+    decision = Reviewer().review(_plan(), no_action_required=True)
+
+    assert decision.approved is True
+    assert decision.no_action_required is True
+    assert decision.reason_codes == ()
+    assert decision.evidence_ids == ()
+    assert decision.retry_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("failure", "reason", "retry_allowed"),
+    [
+        ({"tool_failed": True}, ReviewReason.TOOL_FAILURE, False),
+        ({"permission_denied": True}, ReviewReason.PERMISSION_DENIED, False),
+        (
+            {"payloads": ({"path": "/private/data.parquet"},)},
+            ReviewReason.UNSAFE_PAYLOAD,
+            False,
+        ),
+        (
+            {"metadata_grade": "B"},
+            ReviewReason.GRADE_B_PRODUCTION_ACTION,
+            False,
+        ),
+        ({"retry_count": 2}, ReviewReason.RETRY_LIMIT_EXCEEDED, False),
+        (
+            {
+                "evidence_ids": (_EVIDENCE_A,),
+                "diagnosis_evidence_ids": (_EVIDENCE_B,),
+            },
+            ReviewReason.EVIDENCE_MISMATCH,
+            True,
+        ),
+    ],
+)
+def test_reviewer_rejects_no_action_terminal_when_safety_gate_fails(
+    failure: dict[str, object],
+    reason: ReviewReason,
+    retry_allowed: bool,
+) -> None:
+    plan = _plan()
+    if failure.get("metadata_grade") == "B":
+        production_step = plan.steps[3].model_copy(update={"production_action": True})
+        plan = ExecutionPlan(
+            objective=plan.objective,
+            dataset_id=plan.dataset_id,
+            steps=(*plan.steps[:3], production_step, plan.steps[4]),
+            component_versions=plan.component_versions,
+        )
+    decision = Reviewer().review(plan, no_action_required=True, **failure)
+
+    assert decision.approved is False
+    assert decision.no_action_required is False
+    assert decision.retry_allowed is retry_allowed
+    assert reason in decision.reason_codes
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"approved": False},
+        {"reason_codes": (ReviewReason.TOOL_FAILURE,)},
+        {"evidence_ids": (_EVIDENCE_A,)},
+        {"retry_allowed": True},
+    ],
+)
+def test_review_decision_rejects_invalid_no_action_terminal(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        ReviewDecision(no_action_required=True, **kwargs)
 
 
 @pytest.mark.parametrize(

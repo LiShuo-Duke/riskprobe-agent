@@ -20,6 +20,24 @@ import numpy as np
 import polars as pl
 from sklearn.model_selection import train_test_split
 
+from riskprobe.analysis_contracts import (
+    AnalysisSummary,
+    ArtifactSummary,
+    DiscoverySummary,
+    FeatureRef,
+    InputSummary,
+    MetricDistribution,
+    PartitionSummary,
+    ProfileSummary,
+    ScorecardFeatureSummary,
+    ScorecardSplitMetrics,
+    ScorecardSummary,
+    ScorecardTerm,
+    StageName,
+    StageStatus,
+    StageSummary,
+    ValidationSummary,
+)
 from riskprobe.artifacts import RunContext, RunStore
 from riskprobe.config import ProjectConfig
 from riskprobe.dates import normalize_date_series
@@ -28,6 +46,7 @@ from riskprobe.execution.models import ArtifactRef
 from riskprobe.features.catalog import FeatureCatalog
 from riskprobe.io.parquet import ParquetDataset
 from riskprobe.institutions import discover_local_rules
+from riskprobe.metrics import compute_score_auc, compute_score_ks
 from riskprobe.models import EvidenceCard, RiskRule, SliceMetrics
 from riskprobe.monitoring.models import (
     DiagnosticReport,
@@ -39,6 +58,7 @@ from riskprobe.monitoring.reference import build_reference_snapshot
 from riskprobe.monitoring.service import diagnose_dataset
 from riskprobe.profiling import DatasetProfile, profile_dataset
 from riskprobe.recommendations import build_recommendations
+from riskprobe.report_models import build_final_report_model
 from riskprobe.reporting import (
     evidence_sort_key,
     redact_limitation,
@@ -47,8 +67,14 @@ from riskprobe.reporting import (
     safe_dataset_id,
 )
 from riskprobe.rules.discovery import DiscoveryResult, discover_rules, discover_with_metrics
+from riskprobe.rules.scorecard import fit_scorecard
 from riskprobe.rules.validation import validate_rules
 from riskprobe.runtime import RunRuntime
+from riskprobe.terminal_reports import (
+    TerminalReportManifest,
+    TerminalReportStore,
+    TerminalReportSubject,
+)
 
 if TYPE_CHECKING:
     from riskprobe.agents import AgentResult
@@ -85,7 +111,9 @@ _ARTIFACT_NAMES = (
     "candidate_rules.parquet",
     "evidence_cards.json",
     "risk_report.md",
+    "analysis_summary.json",
 )
+_SCORECARD_ARTIFACT_NAMES = (*_ARTIFACT_NAMES, "scorecard.json")
 _ARTIFACT_SCHEMAS = {
     "manifest.json": "riskprobe.manifest.v1",
     "metadata_report.json": "riskprobe.metadata-report.v1",
@@ -93,8 +121,18 @@ _ARTIFACT_SCHEMAS = {
     "candidate_rules.parquet": "riskprobe.candidate-rules.v1",
     "evidence_cards.json": "riskprobe.evidence-cards.v1",
     "risk_report.md": "riskprobe.risk-report.v1",
+    "analysis_summary.json": "riskprobe.analysis-summary.v1",
+    "scorecard.json": "riskprobe.scorecard.v1",
 }
-_NODE_ORDER = ("profile", "partition", "discover", "validate", "report", "finalize")
+_NODE_ORDER = (
+    "profile",
+    "partition",
+    "discover",
+    "scorecard",
+    "validate",
+    "report",
+    "finalize",
+)
 _SLICE_ORDER = {"dataset": 0, "segment": 1, "time": 2}
 _GRADE_ORDER = {"Stable": 0, "Local": 1, "Unstable": 2, "Suspicious": 3}
 _SNAPSHOT_ROOT_PREFIX = "riskprobe-input-snapshots-"
@@ -117,6 +155,57 @@ _STATUS_MAP = {
     "cancelled": "cancelled",
 }
 _SERVICE_PRODUCER_VERSION = "riskprobe-service-v1"
+_HOST_FAILURE_CODES = frozenset(
+    {
+        "profile_contract_failed",
+        "partition_failed",
+        "discover_failed",
+        "scorecard_failed",
+        "scorecard_terms_failed",
+        "scorecard_features_failed",
+        "scorecard_metrics_failed",
+        "scorecard_refs_failed",
+        "scorecard_metadata_failed",
+        "scorecard_refs_contract_failed",
+        "scorecard_content_failed",
+        "scorecard_splits_contract_failed",
+        "scorecard_contract_failed",
+        "artifact_runtime_failed",
+        "analysis_summary_failed",
+        "artifact_finalize_failed",
+        "agent_session_failed",
+        "agent_state_unavailable",
+        "agent_state_incomplete",
+        "agent_orchestration_failed",
+        "context_timeout",
+        "session_state_unavailable",
+    }
+)
+
+
+class HostSafeStageError(RuntimeError):
+    """Internal failure marker containing only an approved Host error code."""
+
+    def __init__(
+        self,
+        host_failure_code: str,
+        *,
+        report_run_id: str | None = None,
+    ) -> None:
+        if host_failure_code not in _HOST_FAILURE_CODES:
+            raise ValueError("host failure code is not allowed")
+        if report_run_id is not None and _RUN_ID.fullmatch(report_run_id) is None:
+            raise ValueError("report run ID is invalid")
+        self.host_failure_code = host_failure_code
+        self.report_run_id = report_run_id
+        super().__init__(host_failure_code)
+
+    def with_report_run_id(self, run_id: str) -> HostSafeStageError:
+        if self.report_run_id is not None:
+            if self.report_run_id != run_id:
+                raise ValueError("report run ID binding is inconsistent")
+            return self
+        return HostSafeStageError(self.host_failure_code, report_run_id=run_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +500,19 @@ def _time_split(
     )
 
 
+def _time_split_is_usable(
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    holdout: pl.DataFrame,
+    target_col: str,
+) -> bool:
+    return all(
+        not partition.is_empty()
+        and set(partition.get_column(target_col).unique().to_list()) == {0, 1}
+        for partition in (train, test, holdout)
+    )
+
+
 def _stratified_labels(
     frame: pl.DataFrame, target_col: str, segment_col: str
 ) -> np.ndarray:
@@ -656,9 +758,11 @@ def _restore_rules(source: Path | bytes) -> list[RiskRule]:
         raise ValueError("checkpoint rules are invalid") from error
 
 
-def _restore_cards(path: Path) -> list[EvidenceCard]:
+def _restore_cards(source: Path | bytes) -> list[EvidenceCard]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            source if isinstance(source, bytes) else source.read_text(encoding="utf-8")
+        )
         if not isinstance(payload, list):
             raise ValueError("checkpoint evidence must be a list")
         restored: list[EvidenceCard] = []
@@ -682,6 +786,42 @@ def _restore_cards(path: Path) -> list[EvidenceCard]:
         return restored
     except Exception as error:
         raise ValueError("checkpoint evidence is invalid") from error
+
+
+def _restore_terminal_metadata(
+    content: bytes,
+) -> tuple[tuple[str, ...], bool, Mapping[str, object] | None]:
+    try:
+        payload = json.loads(content)
+        if not isinstance(payload, dict):
+            raise TypeError("metadata report must be an object")
+        limitations = payload.get("limitations", [])
+        time_validation_applied = payload["time_validation_applied"]
+        institution = payload.get("institution_analysis")
+        if not isinstance(limitations, list) or not all(
+            isinstance(item, str) for item in limitations
+        ):
+            raise TypeError("metadata limitations are invalid")
+        if type(time_validation_applied) is not bool:
+            raise TypeError("metadata time validation flag is invalid")
+        if institution is None:
+            institution_summary = None
+        else:
+            if not isinstance(institution, dict):
+                raise TypeError("metadata institution analysis is invalid")
+            institution_summary = {}
+            for name in (
+                "eligible_institution_count",
+                "triggered_institution_count",
+                "blocked_institution_count",
+            ):
+                value = institution.get(name, 0)
+                if type(value) is not int or value < 0:
+                    raise TypeError("metadata institution count is invalid")
+                institution_summary[name] = value
+        return tuple(limitations), time_validation_applied, institution_summary
+    except Exception as error:
+        raise ValueError("terminal report metadata is invalid") from error
 
 
 def _issue_payload(issue: Any) -> dict[str, Any]:
@@ -843,20 +983,35 @@ def _render_service_report(
     *,
     cards_are_redacted: bool = False,
     expose_segment_values: bool = False,
+    time_validation_applied: bool | None = None,
+    scorecard_payload: Mapping[str, Any] | None = None,
+    analysis_summary_payload: Mapping[str, Any] | AnalysisSummary | None = None,
+    run_id: str | None = None,
 ) -> str:
+    analysis_summary = (
+        analysis_summary_payload
+        if isinstance(analysis_summary_payload, AnalysisSummary)
+        else AnalysisSummary.model_validate(analysis_summary_payload)
+        if analysis_summary_payload is not None
+        else None
+    )
+    safe_cards = [
+        _sorted_card(card, already_redacted=cards_are_redacted)
+        for card in cards
+    ]
     report = render_risk_report(
         profile,
-        cards,
+        safe_cards,
         institution_analysis=institution_analysis,
         expose_segment_values=expose_segment_values,
         segments_are_redacted=cards_are_redacted,
+        time_validation_applied=time_validation_applied,
+        run_limitations=validation_limitations,
+        analysis_summary=analysis_summary,
+        run_id=run_id,
     )
-    if validation_limitations and not cards:
-        replacement = "\n".join(
-            f"- {redact_limitation(limitation, already_redacted=cards_are_redacted)}"
-            for limitation in sorted(validation_limitations)
-        )
-        report = report.replace("- None identified by configured checks", replacement)
+    if analysis_summary is None and scorecard_payload is not None:
+        report += _render_scorecard_section(scorecard_payload)
     return report
 
 
@@ -921,15 +1076,227 @@ def _attach_holdout(
     return combined
 
 
-def _artifact_integrity(run_dir: Path) -> dict[str, dict[str, Any]]:
+def _artifact_integrity(
+    run_dir: Path, artifact_names: Sequence[str] = _ARTIFACT_NAMES
+) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
-    for name in _ARTIFACT_NAMES[1:]:
+    for name in artifact_names[1:]:
         content = (run_dir / name).read_bytes()
         records[name] = {
             "sha256": hashlib.sha256(content).hexdigest(),
             "size": len(content),
         }
     return records
+
+
+def _scorecard_partition_summary(
+    model: Any,
+    frame: pl.DataFrame,
+    *,
+    target_column: str,
+) -> dict[str, Any]:
+    if frame.is_empty():
+        return {
+            "row_count": 0,
+            "target_rate": None,
+            "bad_probability": {"min": None, "mean": None, "max": None},
+            "risk_score_mean": None,
+            "risk_level_counts": {},
+            "auc": None,
+            "ks": None,
+            "gini": None,
+            "metric_limitation": "empty_partition",
+        }
+    prediction = model.predict(frame)
+    probabilities = np.asarray(prediction.probabilities, dtype=np.float64)
+    target = frame.get_column(target_column).to_numpy()
+    auc_result = compute_score_auc(probabilities, target)
+    ks_result = compute_score_ks(probabilities, target)
+    levels: dict[str, int] = {}
+    for level in prediction.risk_levels:
+        levels[level] = levels.get(level, 0) + 1
+    return {
+        "row_count": frame.height,
+        "target_rate": float(np.mean(target)),
+        "bad_probability": {
+            "min": float(np.min(probabilities)),
+            "mean": float(np.mean(probabilities)),
+            "max": float(np.max(probabilities)),
+        },
+        "risk_score_mean": float(np.mean(prediction.risk_scores)),
+        "risk_level_counts": dict(sorted(levels.items())),
+        "auc": auc_result.auc,
+        "ks": ks_result.statistic,
+        "gini": auc_result.gini,
+        "metric_limitation": auc_result.limitation or ks_result.limitation,
+    }
+
+
+def _scorecard_payload(
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    holdout: pl.DataFrame | None,
+    feature_names: Sequence[str],
+    rules: Sequence[RiskRule],
+    config: ProjectConfig,
+) -> dict[str, Any]:
+    numeric_features = [
+        name for name in feature_names if train.schema[name].is_numeric()
+    ]
+    excluded_features = [name for name in feature_names if name not in numeric_features]
+    constraints = {
+        "max_bins": config.scorecard.max_bins,
+        "min_bin_fraction": config.scorecard.min_bin_fraction,
+        "smoothing": config.scorecard.smoothing,
+        "monotonic": config.scorecard.monotonic,
+        "min_iv": config.scorecard.min_iv,
+        "C": config.scorecard.C,
+        "max_iter": config.scorecard.max_iter,
+    }
+    base = {
+        "constraints": constraints,
+        "input_features": list(feature_names),
+        "included_features": [],
+        "excluded_features": excluded_features,
+        "excluded_feature_reasons": {
+            name: "non_numeric_feature" for name in excluded_features
+        },
+        "imbalance_strategy": (
+            config.imbalance.strategy if config.imbalance.enabled else "disabled"
+        ),
+    }
+    if not numeric_features:
+        return {
+            "status": "unavailable",
+            "limitations": ["No numeric selected features in the Train schema."],
+            **base,
+        }
+    try:
+        model = fit_scorecard(
+            train,
+            feature_names=numeric_features,
+            target_col=config.columns.target,
+            rules=rules,
+            max_bins=config.scorecard.max_bins,
+            min_bin_fraction=config.scorecard.min_bin_fraction,
+            smoothing=config.scorecard.smoothing,
+            monotonic=config.scorecard.monotonic,
+            min_iv=config.scorecard.min_iv,
+            C=config.scorecard.C,
+            max_iter=config.scorecard.max_iter,
+            imbalance=config.imbalance,
+            random_seed=config.discovery.random_seed,
+        )
+    except (TypeError, ValueError):
+        return {
+            "status": "unavailable",
+            "limitations": ["scorecard_fit_unavailable"],
+            **base,
+        }
+    if not model.feature_names:
+        return {
+            "status": "unavailable",
+            "limitations": ["No numeric features remained after IV filtering."],
+            **base,
+        }
+    excluded_feature_reasons = {
+        **base["excluded_feature_reasons"],
+        **{
+            name: "iv_below_threshold"
+            for name in numeric_features
+            if name not in model.feature_names
+        },
+    }
+    summaries = {
+        "train": _scorecard_partition_summary(
+            model,
+            train,
+            target_column=config.columns.target,
+        ),
+        "test": _scorecard_partition_summary(
+            model,
+            test,
+            target_column=config.columns.target,
+        ),
+    }
+    if holdout is not None and holdout.height:
+        summaries["holdout"] = _scorecard_partition_summary(
+            model,
+            holdout,
+            target_column=config.columns.target,
+        )
+    return {
+        "status": "fitted",
+        "limitations": (
+            [] if model.calibrated else ["Bad probabilities are not calibrated."]
+        ),
+        "included_features": list(model.feature_names),
+        "excluded_features": sorted(excluded_feature_reasons),
+        "excluded_feature_reasons": excluded_feature_reasons,
+        "imbalance_strategy": model.imbalance_strategy,
+        "model": {
+            "class_counts": {"good": model.class_counts[0], "bad": model.class_counts[1]},
+            "calibrated": model.calibrated,
+            "intercept": model.intercept,
+            "feature_coefficients": dict(
+                zip(model.feature_names, model.feature_coefficients, strict=True)
+            ),
+            "rule_coefficients": dict(
+                zip(model.rule_names, model.rule_coefficients, strict=True)
+            ),
+            "woe_bins": [
+                {
+                    "feature": binning.feature,
+                    "edges": list(binning.edges),
+                    "woe_values": list(binning.woe_values),
+                    "bad_rates": list(binning.bad_rates),
+                    "bin_counts": list(binning.bin_counts),
+                    "missing_woe": binning.missing_woe,
+                    "missing_bad_rate": binning.missing_bad_rate,
+                    "iv": binning.iv,
+                    "monotonic": binning.monotonic,
+                }
+                for binning in model.binning_models
+            ],
+        },
+        "partition_summaries": summaries,
+        "constraints": constraints,
+    }
+
+
+def _render_scorecard_section(payload: Mapping[str, Any]) -> str:
+    lines = ["", "", "## WOE Binning and Scorecard", "", f"- Status: {payload['status']}"]
+    limitations = payload.get("limitations", [])
+    lines.extend(["", "### Limitations"])
+    lines.extend(f"- {limitation}" for limitation in limitations) or lines.append("- None")
+    lines.extend(["", "### Features"])
+    lines.append("- Included: " + ", ".join(payload.get("included_features", [])) or "- Included: None")
+    lines.append("- Excluded: " + ", ".join(payload.get("excluded_features", [])) or "- Excluded: None")
+    model = payload.get("model")
+    if not isinstance(model, Mapping):
+        return "\n".join(lines) + "\n"
+    lines.extend(["", "### WOE Bins and IV"])
+    for binning in model["woe_bins"]:
+        lines.append(
+            f"- {binning['feature']}: bins={len(binning['bin_counts'])}, IV={binning['iv']:.6f}"
+        )
+    lines.extend(["", "### Coefficients"])
+    for name, coefficient in model["feature_coefficients"].items():
+        lines.append(f"- Feature {name}: {coefficient:.6f}")
+    for name, coefficient in model["rule_coefficients"].items():
+        lines.append(f"- Rule {name}: {coefficient:.6f}")
+    lines.extend(["", "### Partition Summaries"])
+    for name, summary in payload["partition_summaries"].items():
+        probability = summary["bad_probability"]
+        if probability["min"] is None:
+            lines.append(f"- {name}: rows=0, scorecard summary unavailable")
+            continue
+        lines.append(
+            f"- {name}: rows={summary['row_count']}, bad probability min/mean/max="
+            f"{probability['min']:.6f}/{probability['mean']:.6f}/{probability['max']:.6f}, "
+            f"risk score mean={summary['risk_score_mean']:.6f}, levels={summary['risk_level_counts']}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 class RiskProbeService:
@@ -949,6 +1316,7 @@ class RiskProbeService:
         )
         self.store = RunStore(runs_dir)
         self.state_dir = Path(state_dir) if state_dir is not None else self.store.runs_dir
+        self._terminal_report_store: TerminalReportStore | None = None
         (
             self._decision_provider,
             self._decision_fallback,
@@ -957,6 +1325,7 @@ class RiskProbeService:
             external_provider=decision_provider,
         )
         self._split_limitations: tuple[str, ...] = ()
+        self._time_validation_applied = False
 
     @property
     def config(self) -> ProjectConfig:
@@ -1003,6 +1372,17 @@ class RiskProbeService:
         )
         return self.config.features.select_columns(dataset.schema().names(), roles)
 
+    def _time_validation_applies(self, dataset: ParquetDataset) -> bool:
+        if self.config.resolved_time_validation_mode != "auto":
+            return self.config.time_validation_requested
+        frame = dataset.collect(
+            [self.config.columns.snapshot, self.config.columns.target]
+        )
+        train, test, holdout, _ = _time_split(
+            frame, self.config.columns.snapshot
+        )
+        return _time_split_is_usable(train, test, holdout, self.config.columns.target)
+
     def _partitions(
         self, dataset: ParquetDataset, feature_names: list[str]
     ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame | None, int]:
@@ -1013,14 +1393,28 @@ class RiskProbeService:
             *feature_names,
         ]
         frame = dataset.collect(columns)
-        if self.config.time_validation_enabled:
-            self._split_limitations = ()
-            return _time_split(frame, self.config.columns.snapshot)
+        mode = self.config.resolved_time_validation_mode
+        if mode != "disabled":
+            train, test, holdout, excluded_null_snapshot_rows = _time_split(
+                frame, self.config.columns.snapshot
+            )
+            if mode == "strict" or _time_split_is_usable(
+                train, test, holdout, self.config.columns.target
+            ):
+                self._time_validation_applied = True
+                self._split_limitations = ()
+                return train, test, holdout, excluded_null_snapshot_rows
         train, test, holdout, limitations = _stratified_split_with_limitations(
             frame,
             self.config.columns.target,
             self.config.columns.segment,
         )
+        self._time_validation_applied = False
+        if mode == "auto":
+            limitations = (
+                *limitations,
+                "Time split unusable; fixed-seed stratified Train/Test fallback; not strict OOT validation",
+            )
         self._split_limitations = limitations
         return train, test, holdout, 0
 
@@ -1095,7 +1489,7 @@ class RiskProbeService:
             self.config.columns.target,
             self.config.columns.segment,
         ]
-        if self.config.time_validation_enabled:
+        if self._time_validation_applied:
             validation_columns.append(self.config.columns.snapshot)
         train_projection = train.select(validation_columns)
         test_projection = test.select(validation_columns)
@@ -1104,13 +1498,13 @@ class RiskProbeService:
             "segment_col": self.config.columns.segment,
             "snapshot_col": self.config.columns.snapshot,
             "segment_display_name": self.config.segment_display_name,
-            "time_validation_enabled": self.config.time_validation_enabled,
+            "time_validation_enabled": self._time_validation_applied,
             "config": self.config.validation,
             "metadata_grade": self.config.metadata_grade,
         }
         validation_limitations: list[str] = []
         holdout_limitation: str | None = None
-        if self.config.time_validation_enabled:
+        if self._time_validation_applied:
             if holdout is None or holdout.is_empty():
                 holdout_limitation = (
                     "Holdout partition is empty; validation unavailable"
@@ -1141,7 +1535,7 @@ class RiskProbeService:
             return [], tuple(validation_limitations)
 
         cards = validate_rules(train_projection, test_projection, rules, **kwargs)
-        if not self.config.time_validation_enabled:
+        if not self._time_validation_applied:
             return cards, tuple(validation_limitations)
         if holdout_limitation is not None:
             return (
@@ -1176,7 +1570,13 @@ class RiskProbeService:
         context.require_binding(
             config_fingerprint=self.store.config_fingerprint(self.config),
             dataset_id=_safe_dataset_id(self.config.dataset.id),
-            time_validation_enabled=self.config.time_validation_enabled,
+            time_validation_enabled=context._expected_identity[
+                "time_validation_enabled"
+            ],
+            time_validation_mode=self.config.resolved_time_validation_mode,
+            time_validation_applied=context._expected_identity[
+                "time_validation_applied"
+            ],
         )
         return context
 
@@ -1191,6 +1591,71 @@ class RiskProbeService:
         verified = self._verified_run_context(context)
         return _restore_rules(
             verified.read_verified_artifact("candidate_rules.parquet")
+        )
+
+    def _analysis_summary_from_run(
+        self, context: RunContext
+    ) -> AnalysisSummary | None:
+        verified = self._verified_run_context(context)
+        try:
+            manifest = json.loads(
+                (verified.run_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            if "analysis_summary.json" not in manifest.get("artifacts", ()):
+                return None
+            return AnalysisSummary.model_validate_json(
+                verified.read_verified_artifact("analysis_summary.json")
+            )
+        except Exception as error:
+            raise RuntimeError("analysis summary is unavailable") from error
+
+    def _load_verified_report_inputs(
+        self,
+        context: RunContext,
+    ) -> dict[str, object]:
+        verified = self._verified_run_context(context)
+        try:
+            analysis_summary = AnalysisSummary.model_validate_json(
+                verified.read_verified_artifact("analysis_summary.json")
+            )
+            evidence_cards = tuple(
+                _restore_cards(
+                    verified.read_verified_artifact("evidence_cards.json")
+                )
+            )
+            (
+                run_limitations,
+                time_validation_applied,
+                institution_analysis,
+            ) = _restore_terminal_metadata(
+                verified.read_verified_artifact("metadata_report.json")
+            )
+        except Exception as error:
+            raise RuntimeError("terminal report inputs are unavailable") from error
+        return {
+            "artifact_analysis_summary": analysis_summary,
+            "evidence_cards": evidence_cards,
+            "institution_analysis": institution_analysis,
+            "time_validation_applied": time_validation_applied,
+            "run_limitations": run_limitations,
+        }
+
+    def ensure_terminal_report(
+        self,
+        subject: TerminalReportSubject,
+    ) -> TerminalReportManifest | None:
+        if type(subject) is not TerminalReportSubject:
+            raise TypeError("subject must be a TerminalReportSubject")
+        context = self.store.open_verified(subject.run_id)
+        inputs = self._load_verified_report_inputs(context)
+        model = build_final_report_model(subject=subject, **inputs)
+        if self._terminal_report_store is None:
+            self._terminal_report_store = TerminalReportStore(
+                self._state_directory(subject.run_id)
+            )
+        return self._terminal_report_store.ensure_published(
+            subject=subject,
+            model=model,
         )
 
     def _data_fingerprint_from_run(self, context: RunContext) -> str:
@@ -1449,20 +1914,19 @@ class RiskProbeService:
                 )
             except KeyError as error:
                 raise RuntimeError("evidence is unavailable") from error
-            recommendation_ids.append(
-                evidence_store.append(
-                    EvidenceRecord(
-                        run_id=public_run_id,
-                        kind=_RECOMMENDATION_KIND,
-                        payload={
-                            **recommendation.model_dump(mode="json"),
-                            "dataset_id": public_dataset_id,
-                        },
-                        parent_ids=parent_ids,
-                        producer_version=_SERVICE_PRODUCER_VERSION,
-                    )
+            evidence_id = evidence_store.append(
+                EvidenceRecord(
+                    run_id=public_run_id,
+                    kind=_RECOMMENDATION_KIND,
+                    payload={
+                        **recommendation.model_dump(mode="json"),
+                        "dataset_id": public_dataset_id,
+                    },
+                    parent_ids=parent_ids,
+                    producer_version=_SERVICE_PRODUCER_VERSION,
                 )
             )
+            recommendation_ids.append(evidence_id)
         return RecommendResponse(
             dataset_id=public_dataset_id,
             recommendation_ids=tuple(recommendation_ids),
@@ -1630,104 +2094,198 @@ class RiskProbeService:
             raise TypeError("budget must be a Budget")
         if dataset_id != self.config.dataset.id:
             raise ValueError("dataset ID is not registered")
-        context = self.run()
-        run_id = self._validate_run_id(context.run_id)
-        evidence_store = self._evidence_store(run_id)
-        session_path = self._sidecar_path(run_id, "sessions.sqlite3")
         try:
-            session_path.lstat()
-        except FileNotFoundError:
-            session_sidecar_existed = False
-        except OSError as error:
-            raise RuntimeError("agent state is unavailable") from error
-        else:
-            session_sidecar_existed = True
-            if not _is_owned_regular_file(session_path, {0o600}):
-                raise RuntimeError("agent state is unavailable")
-        sessions = SessionStore(session_path)
-        decision_controller = DecisionController(evidence_store)
-        handler = LocalRiskProbeToolHandler(
-            run_id=run_id,
-            runs_dir=self.store.runs_dir,
-            evidence_store=evidence_store,
-            run_context=context if type(context) is RunContext else None,
-            decision_controller=decision_controller,
-        )
-        policy = PolicyEngine()
-        gateway = HandlerToolGateway(
-            registry=DatasetRegistry.from_mapping({dataset_id: self.config}),
-            policy=policy,
-            handler=handler,
-        )
-        planner = Planner(
-            allowed_tools={
-                "inspect": InspectRequest,
-                "diagnose": DiagnoseRequest,
-                "discover": DiscoverRequest,
-                "recommend": RecommendRequest,
-            }
-        )
-        orchestrator = AgentOrchestrator(
-            planner=planner,
-            reviewer=Reviewer(),
-            gateway=gateway,
-            sessions=sessions,
-            evidence_resolver=evidence_store,
-            decision_controller=decision_controller,
-            decision_provider=self._decision_provider,
-            decision_fallback=self._decision_fallback,
-        )
-        if type(context) is not RunContext:
-            return orchestrator.run(
-                objective=objective,
-                dataset_id=dataset_id,
-                principal=principal,
-                budget=budget,
-                session_id=run_id,
+            context = self.run()
+        except HostSafeStageError:
+            raise
+        except Exception:
+            raise HostSafeStageError("artifact_runtime_failed") from None
+        run_id = self._validate_run_id(context.run_id)
+        try:
+            evidence_store = self._evidence_store(run_id)
+            session_path = self._sidecar_path(run_id, "sessions.sqlite3")
+            result_path = self._sidecar_path(run_id, "agent-result.json")
+            session_exists = True
+            try:
+                session_path.lstat()
+            except FileNotFoundError:
+                session_exists = False
+            else:
+                if not _is_owned_regular_file(session_path, {0o600}):
+                    raise HostSafeStageError(
+                        "agent_state_unavailable",
+                        report_run_id=run_id,
+                    )
+            if not session_exists:
+                try:
+                    result_path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise HostSafeStageError(
+                        "agent_state_incomplete",
+                        report_run_id=run_id,
+                    )
+            sessions = SessionStore(session_path)
+        except HostSafeStageError as error:
+            raise error.with_report_run_id(run_id) from None
+        except Exception:
+            raise HostSafeStageError(
+                "agent_state_unavailable",
+                report_run_id=run_id,
+            ) from None
+        try:
+            decision_controller = DecisionController(evidence_store)
+            handler = LocalRiskProbeToolHandler(
+                run_id=run_id,
+                runs_dir=self.store.runs_dir,
+                evidence_store=evidence_store,
+                run_context=context if type(context) is RunContext else None,
+                decision_controller=decision_controller,
             )
-
-        metadata_grade = self._profile_from_run(context).metadata_grade
-        result_store = AgentResultStore(
-            self._sidecar_path(run_id, "agent-result.json")
-        )
-        with result_store.locked():
-            cached = result_store.load()
-            if cached is not None:
-                required_capabilities = {
-                    Capability.INSPECT,
-                    Capability.DIAGNOSE,
-                    Capability.DISCOVER,
-                    Capability.RECOMMEND,
+            policy = PolicyEngine()
+            gateway = HandlerToolGateway(
+                registry=DatasetRegistry.from_mapping({dataset_id: self.config}),
+                policy=policy,
+                handler=handler,
+            )
+            planner = Planner(
+                allowed_tools={
+                    "inspect": InspectRequest,
+                    "diagnose": DiagnoseRequest,
+                    "discover": DiscoverRequest,
+                    "recommend": RecommendRequest,
                 }
-                if not required_capabilities.issubset(
-                    policy.capabilities_for(principal.role)
-                ):
-                    raise PolicyDeniedError("capability is not authorized")
-                return orchestrator.validate_terminal_result(
-                    cached,
+            )
+            orchestrator = AgentOrchestrator(
+                planner=planner,
+                reviewer=Reviewer(),
+                gateway=gateway,
+                sessions=sessions,
+                evidence_resolver=evidence_store,
+                decision_controller=decision_controller,
+                decision_provider=self._decision_provider,
+                decision_fallback=self._decision_fallback,
+            )
+        except HostSafeStageError as error:
+            raise error.with_report_run_id(run_id) from None
+        except Exception:
+            raise HostSafeStageError(
+                "agent_orchestration_failed",
+                report_run_id=run_id,
+            ) from None
+        if type(context) is not RunContext:
+            try:
+                return orchestrator.run(
                     objective=objective,
                     dataset_id=dataset_id,
+                    principal=principal,
+                    budget=budget,
                     session_id=run_id,
-                    metadata_grade=metadata_grade,
                 )
-            if session_sidecar_existed:
-                raise RuntimeError("agent result is unavailable")
-            result = orchestrator.run(
-                objective=objective,
-                dataset_id=dataset_id,
-                principal=principal,
-                budget=budget,
-                session_id=run_id,
-            )
-            validated = orchestrator.validate_terminal_result(
-                result,
-                objective=objective,
-                dataset_id=dataset_id,
-                session_id=run_id,
-                metadata_grade=metadata_grade,
-            )
-            result_store.publish(validated)
-            return validated
+            except HostSafeStageError as error:
+                raise error.with_report_run_id(run_id) from None
+            except Exception:
+                raise HostSafeStageError(
+                    "agent_orchestration_failed",
+                    report_run_id=run_id,
+                ) from None
+
+        try:
+            metadata_grade = self._profile_from_run(context).metadata_grade
+            analysis_summary = self._analysis_summary_from_run(context)
+        except HostSafeStageError as error:
+            raise error.with_report_run_id(run_id) from None
+        except Exception:
+            raise HostSafeStageError(
+                "agent_orchestration_failed",
+                report_run_id=run_id,
+            ) from None
+        try:
+            result_store = AgentResultStore(result_path)
+            with result_store.locked():
+                try:
+                    cached = result_store.load()
+                except HostSafeStageError as error:
+                    raise error.with_report_run_id(run_id) from None
+                except Exception:
+                    raise HostSafeStageError(
+                        "agent_state_unavailable",
+                        report_run_id=run_id,
+                    ) from None
+                try:
+                    journal = ()
+                    if cached is None:
+                        try:
+                            journal = sessions.replay(run_id)
+                        except KeyError:
+                            pass
+                    if cached is not None or journal:
+                        required_capabilities = {
+                            Capability.INSPECT,
+                            Capability.DIAGNOSE,
+                            Capability.DISCOVER,
+                            Capability.RECOMMEND,
+                        }
+                        if not required_capabilities.issubset(
+                            policy.capabilities_for(principal.role)
+                        ):
+                            raise PolicyDeniedError("capability is not authorized")
+                    if journal:
+                        recovered = orchestrator.recover_terminal_result(
+                            objective=objective,
+                            dataset_id=dataset_id,
+                            session_id=run_id,
+                            metadata_grade=metadata_grade,
+                            analysis_summary=analysis_summary,
+                        )
+                        if recovered is None:
+                            raise HostSafeStageError(
+                                "agent_state_incomplete",
+                                report_run_id=run_id,
+                            )
+                        result_store.publish(recovered)
+                        return recovered
+                    if cached is not None:
+                        return orchestrator.validate_terminal_result(
+                            cached,
+                            objective=objective,
+                            dataset_id=dataset_id,
+                            session_id=run_id,
+                            metadata_grade=metadata_grade,
+                            analysis_summary=analysis_summary,
+                        )
+                    result = orchestrator.run(
+                        objective=objective,
+                        dataset_id=dataset_id,
+                        principal=principal,
+                        budget=budget,
+                        session_id=run_id,
+                    )
+                    validated = orchestrator.validate_terminal_result(
+                        result,
+                        objective=objective,
+                        dataset_id=dataset_id,
+                        session_id=run_id,
+                        metadata_grade=metadata_grade,
+                        analysis_summary=analysis_summary,
+                    )
+                    result_store.publish(validated)
+                    return validated
+                except HostSafeStageError as error:
+                    raise error.with_report_run_id(run_id) from None
+                except Exception:
+                    raise HostSafeStageError(
+                        "agent_orchestration_failed",
+                        report_run_id=run_id,
+                    ) from None
+        except HostSafeStageError as error:
+            raise error.with_report_run_id(run_id) from None
+        except Exception:
+            raise HostSafeStageError(
+                "agent_state_unavailable",
+                report_run_id=run_id,
+            ) from None
 
     def orchestrate_with_citations(
         self,
@@ -1868,12 +2426,18 @@ class RiskProbeService:
             data_fingerprint = _parquet_metadata_fingerprint(snapshot_path)
             code_version = _code_identity()
             expected_dataset_id = _safe_dataset_id(self.config.dataset.id)
+            try:
+                self._time_validation_applied = self._time_validation_applies(dataset)
+            except BaseException:
+                raise HostSafeStageError("profile_contract_failed") from None
             context = self.store.create(
                 self.config,
                 data_fingerprint,
                 code_version,
                 dataset_id=expected_dataset_id,
-                time_validation_enabled=self.config.time_validation_enabled,
+                time_validation_enabled=self._time_validation_applied,
+                time_validation_mode=self.config.resolved_time_validation_mode,
+                time_validation_applied=self._time_validation_applied,
             )
             finalize_fingerprint = _node_input_fingerprint(
                 context.run_id, "finalize"
@@ -1941,6 +2505,7 @@ class RiskProbeService:
 
                 def execute_artifact_node(
                     node_id: str,
+                    host_failure_code: str,
                     expected_artifacts: Mapping[str, str],
                     action: Any,
                     restore: Any,
@@ -1974,16 +2539,19 @@ class RiskProbeService:
                         )
                     except BaseException as error:
                         mark_failed(node_id, input_fingerprint, error)
-                        raise
+                        raise HostSafeStageError(host_failure_code) from None
                     return result, False
 
-                profile = profile_dataset(dataset, self.config)
-                self._assert_rule_conclusion_allowed(profile)
-                artifact_profile = replace(
-                    profile,
-                    dataset_id=expected_dataset_id,
-                )
-                feature_names = self._feature_names(dataset)
+                try:
+                    profile = profile_dataset(dataset, self.config)
+                    self._assert_rule_conclusion_allowed(profile)
+                    artifact_profile = replace(
+                        profile,
+                        dataset_id=expected_dataset_id,
+                    )
+                    feature_names = self._feature_names(dataset)
+                except BaseException:
+                    raise HostSafeStageError("profile_contract_failed") from None
                 profile_fingerprint = _node_input_fingerprint(
                     context.run_id, "profile"
                 )
@@ -2026,7 +2594,15 @@ class RiskProbeService:
                         context.write_json(
                             "data_profile.json",
                             _profile_payload(
-                                artifact_profile,
+                                (
+                                    replace(
+                                        artifact_profile,
+                                        snapshot_min=None,
+                                        snapshot_max=None,
+                                    )
+                                    if not self._time_validation_applied
+                                    else artifact_profile
+                                ),
                                 excluded_null_snapshot_rows=excluded_null_snapshot_rows,
                             ),
                         )
@@ -2052,7 +2628,7 @@ class RiskProbeService:
                         )
                     except BaseException as error:
                         mark_failed("partition", partition_fingerprint, error)
-                        raise
+                        raise HostSafeStageError("partition_failed") from None
                 else:
                     (
                         train,
@@ -2067,24 +2643,85 @@ class RiskProbeService:
                     ]
                 }
 
-                def discover_action() -> tuple[list[RiskRule], dict[str, Any]]:
-                    rules = self._discover_from_train(train, feature_names)
+                def discover_action() -> tuple[DiscoveryResult, dict[str, Any]]:
+                    result = self._discovery_result_from_train(train, feature_names)
+                    rules = list(result.rules)
                     context.write_parquet(
                         "candidate_rules.parquet", _candidate_frame(rules)
                     )
-                    return rules, {"rule_count": len(rules)}
+                    return result, {
+                        "pair_candidates_before_diversity": result.pair_candidates_before_diversity,
+                        "pair_rules_selected": result.pair_rules_selected,
+                        "rule_count": len(rules),
+                        "single_candidates_before_cap": result.single_candidates_before_cap,
+                        "single_rules_selected": result.single_rules_selected,
+                    }
 
-                def restore_rules(_output: Mapping[str, Any]) -> list[RiskRule]:
-                    return _restore_rules(
+                def restore_rules(output: Mapping[str, Any]) -> DiscoveryResult:
+                    restored = _restore_rules(
                         context.run_dir / "candidate_rules.parquet"
                     )
+                    return DiscoveryResult(
+                        rules=tuple(restored),
+                        train_metrics={},
+                        single_candidates_before_cap=int(
+                            output.get("single_candidates_before_cap", len(restored))
+                        ),
+                        single_rules_selected=int(
+                            output.get("single_rules_selected", len(restored))
+                        ),
+                        pair_candidates_before_diversity=int(
+                            output.get("pair_candidates_before_diversity", 0)
+                        ),
+                        pair_rules_selected=int(
+                            output.get("pair_rules_selected", 0)
+                        ),
+                    )
 
-                rules, _ = execute_artifact_node(
+                discovery_result, _ = execute_artifact_node(
                     "discover",
+                    "discover_failed",
                     discover_artifacts,
                     discover_action,
                     restore_rules,
                 )
+                rules = list(discovery_result.rules)
+
+                scorecard_payload: dict[str, Any] | None = None
+                if self.config.scorecard.enabled:
+                    scorecard_artifacts = {
+                        "scorecard.json": _ARTIFACT_SCHEMAS["scorecard.json"]
+                    }
+
+                    def scorecard_action() -> tuple[dict[str, Any], dict[str, Any]]:
+                        payload = _scorecard_payload(
+                            train,
+                            test,
+                            holdout,
+                            feature_names,
+                            rules,
+                            self.config,
+                        )
+                        context.write_json("scorecard.json", payload)
+                        return payload, {"status": payload["status"]}
+
+                    def restore_scorecard(_output: Mapping[str, Any]) -> dict[str, Any]:
+                        payload = json.loads(
+                            (context.run_dir / "scorecard.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        if not isinstance(payload, dict):
+                            raise RuntimeError("scorecard checkpoint payload is invalid")
+                        return payload
+
+                    scorecard_payload, _ = execute_artifact_node(
+                        "scorecard",
+                        "scorecard_failed",
+                        scorecard_artifacts,
+                        scorecard_action,
+                        restore_scorecard,
+                    )
 
                 validate_artifacts = {
                     "evidence_cards.json": _ARTIFACT_SCHEMAS[
@@ -2129,26 +2766,20 @@ class RiskProbeService:
                         target_col=self.config.columns.target,
                         segment_col=self.config.columns.segment,
                         snapshot_col=self.config.columns.snapshot,
-                        time_validation_enabled=(
-                            self.config.time_validation_enabled
-                        ),
+                        time_validation_enabled=self._time_validation_applied,
                         discovery_config=self.config.discovery,
                         validation_config=self.config.validation,
                         confirmed_features=frozenset(feature_names),
                         segment_display_name=self.config.segment_display_name,
                         metadata_grade=self.config.metadata_grade,
                         holdout=holdout,
-                        expose_segment_values=(
-                            self.config.privacy.expose_segment_values
-                        ),
+                        expose_segment_values=False,
                     )
                     context.write_json(
                         "evidence_cards.json",
                         _evidence_payload(
                             cards,
-                            time_validation_enabled=(
-                                self.config.time_validation_enabled
-                            ),
+                            time_validation_enabled=self._time_validation_applied,
                         ),
                     )
                     return (
@@ -2190,6 +2821,7 @@ class RiskProbeService:
 
                 validation_result, cards_are_redacted = execute_artifact_node(
                     "validate",
+                    "artifact_runtime_failed",
                     validate_artifacts,
                     validate_action,
                     restore_validation,
@@ -2229,9 +2861,33 @@ class RiskProbeService:
                         "metadata_report.json"
                     ],
                     "risk_report.md": _ARTIFACT_SCHEMAS["risk_report.md"],
+                    "analysis_summary.json": _ARTIFACT_SCHEMAS[
+                        "analysis_summary.json"
+                    ],
                 }
 
                 def report_action() -> tuple[None, dict[str, Any]]:
+                    try:
+                        analysis_summary_payload = _analysis_summary_payload(
+                            config=self.config,
+                            profile=profile,
+                            feature_names=feature_names,
+                            train=train,
+                            test=test,
+                            holdout=holdout,
+                            excluded_null_snapshot_rows=excluded_null_snapshot_rows,
+                            discovery_result=discovery_result,
+                            rules=rules,
+                            scorecard_payload=scorecard_payload,
+                            cards=cards,
+                            validation_limitations=validation_limitations,
+                            institution_analysis=institution_analysis,
+                            time_validation_applied=self._time_validation_applied,
+                        )
+                    except HostSafeStageError:
+                        raise
+                    except BaseException:
+                        raise HostSafeStageError("analysis_summary_failed") from None
                     context.write_json(
                         "metadata_report.json",
                         {
@@ -2240,16 +2896,20 @@ class RiskProbeService:
                             "split_rows": split_rows,
                             "split_strategy": (
                                 "time_group_split"
-                                if self.config.time_validation_enabled
+                                if self._time_validation_applied
                                 else (
-                                    "institution_target_stratified"
-                                    if not self._split_limitations
-                                    else "target_stratified_fallback"
+                                    "auto_stratified_fallback"
+                                    if self.config.resolved_time_validation_mode == "auto"
+                                    else (
+                                        "institution_target_stratified"
+                                        if not self._split_limitations
+                                        else "target_stratified_fallback"
+                                    )
                                 )
                             ),
-                            "time_validation_enabled": (
-                                self.config.time_validation_enabled
-                            ),
+                            "time_validation_enabled": self._time_validation_applied,
+                            "time_validation_mode": self.config.resolved_time_validation_mode,
+                            "time_validation_applied": self._time_validation_applied,
                             "institution_analysis": institution_analysis,
                         },
                     )
@@ -2261,18 +2921,25 @@ class RiskProbeService:
                             validation_limitations,
                             institution_analysis,
                             cards_are_redacted=cards_are_redacted,
-                            expose_segment_values=(
-                                self.config.privacy.expose_segment_values
-                            ),
+                            expose_segment_values=False,
+                            time_validation_applied=self._time_validation_applied,
+                            scorecard_payload=scorecard_payload,
+                            analysis_summary_payload=analysis_summary_payload,
+                            run_id=context.run_id,
                         ),
                     )
-                    return None, {"report_count": 2}
+                    context.write_canonical_json(
+                        "analysis_summary.json",
+                        analysis_summary_payload,
+                    )
+                    return None, {"report_count": 3}
 
                 def restore_report(_output: Mapping[str, Any]) -> None:
                     return None
 
                 execute_artifact_node(
                     "report",
+                    "artifact_runtime_failed",
                     report_artifacts,
                     report_action,
                     restore_report,
@@ -2290,10 +2957,20 @@ class RiskProbeService:
                     context.write_canonical_json(
                         "manifest.json",
                         {
+                            "schema_version": "riskprobe.manifest.v1",
                             "artifact_integrity": _artifact_integrity(
-                                context.run_dir
+                                context.run_dir,
+                                (
+                                    _SCORECARD_ARTIFACT_NAMES
+                                    if self.config.scorecard.enabled
+                                    else _ARTIFACT_NAMES
+                                ),
                             ),
-                            "artifacts": list(_ARTIFACT_NAMES),
+                            "artifacts": list(
+                                _SCORECARD_ARTIFACT_NAMES
+                                if self.config.scorecard.enabled
+                                else _ARTIFACT_NAMES
+                            ),
                             "code_version": code_version,
                             "config_fingerprint": self.store.config_fingerprint(
                                 self.config
@@ -2301,9 +2978,9 @@ class RiskProbeService:
                             "data_fingerprint": data_fingerprint,
                             "dataset_id": expected_dataset_id,
                             "run_id": context.run_id,
-                            "time_validation_enabled": (
-                                self.config.time_validation_enabled
-                            ),
+                            "time_validation_enabled": self._time_validation_applied,
+                            "time_validation_mode": self.config.resolved_time_validation_mode,
+                            "time_validation_applied": self._time_validation_applied,
                         },
                     )
                     manifest_reference = ArtifactRef.from_path(
@@ -2313,7 +2990,7 @@ class RiskProbeService:
                     context.finalize()
                 except BaseException as error:
                     mark_failed("finalize", finalize_fingerprint, error)
-                    raise
+                    raise HostSafeStageError("artifact_runtime_failed") from None
 
                 try:
                     runtime.succeed_node(
@@ -2326,9 +3003,11 @@ class RiskProbeService:
                     # Publication is immutable and already verified; trace can reconcile later.
                     return context
                 return context
-            except BaseException:
+            except BaseException as error:
                 context.release()
-                raise
+                if isinstance(error, HostSafeStageError):
+                    raise
+                raise HostSafeStageError("artifact_runtime_failed") from None
 
     def monitoring_snapshot(self) -> tuple[RunContext, ReferenceSnapshot]:
         """Build and persist an aggregate reference snapshot beside an immutable run."""
@@ -2374,3 +3053,315 @@ class RiskProbeService:
             snapshot.model_dump_json(indent=2), encoding="utf-8"
         )
         return context, snapshot
+
+
+def _metric_distribution(values: Sequence[float]) -> MetricDistribution:
+    if not values:
+        return MetricDistribution(count=0)
+    ordered = np.asarray(values, dtype=np.float64)
+    return MetricDistribution(
+        count=int(ordered.size),
+        minimum=float(np.min(ordered)),
+        median=float(np.median(ordered)),
+        maximum=float(np.max(ordered)),
+    )
+
+
+def _scorecard_summary(
+    payload: Mapping[str, Any] | None,
+    *,
+    feature_names: Sequence[str],
+    split_rows: Mapping[str, int],
+) -> ScorecardSummary:
+    if payload is None:
+        return ScorecardSummary(enabled=False, status=StageStatus.SKIPPED)
+    if payload.get("status") != "fitted":
+        return ScorecardSummary(
+            enabled=True,
+            status=StageStatus.UNAVAILABLE,
+            reason_code="scorecard_unavailable",
+        )
+    model = payload["model"]
+    try:
+        terms = tuple(
+            [
+                ScorecardTerm(
+                    term=FeatureRef.from_name(name),
+                    kind="feature",
+                    coefficient=float(coefficient),
+                )
+                for name, coefficient in model["feature_coefficients"].items()
+            ]
+            + [
+                ScorecardTerm(
+                    term=FeatureRef.from_name(name),
+                    kind="rule",
+                    coefficient=float(coefficient),
+                )
+                for name, coefficient in model["rule_coefficients"].items()
+            ]
+        )
+    except BaseException:
+        raise HostSafeStageError("scorecard_terms_failed") from None
+    try:
+        feature_summaries = tuple(
+            ScorecardFeatureSummary(
+                feature=FeatureRef.from_name(binning["feature"]),
+                iv=float(binning["iv"]),
+                bin_count=len(binning["bin_counts"]),
+                monotonic=binning["monotonic"],
+                has_missing_bin=binning["missing_bad_rate"] is not None,
+            )
+            for binning in model["woe_bins"]
+        )
+    except BaseException:
+        raise HostSafeStageError("scorecard_features_failed") from None
+    partition_summaries = payload["partition_summaries"]
+    split_metrics: list[ScorecardSplitMetrics] = []
+    try:
+        for split in ("train", "test", "holdout"):
+            partition = partition_summaries.get(split)
+            if partition is None:
+                split_metrics.append(
+                    ScorecardSplitMetrics(
+                        split=split,
+                        status=StageStatus.UNAVAILABLE,
+                        reason_code="holdout_unavailable",
+                        sample_count=int(split_rows.get(split, 0)),
+                    )
+                )
+                continue
+            limitation = partition["metric_limitation"]
+            if limitation is not None:
+                split_metrics.append(
+                    ScorecardSplitMetrics(
+                        split=split,
+                        status=StageStatus.UNAVAILABLE,
+                        reason_code=limitation,
+                        sample_count=int(partition["row_count"]),
+                        positive_rate=partition["target_rate"],
+                        probability_min=partition["bad_probability"]["min"],
+                        probability_mean=partition["bad_probability"]["mean"],
+                        probability_max=partition["bad_probability"]["max"],
+                        mean_score=partition["risk_score_mean"],
+                        risk_level_counts=partition["risk_level_counts"],
+                    )
+                )
+                continue
+            split_metrics.append(
+                ScorecardSplitMetrics(
+                    split=split,
+                    status=StageStatus.SUCCEEDED,
+                    sample_count=int(partition["row_count"]),
+                    positive_rate=float(partition["target_rate"]),
+                    probability_min=float(partition["bad_probability"]["min"]),
+                    probability_mean=float(partition["bad_probability"]["mean"]),
+                    probability_max=float(partition["bad_probability"]["max"]),
+                    mean_score=float(partition["risk_score_mean"]),
+                    risk_level_counts=partition["risk_level_counts"],
+                    auc=float(partition["auc"]),
+                    ks=float(partition["ks"]),
+                    gini=float(partition["gini"]),
+                )
+            )
+    except BaseException:
+        raise HostSafeStageError("scorecard_metrics_failed") from None
+    try:
+        excluded_reasons = {
+            FeatureRef.from_name(name).value: reason
+            for name, reason in payload["excluded_feature_reasons"].items()
+        }
+        input_features = tuple(FeatureRef.from_name(name) for name in feature_names)
+        included_features = tuple(
+            FeatureRef.from_name(name) for name in payload["included_features"]
+        )
+    except BaseException:
+        raise HostSafeStageError("scorecard_refs_failed") from None
+    common = {
+        "enabled": True,
+        "status": StageStatus.SUCCEEDED,
+        "model_type": "logistic_regression",
+        "calibrated": bool(model["calibrated"]),
+        "parameters": payload["constraints"],
+        "imbalance_strategy": payload["imbalance_strategy"],
+        "class_counts": model["class_counts"],
+        "intercept": float(model["intercept"]),
+    }
+    refs = {
+        **common,
+        "input_features": input_features,
+        "included_features": included_features,
+        "excluded_features": excluded_reasons,
+    }
+    content = {
+        **refs,
+        "feature_summaries": feature_summaries,
+        "terms": terms,
+    }
+    try:
+        return ScorecardSummary(**content, splits=tuple(split_metrics))
+    except BaseException:
+        raise HostSafeStageError("scorecard_splits_contract_failed") from None
+
+
+def _analysis_summary_payload(
+    *,
+    config: ProjectConfig,
+    profile: DatasetProfile,
+    feature_names: Sequence[str],
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    holdout: pl.DataFrame | None,
+    excluded_null_snapshot_rows: int,
+    discovery_result: DiscoveryResult,
+    rules: Sequence[RiskRule],
+    scorecard_payload: Mapping[str, Any] | None,
+    cards: Sequence[EvidenceCard],
+    validation_limitations: Sequence[str],
+    institution_analysis: Mapping[str, Any],
+    time_validation_applied: bool,
+) -> dict[str, Any]:
+    split_rows = {
+        "train": train.height,
+        "test": test.height,
+        "holdout": holdout.height if holdout is not None else 0,
+    }
+    try:
+        scorecard = _scorecard_summary(
+            scorecard_payload,
+            feature_names=feature_names,
+            split_rows=split_rows,
+        )
+    except HostSafeStageError:
+        raise
+    except BaseException:
+        raise HostSafeStageError("scorecard_failed") from None
+    scorecard_stage = (
+        StageSummary(
+            name=StageName.SCORECARD,
+            status=scorecard.status,
+            enabled=config.scorecard.enabled,
+            output_available=scorecard.status is StageStatus.SUCCEEDED,
+            reason_code=scorecard.reason_code,
+        )
+        if scorecard.status is not StageStatus.SKIPPED
+        else StageSummary(
+            name=StageName.SCORECARD,
+            status=StageStatus.SKIPPED,
+            enabled=False,
+            output_available=False,
+            reason_code="disabled_by_configuration",
+        )
+    )
+    metric_values = tuple(discovery_result.train_metrics.values())
+    grade_counts: dict[str, int] = {}
+    for card in cards:
+        grade_counts[card.grade] = grade_counts.get(card.grade, 0) + 1
+    limitation_counts: dict[str, int] = {}
+    for limitation in validation_limitations:
+        code = f"validation-limitation-{hashlib.sha256(limitation.encode('utf-8')).hexdigest()[:16]}"
+        limitation_counts[code] = limitation_counts.get(code, 0) + 1
+    stages = (
+        StageSummary(name=StageName.CONFIG, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(name=StageName.SNAPSHOT, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(name=StageName.PROFILE, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(name=StageName.PARTITION, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(name=StageName.DISCOVERY, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(
+            name=StageName.WOE,
+            status=StageStatus.SUCCEEDED if config.discovery.woe_binning_enabled else StageStatus.SKIPPED,
+            enabled=config.discovery.woe_binning_enabled,
+            output_available=config.discovery.woe_binning_enabled,
+            reason_code=None if config.discovery.woe_binning_enabled else "disabled_by_configuration",
+        ),
+        scorecard_stage,
+        StageSummary(name=StageName.VALIDATION, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(name=StageName.INSTITUTION_ANALYSIS, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(name=StageName.REPORT, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        StageSummary(name=StageName.FINALIZE, status=StageStatus.SUCCEEDED, enabled=True, output_available=True),
+        *(
+            StageSummary(name=name, status=StageStatus.NOT_RUN, enabled=True, output_available=False)
+            for name in (
+                StageName.INSPECT,
+                StageName.DIAGNOSE_QUALITY,
+                StageName.DIAGNOSE_FEATURE_DRIFT,
+                StageName.DIAGNOSE_POPULATION_SHIFT,
+                StageName.DIAGNOSE_TARGET_SHIFT,
+                StageName.DIAGNOSE_SEGMENT_RISK,
+                StageName.DIAGNOSE_TIME_STABILITY,
+                StageName.DIAGNOSE_RULE_EVIDENCE,
+                StageName.DISCOVER_RESTORE,
+                StageName.DECISION_CONTEXT,
+                StageName.RECOMMEND,
+                StageName.REVIEW,
+                StageName.TERMINAL,
+            )
+        ),
+    )
+    summary = AnalysisSummary(
+        stages=stages,
+        input=InputSummary(
+            dataset_id=_safe_dataset_id(config.dataset.id),
+            selected_feature_count=len(feature_names),
+            target_positive_meaning=config.target.positive_meaning,
+            performance_window_known=config.target.performance_window_days is not None,
+        ),
+        profile=ProfileSummary(
+            row_count=profile.row_count,
+            feature_count=profile.feature_count,
+            numeric_feature_count=sum(train.schema[name].is_numeric() for name in feature_names),
+            positive_rate=profile.positive_rate,
+            segment_count=len(profile.segment_counts),
+            segment_min_size=min(profile.segment_counts.values(), default=None),
+            segment_max_size=max(profile.segment_counts.values(), default=None),
+            metadata_grade=profile.metadata_grade,
+            issue_codes=tuple(sorted({issue.code for issue in profile.issues})),
+        ),
+        partition=PartitionSummary(
+            requested_time_validation=config.time_validation_requested,
+            applied_time_validation=time_validation_applied,
+            mode=config.resolved_time_validation_mode,
+            strategy=("time_group_split" if time_validation_applied else "stratified_fallback"),
+            train_rows=train.height,
+            test_rows=test.height,
+            holdout_rows=holdout.height if holdout is not None else 0,
+            excluded_null_snapshot_rows=excluded_null_snapshot_rows,
+            fallback_reason_code=(None if time_validation_applied else "time_split_unavailable"),
+        ),
+        discovery=DiscoverySummary(
+            sampled=train.height > _DISCOVERY_SAMPLE_LIMIT,
+            sample_rows=min(train.height, _DISCOVERY_SAMPLE_LIMIT),
+            input_feature_count=len(feature_names),
+            eligible_feature_count=len(feature_names),
+            candidate_rule_count=(discovery_result.single_candidates_before_cap + discovery_result.pair_candidates_before_diversity),
+            selected_rule_count=len(rules),
+            single_candidate_count=discovery_result.single_candidates_before_cap,
+            single_rule_count=discovery_result.single_rules_selected,
+            pair_candidate_count=discovery_result.pair_candidates_before_diversity,
+            pair_rule_count=discovery_result.pair_rules_selected,
+            rule_ids=tuple(rule.rule_id for rule in rules),
+            lift=_metric_distribution(tuple(metric.lift for metric in metric_values)),
+            support=_metric_distribution(tuple(metric.coverage for metric in metric_values)),
+            precision=_metric_distribution(tuple(metric.precision for metric in metric_values)),
+        ),
+        scorecard=scorecard,
+        validation=ValidationSummary(
+            evidence_count=len(cards),
+            grade_counts=grade_counts,
+            holdout_status=(StageStatus.SUCCEEDED if holdout is not None and holdout.height else StageStatus.UNAVAILABLE),
+            limitation_counts=limitation_counts,
+            lift=_metric_distribution(tuple(card.test.lift for card in cards)),
+            adjusted_p_value=_metric_distribution(tuple(card.adjusted_p_value for card in cards)),
+            segment_consistency=_metric_distribution(tuple(card.segment_consistency for card in cards)),
+            time_decay=_metric_distribution(tuple(card.max_time_decay for card in cards)),
+        ),
+        artifacts=ArtifactSummary(
+            logical_artifacts=(_SCORECARD_ARTIFACT_NAMES if config.scorecard.enabled else _ARTIFACT_NAMES),
+            artifact_count=len(_SCORECARD_ARTIFACT_NAMES if config.scorecard.enabled else _ARTIFACT_NAMES),
+            published=True,
+            reused=False,
+            integrity_verified=True,
+        ),
+    )
+    del institution_analysis
+    return summary.model_dump(mode="python")

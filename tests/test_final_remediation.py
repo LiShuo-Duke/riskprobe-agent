@@ -283,6 +283,7 @@ def test_independent_python_processes_produce_identical_rules_and_artifact_hashe
         "candidate_rules.parquet",
         "evidence_cards.json",
         "risk_report.md",
+        "analysis_summary.json",
     }
     assert first == second
     assert b"/Users/" not in json.dumps(first, sort_keys=True).encode()
@@ -345,11 +346,10 @@ def test_grade_b_report_limits_evidence_to_time_slice_stability(tmp_path: Path) 
     config = _config(data_path).model_copy(update={"time_validation_enabled": True})
     profile = profile_dataset(ParquetDataset(data_path), config)
 
-    report = render_risk_report(profile, [])
+    report = render_risk_report(profile, [], time_validation_applied=True)
 
-    assert "evidence reflects stability across time slices, not a known performance window" in report
-    assert "严格 OOT" not in report
-    assert "可上线" not in report
+    assert "时间切片稳定性：已评估" in report
+    assert "不等于已知表现窗口、严格 OOT 或生产就绪" in report
 
 
 def test_grade_b_report_discloses_when_time_slice_stability_was_not_evaluated(
@@ -360,10 +360,10 @@ def test_grade_b_report_discloses_when_time_slice_stability_was_not_evaluated(
     frame.write_parquet(data_path)
     profile = profile_dataset(ParquetDataset(data_path), _config(data_path))
 
-    report = render_risk_report(profile, [])
+    report = render_risk_report(profile, [], time_validation_applied=False)
 
-    assert "evidence reflects stability across time slices" not in report
-    assert "time-slice stability was not evaluated" in report
+    assert "时间切片稳定性：已评估" not in report
+    assert "时间切片稳定性：未评估" in report
 
 
 def test_zero_pair_limit_disables_second_order_rules() -> None:
@@ -432,8 +432,8 @@ def test_grade_b_report_does_not_claim_time_stability_for_a_single_snapshot(
     config = _config(data_path).model_copy(update={"time_validation_enabled": True})
     profile = profile_dataset(ParquetDataset(data_path), config)
 
-    report = render_risk_report(profile, [])
+    report = render_risk_report(profile, [], time_validation_applied=False)
 
-    assert "evidence reflects stability across time slices" not in report
-    assert "time-slice stability was not evaluated" in report
+    assert "时间切片稳定性：已评估" not in report
+    assert "时间切片稳定性：未评估" in report
     assert "Time Decay" not in report

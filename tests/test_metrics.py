@@ -279,3 +279,26 @@ def test_score_ks_rejects_non_binary_target() -> None:
 
     with pytest.raises(ValueError, match="binary target"):
         compute_score_ks([0.1, 0.2], [0, 2])
+
+
+def test_score_auc_filters_nonfinite_scores_and_derives_gini() -> None:
+    from riskprobe.metrics import compute_score_auc
+
+    result = compute_score_auc([0.9, 0.8, float("nan"), 0.2, 0.1], [1, 1, 0, 0, 0])
+
+    assert result.auc == pytest.approx(1.0)
+    assert result.gini == pytest.approx(1.0)
+    assert result.bad_count == 2
+    assert result.good_count == 2
+    assert result.excluded_count == 1
+    assert result.limitation is None
+
+
+def test_score_auc_returns_unavailable_for_single_class_after_filtering() -> None:
+    from riskprobe.metrics import compute_score_auc
+
+    result = compute_score_auc([0.1, float("nan")], [1, 1])
+
+    assert result.auc is None
+    assert result.gini is None
+    assert result.limitation == "single_class_or_no_finite_scores"

@@ -117,7 +117,7 @@ def _snapshot_range(
     snapshots = frame.get_column(snapshot_column)
     if snapshots.null_count() == len(snapshots):
         raise DataContractError(f"snapshot column {snapshot_column} must not be all null")
-    if not config.time_validation_enabled:
+    if not config.time_validation_requested:
         return None, None, None
 
     try:

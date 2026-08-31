@@ -18,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from riskprobe.analysis_contracts import AnalysisSummary
 from riskprobe.monitoring.models import RiskFinding
 from riskprobe.privacy import canonical_payload_hash
 from riskprobe.recommendations.policy import (
@@ -146,6 +147,7 @@ class DecisionContext(_StrictDTO):
     feature_count: int = Field(ge=0)
     issue_codes: tuple[str, ...] = ()
     rule_ids: tuple[str, ...] = ()
+    analysis_summary: AnalysisSummary | None = None
     diagnosis_evidence_ids: tuple[str, ...]
     findings: tuple[DecisionFinding, ...]
     policy: DecisionPolicy
@@ -238,7 +240,24 @@ class DecisionContext(_StrictDTO):
             raise ValueError("decision context expiry is invalid")
         if (self.expires_at - self.issued_at).total_seconds() > self.policy.context_ttl_seconds:
             raise ValueError("decision context exceeds policy TTL")
-        return _derive_id(self, "context_id")
+        payload = self.model_dump(mode="json", exclude={"context_id"})
+        expected = canonical_payload_hash(payload)
+        if self.context_id and self.context_id != expected:
+            legacy_expected = (
+                canonical_payload_hash(
+                    self.model_dump(
+                        mode="json",
+                        exclude={"context_id", "analysis_summary"},
+                    )
+                )
+                if self.analysis_summary is None
+                else None
+            )
+            if self.context_id != legacy_expected:
+                raise ValueError("context_id does not match canonical payload")
+            return self
+        object.__setattr__(self, "context_id", expected)
+        return self
 
 
 class DecisionProposal(_StrictDTO):

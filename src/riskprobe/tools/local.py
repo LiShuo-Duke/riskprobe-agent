@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -135,12 +136,18 @@ class LocalRiskProbeToolHandler:
             if self._run_context is None
             else service._profile_from_run(self._run_context)
         )
+        analysis_summary = (
+            None
+            if self._run_context is None
+            else service._analysis_summary_from_run(self._run_context)
+        )
         return InspectResponse(
             dataset_id=request.dataset_id,
             row_count=profile.row_count,
             feature_count=profile.feature_count,
             metadata_grade=profile.metadata_grade,
             issue_codes=profile.issue_codes,
+            analysis_summary=analysis_summary,
         )
 
     def _discover(
@@ -204,15 +211,20 @@ class LocalRiskProbeToolHandler:
         )
 
     def _run(self, request: RunRequest, dataset: DatasetHandle) -> RunResponse:
-        context = self._service(dataset).run()
+        service = self._service(dataset)
+        context = service.run()
         if context.run_id != self._run_id:
             raise RuntimeError("run is unavailable")
+        verified = service._verified_run_context(context)
+        manifest = json.loads(
+            (verified.run_dir / "manifest.json").read_text(encoding="utf-8")
+        )
         return RunResponse(
             dataset_id=request.dataset_id,
             run_id=context.run_id,
             reused=context.is_existing,
             metadata_grade=dataset.config.metadata_grade,
-            artifact_count=6,
+            artifact_count=len(manifest["artifacts"]),
         )
 
     def _status(self, request: StatusRequest) -> StatusResponse:

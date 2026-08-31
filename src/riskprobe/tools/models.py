@@ -10,6 +10,8 @@ from typing import Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 
+from riskprobe.analysis_contracts import AnalysisSummary
+
 _DATASET_ID = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -119,6 +121,7 @@ class InspectResponse(_DatasetResponse):
     feature_count: int = Field(ge=0)
     metadata_grade: Literal["A", "B"]
     issue_codes: tuple[str, ...] = ()
+    analysis_summary: AnalysisSummary | None = None
 
     @field_validator("issue_codes")
     @classmethod
@@ -169,7 +172,7 @@ class RunResponse(_DatasetResponse):
     run_id: str
     reused: bool
     metadata_grade: Literal["A", "B"] | None = None
-    artifact_count: int = Field(default=6, ge=0)
+    artifact_count: int = Field(ge=0)
 
     @field_validator("run_id")
     @classmethod

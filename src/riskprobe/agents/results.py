@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from riskprobe.analysis_contracts import AnalysisSummary
 from riskprobe.agents.contracts import (
     AgentResult,
     AgentState,
@@ -40,6 +41,22 @@ _REQUEST_TYPES = {
     "discover": DiscoverRequest,
     "recommend": RecommendRequest,
 }
+_LEGACY_RESULT_FIELDS = frozenset(
+    {
+        "session_id",
+        "status",
+        "plan",
+        "review",
+        "tool_sequence",
+        "evidence_ids",
+        "diagnosis_evidence_ids",
+        "retry_count",
+        "state_history",
+        "leaf_node_id",
+        "redacted_summary",
+    }
+)
+_CURRENT_RESULT_FIELDS = _LEGACY_RESULT_FIELDS | {"analysis_summary"}
 
 
 class AgentResultIntegrityError(RuntimeError):
@@ -114,6 +131,8 @@ class AgentResultStore:
             return
 
         result_payload = result.model_dump(mode="json")
+        if result.analysis_summary is None:
+            del result_payload["analysis_summary"]
         result_json = _canonical_json(result_payload)
         envelope = {
             "format_version": _FORMAT_VERSION,
@@ -155,21 +174,13 @@ class AgentResultStore:
 
 
 def _reconstruct_result(payload: dict[str, object]) -> AgentResult:
-    expected_result_fields = {
-        "session_id",
-        "status",
-        "plan",
-        "review",
-        "tool_sequence",
-        "evidence_ids",
-        "diagnosis_evidence_ids",
-        "retry_count",
-        "state_history",
-        "leaf_node_id",
-        "redacted_summary",
-    }
-    if set(payload) != expected_result_fields:
+    result_fields = frozenset(payload)
+    if result_fields not in {_LEGACY_RESULT_FIELDS, _CURRENT_RESULT_FIELDS}:
         raise ValueError("invalid result fields")
+    if result_fields == _CURRENT_RESULT_FIELDS and type(
+        payload["analysis_summary"]
+    ) is not dict:
+        raise ValueError("invalid analysis summary")
     plan_payload = payload["plan"]
     if type(plan_payload) is not dict or set(plan_payload) != {
         "objective",
@@ -221,12 +232,21 @@ def _reconstruct_result(payload: dict[str, object]) -> AgentResult:
     )
 
     review_payload = payload["review"]
-    if type(review_payload) is not dict or set(review_payload) != {
+    legacy_review_fields = {
         "approved",
         "reason_codes",
         "evidence_ids",
         "retry_allowed",
-    }:
+    }
+    current_review_fields = {*legacy_review_fields, "no_action_required"}
+    if type(review_payload) is not dict:
+        raise ValueError("invalid review fields")
+    review_fields = set(review_payload)
+    if review_fields == legacy_review_fields:
+        no_action_required = False
+    elif review_fields == current_review_fields:
+        no_action_required = review_payload["no_action_required"]
+    else:
         raise ValueError("invalid review fields")
     reason_codes = review_payload["reason_codes"]
     review_evidence = review_payload["evidence_ids"]
@@ -237,6 +257,7 @@ def _reconstruct_result(payload: dict[str, object]) -> AgentResult:
         reason_codes=tuple(ReviewReason(reason) for reason in reason_codes),
         evidence_ids=tuple(review_evidence),
         retry_allowed=review_payload["retry_allowed"],
+        no_action_required=no_action_required,
     )
 
     tool_sequence = payload["tool_sequence"]
@@ -260,6 +281,13 @@ def _reconstruct_result(payload: dict[str, object]) -> AgentResult:
         state_history=tuple(AgentState(state) for state in state_history),
         leaf_node_id=payload["leaf_node_id"],
         redacted_summary=payload["redacted_summary"],
+        analysis_summary=(
+            None
+            if result_fields == _LEGACY_RESULT_FIELDS
+            else AnalysisSummary.model_validate_json(
+                _canonical_json(payload["analysis_summary"])
+            )
+        ),
     )
 
 
@@ -282,7 +310,17 @@ def _decode_result(content: bytes) -> AgentResult:
         ]:
             raise ValueError("result digest mismatch")
         result = _reconstruct_result(envelope["result"])
-        if result.model_dump(mode="json") != envelope["result"]:
+        projected_result = result.model_dump(mode="json")
+        if frozenset(envelope["result"]) == _LEGACY_RESULT_FIELDS:
+            del projected_result["analysis_summary"]
+        if set(envelope["result"]["review"]) == {
+            "approved",
+            "reason_codes",
+            "evidence_ids",
+            "retry_allowed",
+        }:
+            del projected_result["review"]["no_action_required"]
+        if projected_result != envelope["result"]:
             raise ValueError("result projection mismatch")
         return result
     except (

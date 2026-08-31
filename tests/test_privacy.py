@@ -88,6 +88,22 @@ def test_gate_rejects_entity_like_values_under_neutral_keys(unsafe_value: str) -
         assert_safe_payload({"value": unsafe_value})
 
 
+def test_gate_allows_controlled_sample_weight_strategy() -> None:
+    assert_safe_payload({"imbalance_strategy": "sample_weight"})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"sample_id": "sample-123456"},
+        {"sample_id": 123456789012},
+    ],
+)
+def test_gate_rejects_sample_identifiers(payload: dict[str, object]) -> None:
+    with pytest.raises(UnsafePayloadError, match="payload is not safe"):
+        assert_safe_payload(payload)
+
+
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_gate_rejects_non_finite_numbers(value: float) -> None:
     with pytest.raises(UnsafePayloadError, match="payload is not safe"):
@@ -139,3 +155,24 @@ def test_payload_gate_rejects_path_like_and_identifier_strings() -> None:
         assert_safe_payload({"message": "/Users/test/private.parquet"})
     with pytest.raises(UnsafePayloadError):
         assert_safe_payload({"message": "entity_id=customer-123"})
+
+
+def test_gate_allows_canonical_feature_refs_but_not_arbitrary_object_rows() -> None:
+    assert_safe_payload(
+        {
+            "input_features": [
+                {"value": "PAY_AMT1", "tokenized": False},
+                {"value": "model-feature-0123456789abcdef", "tokenized": True},
+            ]
+        }
+    )
+
+    with pytest.raises(UnsafePayloadError, match="payload is not safe"):
+        assert_safe_payload(
+            {
+                "input_features": [
+                    {"value": "PAY_AMT1", "coefficient": 0.1},
+                    {"value": "PAY_AMT2", "coefficient": 0.2},
+                ]
+            }
+        )

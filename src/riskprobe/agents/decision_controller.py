@@ -79,6 +79,7 @@ class DecisionPreparation(_StrictDTO):
 class _DecisionUnavailableReason(StrEnum):
     PROVIDER_PENDING = "provider_pending"
     PROVIDER_ERROR = "provider_error"
+    SUBMISSION_ERROR = "submission_error"
 
 
 class _DecisionUnavailableOutcome(_StrictDTO):
@@ -280,6 +281,7 @@ class DecisionController:
                 feature_count=inspect.feature_count,
                 issue_codes=inspect.issue_codes,
                 rule_ids=discover.rule_ids,
+                analysis_summary=inspect.analysis_summary,
                 diagnosis_evidence_ids=diagnosis_ids,
                 findings=findings,
                 policy=self._policy,

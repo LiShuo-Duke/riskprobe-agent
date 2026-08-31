@@ -343,7 +343,7 @@ def test_register_local_parquet_keeps_exact_feature_columns(tmp_path, synthetic_
     assert config.features.select_columns(
         ["entity_id", "order_cnt_7d", "order_amount_30d", "order_cnt_30d"],
         ("entity_id", "entity_id", "institution", "target"),
-    ) == ["order_amount_30d", "order_cnt_7d"]
+    ) == ["order_cnt_7d", "order_amount_30d"]
 
 
 @pytest.mark.parametrize(

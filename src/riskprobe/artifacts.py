@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import json
 import math
+import re
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -49,7 +50,7 @@ def _canonical_json(value: Any) -> str:
     )
 
 
-_REQUIRED_ARTIFACTS = (
+_LEGACY_REQUIRED_ARTIFACTS = (
     "manifest.json",
     "metadata_report.json",
     "data_profile.json",
@@ -57,8 +58,15 @@ _REQUIRED_ARTIFACTS = (
     "evidence_cards.json",
     "risk_report.md",
 )
-_INTEGRITY_ARTIFACTS = _REQUIRED_ARTIFACTS[1:]
-_MANIFEST_IDENTITY_FIELDS = (
+_LEGACY_SCORECARD_ARTIFACTS = (*_LEGACY_REQUIRED_ARTIFACTS, "scorecard.json")
+_REQUIRED_ARTIFACTS = (*_LEGACY_REQUIRED_ARTIFACTS, "analysis_summary.json")
+_SCORECARD_ARTIFACTS = (*_REQUIRED_ARTIFACTS, "scorecard.json")
+_LEGACY_ARTIFACT_SETS = frozenset(
+    (_LEGACY_REQUIRED_ARTIFACTS, _LEGACY_SCORECARD_ARTIFACTS)
+)
+_CURRENT_ARTIFACT_SETS = frozenset((_REQUIRED_ARTIFACTS, _SCORECARD_ARTIFACTS))
+_RUN_ID = re.compile(r"^[0-9a-f]{16}$")
+_LEGACY_MANIFEST_IDENTITY_FIELDS = (
     "run_id",
     "config_fingerprint",
     "data_fingerprint",
@@ -66,10 +74,21 @@ _MANIFEST_IDENTITY_FIELDS = (
     "dataset_id",
     "time_validation_enabled",
 )
+_MANIFEST_IDENTITY_FIELDS = (
+    *_LEGACY_MANIFEST_IDENTITY_FIELDS,
+    "time_validation_mode",
+    "time_validation_applied",
+)
 _MANIFEST_FIELDS = {
+    "schema_version",
     "artifacts",
     "artifact_integrity",
     *_MANIFEST_IDENTITY_FIELDS,
+}
+_LEGACY_MANIFEST_FIELDS = {
+    "artifacts",
+    "artifact_integrity",
+    *_LEGACY_MANIFEST_IDENTITY_FIELDS,
 }
 
 
@@ -119,26 +138,42 @@ def _is_complete_run(
         return False
     if manifest_bytes != f"{_canonical_json(manifest)}\n".encode("utf-8"):
         return False
-    if set(manifest) != _MANIFEST_FIELDS:
+    manifest_fields = set(manifest)
+    if manifest_fields == _MANIFEST_FIELDS:
+        if manifest.get("schema_version") != "riskprobe.manifest.v1":
+            return False
+        allowed_artifact_sets = _CURRENT_ARTIFACT_SETS
+        identity_fields = _MANIFEST_IDENTITY_FIELDS
+    elif manifest_fields == _LEGACY_MANIFEST_FIELDS:
+        allowed_artifact_sets = _LEGACY_ARTIFACT_SETS
+        identity_fields = _LEGACY_MANIFEST_IDENTITY_FIELDS
+    else:
         return False
-    if manifest.get("artifacts") != list(_REQUIRED_ARTIFACTS):
+    artifacts = manifest.get("artifacts")
+    if (
+        not isinstance(artifacts, list)
+        or tuple(artifacts) not in allowed_artifact_sets
+    ):
         return False
-    identity = {name: manifest.get(name) for name in _MANIFEST_IDENTITY_FIELDS}
-    if identity != dict(expected_identity):
+    artifact_names = tuple(artifacts)
+    integrity_artifacts = artifact_names[1:]
+    identity = {name: manifest[name] for name in identity_fields}
+    expected = {name: expected_identity.get(name) for name in identity_fields}
+    if identity != expected:
         return False
     integrity = manifest.get("artifact_integrity")
-    if not isinstance(integrity, dict) or set(integrity) != set(_INTEGRITY_ARTIFACTS):
+    if not isinstance(integrity, dict) or set(integrity) != set(integrity_artifacts):
         return False
     try:
         directory_entries = {entry.name for entry in run_dir.iterdir()}
     except OSError:
         return False
-    allowed_entries = set(_REQUIRED_ARTIFACTS)
+    allowed_entries = set(artifact_names)
     if (run_dir / ".incomplete").is_file():
         allowed_entries.add(".incomplete")
     if directory_entries != allowed_entries:
         return False
-    for name in _INTEGRITY_ARTIFACTS:
+    for name in integrity_artifacts:
         path = run_dir / name
         record = integrity.get(name)
         if (
@@ -267,6 +302,8 @@ class RunContext:
         config_fingerprint: str,
         dataset_id: str | None,
         time_validation_enabled: bool | None,
+        time_validation_mode: str | None,
+        time_validation_applied: bool | None,
     ) -> None:
         """Require this context to be a complete run for the supplied public binding."""
 
@@ -274,6 +311,8 @@ class RunContext:
             "config_fingerprint": config_fingerprint,
             "dataset_id": dataset_id,
             "time_validation_enabled": time_validation_enabled,
+            "time_validation_mode": time_validation_mode,
+            "time_validation_applied": time_validation_applied,
         }
         if self._writable or any(
             self._expected_identity.get(name) != value
@@ -288,18 +327,23 @@ class RunContext:
     def read_verified_artifact(self, name: str) -> bytes:
         """Read one immutable artifact while enforcing its anchored integrity."""
 
-        if name not in _INTEGRITY_ARTIFACTS:
+        if name not in _SCORECARD_ARTIFACTS[1:]:
             raise ValueError("artifact is not readable through the integrity view")
         self.require_binding(
             config_fingerprint=str(self._expected_identity["config_fingerprint"]),
             dataset_id=self._expected_identity["dataset_id"],
             time_validation_enabled=self._expected_identity["time_validation_enabled"],
+            time_validation_mode=self._expected_identity["time_validation_mode"],
+            time_validation_applied=self._expected_identity["time_validation_applied"],
         )
         try:
             manifest = json.loads((self.run_dir / "manifest.json").read_bytes())
+            artifacts = manifest["artifacts"]
+            if not isinstance(artifacts, list) or name not in artifacts:
+                raise ValueError("artifact is not declared by the manifest")
             expected_integrity = manifest["artifact_integrity"][name]
             content = self._target(name).read_bytes()
-        except (KeyError, OSError, TypeError, json.JSONDecodeError) as error:
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise RuntimeError(f"run {self.run_id} is not complete") from error
         actual_integrity = {
             "sha256": hashlib.sha256(content).hexdigest(),
@@ -318,11 +362,18 @@ class RunContext:
         if not _is_complete_run(self.run_dir, self._expected_identity):
             raise RuntimeError(f"run {self.run_id} is not complete")
         manifest = json.loads((self.run_dir / "manifest.json").read_text())
+        identity_fields = (
+            _MANIFEST_IDENTITY_FIELDS
+            if "schema_version" in manifest
+            else _LEGACY_MANIFEST_IDENTITY_FIELDS
+        )
         _write_canonical_json(
             self._integrity_anchor,
             {
                 "artifact_integrity": manifest["artifact_integrity"],
-                "identity": self._expected_identity,
+                "identity": {
+                    name: manifest[name] for name in identity_fields
+                },
             },
         )
         if not _is_complete_run(
@@ -393,6 +444,57 @@ class RunStore:
         payload = f"{_canonical_json(self._identity_config(config))}{data_fingerprint}{code_version}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
+    def open_verified(self, run_id: str) -> RunContext:
+        """Open an existing finalized run through its anchored read-only view."""
+
+        if not isinstance(run_id, str) or _RUN_ID.fullmatch(run_id) is None:
+            raise ValueError("run_id must be a 16-character lowercase hexadecimal value")
+        run_dir = self.runs_dir / run_id
+        integrity_anchor = self.runs_dir / f".{run_id}.integrity.json"
+        if (
+            run_dir.is_symlink()
+            or not run_dir.is_dir()
+            or (run_dir / ".incomplete").exists()
+        ):
+            raise RuntimeError(f"run {run_id} is not complete")
+        try:
+            manifest = json.loads((run_dir / "manifest.json").read_bytes())
+            if not isinstance(manifest, dict):
+                raise TypeError("manifest must be an object")
+            manifest_fields = set(manifest)
+            if manifest_fields == _MANIFEST_FIELDS:
+                identity_fields = _MANIFEST_IDENTITY_FIELDS
+            elif manifest_fields == _LEGACY_MANIFEST_FIELDS:
+                identity_fields = _LEGACY_MANIFEST_IDENTITY_FIELDS
+            else:
+                raise TypeError("manifest fields are invalid")
+            expected_identity = {
+                name: manifest[name] for name in identity_fields
+            }
+            if identity_fields == _LEGACY_MANIFEST_IDENTITY_FIELDS:
+                enabled = expected_identity["time_validation_enabled"]
+                if enabled is not None and type(enabled) is not bool:
+                    raise TypeError("legacy time validation identity is invalid")
+                expected_identity["time_validation_mode"] = (
+                    None if enabled is None else "strict" if enabled else "disabled"
+                )
+                expected_identity["time_validation_applied"] = enabled
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"run {run_id} is not complete") from error
+        if expected_identity["run_id"] != run_id or not _is_complete_run(
+            run_dir,
+            expected_identity,
+            integrity_anchor,
+        ):
+            raise RuntimeError(f"run {run_id} is not complete")
+        return RunContext(
+            run_id,
+            run_dir,
+            is_existing=True,
+            expected_identity=expected_identity,
+            integrity_anchor=integrity_anchor,
+        )
+
     def create(
         self,
         config: Any,
@@ -401,6 +503,8 @@ class RunStore:
         *,
         dataset_id: str | None = None,
         time_validation_enabled: bool | None = None,
+        time_validation_mode: str | None = None,
+        time_validation_applied: bool | None = None,
     ) -> RunContext:
         run_id = self.compute_run_id(config, data_fingerprint, code_version)
         expected_identity = {
@@ -410,6 +514,8 @@ class RunStore:
             "code_version": code_version,
             "dataset_id": dataset_id,
             "time_validation_enabled": time_validation_enabled,
+            "time_validation_mode": time_validation_mode,
+            "time_validation_applied": time_validation_applied,
         }
         run_dir = self.runs_dir / run_id
         incomplete = run_dir / ".incomplete"

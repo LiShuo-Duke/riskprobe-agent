@@ -9,6 +9,7 @@
 - 评分卡记录不平衡策略、固定随机种子、Train class counts 和冻结 WOE 统计量等 provenance；预测概率保持未 calibration，不提供校准后的部署基准率概率。
 - `RuleMetrics` 增加 `hit_good_rate`、`ks_signed` 和 `ks_stat`；`p_value` 继续独立使用双侧 Fisher 精确检验，不由 KS 替代。
 - 新增连续 score 的 `compute_score_ks`：支持 `higher_is_bad`/`lower_is_bad`，只排除 non-finite score；过滤后为空类或无 finite score 时返回 `None` 统计量和 `single_class_or_no_finite_scores` limitation。
+- 新增中文完整终态 Markdown 与 DOCX 报告，包含 TOP10 安全规则条件与已返回指标；DOCX 输出确定化，terminal sidecar 支持幂等修复，公开的两个 MCP 工具 schema 与 error code 保持不变。
 
 ## v0.2.0 — 2026-08-21
 

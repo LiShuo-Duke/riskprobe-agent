@@ -11,9 +11,7 @@ python3 -m venv .venv
 ./.venv/bin/python -m pip install -e .
 ```
 
-准备一个本地 `ProjectConfig` YAML。YAML 中的 Parquet 路径、运行目录和状态目录均由用户在 MCP 启动配置中指定，不能通过 MCP 工具动态传入；真实数据、本地配置和运行产物不得提交到 Git。
-
-手工 smoke 命令如下；这是等待客户端连接的 stdio 服务，不是 HTTP 服务：
+准备本地 `ProjectConfig` YAML，在启动时固定 Parquet 路径、列角色、特征、运行目录与状态目录。真实数据、本地配置和运行产物不得提交到 Git；第一 MCP 工具只接收 `idempotency_key`，不能动态传入数据路径或角色。
 
 ```bash
 ./.venv/bin/python -m riskprobe.mcp_server \
@@ -29,7 +27,7 @@ python3 -m venv .venv
 
 ## Kiro
 
-仓库内 `.kiro/settings/mcp.json` 使用公开 synthetic 配置和被 Git 忽略的 `runs/` 目录。生成 synthetic Parquet 后，在 `riskprobe` Agent 中执行两阶段流程；Agent 权限只允许两个 RiskProbe MCP tools，并拒绝 Shell、文件读写和网络。
+仓库内 `.kiro/settings/mcp.json` 指向被 Git 忽略的本地启动档案。Agent 仅允许两个 RiskProbe MCP tools，并拒绝 Shell、文件读写和网络。Host 依据受限聚合上下文生成中文报告；服务本身产出完整聚合工件，Host 不读取这些工件。
 
 ## Codex、Trae 与其他客户端
 
@@ -54,4 +52,4 @@ riskprobe_submit_decision_proposal(
   └─ 本地固定执行 recommend → review，返回 terminal outcome
 ```
 
-所有客户端都必须保持完整诊断证据集合，只能选择策略允许的 action code，并把 B 级结果限定为分析建议。禁止实体值、样本行、原始日志、真实路径、明细读取、Shell、网络访问和自动上线。不支持 MCP 的客户端仍可使用 CLI 完成本地确定性分析，但 CLI 不是外部 Host 决策门控的绕过方式。
+所有客户端都必须保持完整诊断证据集合，只能选择策略允许的 action code，并把 B 级结果限定为分析建议。中文报告按返回顺序覆盖 findings 和 evidence ID，并包含受控 action 与依据、terminal review/reason codes/retry、隐私限制和人工审批要求。禁止实体值、样本行、原始日志、真实路径、明细读取、Shell、网络访问和自动上线；不支持 MCP 的客户端可使用 CLI 做本地确定性分析，但 CLI 不是外部 Host 决策门控的绕过方式。

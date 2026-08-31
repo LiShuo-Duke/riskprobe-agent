@@ -105,9 +105,9 @@ feature / family / segment / label / rule / schema
 
 输出贡献度、排名和数值证据，不返回用户实体、样本行或原始明细。
 
-### 7. 启动时只读数据配置
+### 7. 启动模板与运行时只读数据配置
 
-本地 Parquet、列角色、特征族和隐私策略由 `ProjectConfig` YAML 明确声明。MCP 服务启动时接收配置路径、运行目录和状态目录；两个 MCP 工具都不接受文件路径、任意代码、身份、预算或数据注册参数。源 Parquet 始终只读，运行产物写入用户指定的本地目录。
+`ProjectConfig` YAML 在 MCP 启动时固定只读数据档案、列角色、特征、目标语义、验证与隐私策略。数据路径和角色不是工具参数；源 Parquet 始终只读，运行产物写入用户指定的本地目录。
 
 ### 8. 两阶段 Host 决策 MCP
 
@@ -118,7 +118,7 @@ riskprobe_get_decision_context
 riskprobe_submit_decision_proposal
 ```
 
-第一阶段固定执行 `inspect → diagnose → discover` 并返回聚合决策上下文；Kiro、Codex、Trae 或其他 Host 从 policy allowlist 选择 action code 后提交原样上下文和完整诊断证据。第二阶段固定执行 `recommend → review` 并返回 terminal result。Host 不拥有底层数据工具，不能跳步或自动上线策略。
+第一工具只接收公开稳定的 `idempotency_key`，固定执行 `inspect → diagnose → discover` 并返回聚合决策上下文。Host 必须覆盖完整 findings，从 policy allowlist 选择动作并提交原样上下文和完整诊断证据。第二阶段执行 `recommend → review` 并返回 terminal result；Host 不读取运行工件、不能跳步或自动上线策略。
 
 ### 当前没有实现的功能
 
@@ -192,7 +192,7 @@ mkdir -p data/synthetic
 
 ### 3. 使用自己的本地 Parquet
 
-复制公开示例并创建一个不提交到 Git 的本地 `ProjectConfig` YAML，在其中明确填写只读 Parquet 路径、实体/时间/分层/目标角色和特征配置。CLI 使用 `--config` 读取该文件；MCP 则在进程启动时通过 `--config` 接收它。数据路径不会作为 MCP tool 参数暴露，RiskProbe 也不会上传或修改源 Parquet。
+复制公开示例并创建一个不提交到 Git 的本地 `ProjectConfig` YAML，在其中固定路径、列角色、特征、目标/时间语义和验证策略。CLI 与 MCP 均通过启动时的 `--config` 读取该档案；第一 MCP 工具只接收 `idempotency_key`。RiskProbe 不会上传或修改源 Parquet。
 
 ## MCP 和 Agent 使用
 
@@ -218,7 +218,7 @@ configs/mcp/codex.example.toml     # Codex 配置
 configs/mcp/trae.example.json      # Trae 配置
 ```
 
-将模板中的占位路径替换为用户自己的项目配置和私有运行目录。标准工作流为：
+将模板中的占位路径替换为用户自己的启动档案和私有运行目录。标准工作流为：
 
 ```text
 riskprobe_get_decision_context(idempotency_key)
@@ -232,7 +232,7 @@ riskprobe_get_decision_context(idempotency_key)
 → terminal agent_result
 ```
 
-服务端完整顺序固定为 `inspect → diagnose → discover → recommend → review`。Host 不能调用底层分析函数、传入路径、删减诊断证据或绕过 review。
+服务端完整顺序固定为 `inspect → diagnose → discover → recommend → review`。报告由 Host 基于受限上下文生成；服务本身产出完整聚合工件。Host 不读取工件、不能调用底层分析函数、传入任意代码、删减诊断证据或绕过 review。
 
 ### 有界 Agent 编排与本地知识引用
 

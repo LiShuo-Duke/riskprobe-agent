@@ -68,6 +68,9 @@ def test_agent_skill_requires_exact_two_phase_host_decision_flow() -> None:
     assert "context_id" in skill
     assert "diagnosis_evidence_ids" in skill
     assert "idempotency_key" in skill
+    assert "analysis_summary" in skill
+    assert "decision_summary" in skill
+    assert "AUC、KS、Gini" in skill
     for legacy_tool in (
         "register_local_dataset",
         "register_local_parquet",

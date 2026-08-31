@@ -1,6 +1,6 @@
 {
   "name": "riskprobe",
-  "description": "Run the bounded local RiskProbe Host-decision workflow.",
+  "description": "Analyze Chinese credit risk, rule mining, binning, scorecards, and aggregate reports through the bounded local RiskProbe workflow.",
   "tools": ["@riskprobe"],
   "includeMcpJson": true,
   "includePowers": false,

@@ -577,6 +577,78 @@ def test_orchestrate_reviews_fresh_terminal_once(
     ).load() == result
 
 
+def test_terminal_report_reuses_built_model_for_same_subject(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.terminal_reports import TerminalReportSubject
+
+    config = _small_config(tmp_path)
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=tmp_path / "state",
+    )
+    run = service.run()
+    subject = TerminalReportSubject(
+        idempotency_key="report-model-reuse",
+        run_id=run.run_id,
+        context_id=None,
+        findings=(),
+        proposal_action_codes=(),
+        diagnosis_evidence_ids=(),
+        agent_result=None,
+        analysis_summary=None,
+        decision_summary=None,
+        terminal_status="failed",
+        error_code="agent_orchestration_failed",
+    )
+
+    first = service.ensure_terminal_report(subject)
+
+    def reject_rebuild(_context: object) -> object:
+        raise AssertionError("terminal report model must be reused")
+
+    monkeypatch.setattr(service, "_load_verified_report_inputs", reject_rebuild)
+
+    assert service.ensure_terminal_report(subject) == first
+
+
+def test_terminal_report_model_cache_revalidates_run_artifacts(
+    tmp_path: Path,
+) -> None:
+    from riskprobe.terminal_reports import TerminalReportSubject
+
+    config = _small_config(tmp_path)
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=tmp_path / "state",
+    )
+    run = service.run()
+    subject = TerminalReportSubject(
+        idempotency_key="report-cache-integrity",
+        run_id=run.run_id,
+        context_id=None,
+        findings=(),
+        proposal_action_codes=(),
+        diagnosis_evidence_ids=(),
+        agent_result=None,
+        analysis_summary=None,
+        decision_summary=None,
+        terminal_status="failed",
+        error_code="agent_orchestration_failed",
+    )
+    service.ensure_terminal_report(subject)
+    (run.run_dir / "analysis_summary.json").write_text(
+        "tampered",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="not complete"):
+        service.ensure_terminal_report(subject)
+
+
 def test_orchestrate_reuses_verified_terminal_result_without_tool_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

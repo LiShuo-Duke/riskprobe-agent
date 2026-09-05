@@ -58,7 +58,7 @@ from riskprobe.monitoring.reference import build_reference_snapshot
 from riskprobe.monitoring.service import diagnose_dataset
 from riskprobe.profiling import DatasetProfile, profile_dataset
 from riskprobe.recommendations import build_recommendations
-from riskprobe.report_models import build_final_report_model
+from riskprobe.report_models import ReportModel, build_final_report_model
 from riskprobe.reporting import (
     evidence_sort_key,
     redact_limitation,
@@ -1317,6 +1317,10 @@ class RiskProbeService:
         self.store = RunStore(runs_dir)
         self.state_dir = Path(state_dir) if state_dir is not None else self.store.runs_dir
         self._terminal_report_store: TerminalReportStore | None = None
+        # hatail: one-entry cache bounds memory; use an LRU if interleaved sessions dominate.
+        self._cached_terminal_report: (
+            tuple[TerminalReportSubject, ReportModel] | None
+        ) = None
         (
             self._decision_provider,
             self._decision_fallback,
@@ -1647,16 +1651,22 @@ class RiskProbeService:
         if type(subject) is not TerminalReportSubject:
             raise TypeError("subject must be a TerminalReportSubject")
         context = self.store.open_verified(subject.run_id)
-        inputs = self._load_verified_report_inputs(context)
-        model = build_final_report_model(subject=subject, **inputs)
+        cached = self._cached_terminal_report
+        if cached is not None and cached[0] == subject:
+            model = cached[1]
+        else:
+            inputs = self._load_verified_report_inputs(context)
+            model = build_final_report_model(subject=subject, **inputs)
         if self._terminal_report_store is None:
             self._terminal_report_store = TerminalReportStore(
                 self._state_directory(subject.run_id)
             )
-        return self._terminal_report_store.ensure_published(
+        manifest = self._terminal_report_store.ensure_published(
             subject=subject,
             model=model,
         )
+        self._cached_terminal_report = (subject, model)
+        return manifest
 
     def _data_fingerprint_from_run(self, context: RunContext) -> str:
         verified = self._verified_run_context(context)

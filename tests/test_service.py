@@ -535,6 +535,48 @@ def test_orchestrate_empty_diagnosis_skips_real_recommend_and_replays_no_action(
     ) == result
 
 
+def test_orchestrate_reviews_fresh_terminal_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from riskprobe.agents import Reviewer
+    from riskprobe.agents.results import AgentResultStore
+    from riskprobe.policy import Budget, Principal, Role
+
+    review_calls = 0
+    original_review = Reviewer.review
+
+    def count_review(
+        self: Reviewer,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal review_calls
+        review_calls += 1
+        return original_review(self, *args, **kwargs)
+
+    monkeypatch.setattr(Reviewer, "review", count_review)
+    config = _small_config(tmp_path)
+    state_dir = tmp_path / "state"
+    service = RiskProbeService(
+        config=config,
+        runs_dir=tmp_path / "runs",
+        state_dir=state_dir,
+    )
+
+    result = service.orchestrate(
+        dataset_id=config.dataset.id,
+        principal=Principal(principal_id="single-review", role=Role.ANALYST),
+        budget=Budget(max_queries=16),
+    )
+
+    assert review_calls == 1
+    assert result.review.approved is True
+    assert AgentResultStore(
+        state_dir / f".{result.session_id}.agent-result.json"
+    ).load() == result
+
+
 def test_orchestrate_reuses_verified_terminal_result_without_tool_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -2262,16 +2262,8 @@ class RiskProbeService:
                         budget=budget,
                         session_id=run_id,
                     )
-                    validated = orchestrator.validate_terminal_result(
-                        result,
-                        objective=objective,
-                        dataset_id=dataset_id,
-                        session_id=run_id,
-                        metadata_grade=metadata_grade,
-                        analysis_summary=analysis_summary,
-                    )
-                    result_store.publish(validated)
-                    return validated
+                    result_store.publish(result)
+                    return result
                 except HostSafeStageError as error:
                     raise error.with_report_run_id(run_id) from None
                 except Exception:
